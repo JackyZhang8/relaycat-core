@@ -1,0 +1,351 @@
+name: Release Relay
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - "relaycat-relay-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Relay version, for example 0.1.4 or v0.1.4"
+        required: true
+
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  validate:
+    name: Validate Relay version
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            raw="${{ inputs.version }}"
+          else
+            raw="${{ github.ref_name }}"
+            raw="${raw#relaycat-relay-}"
+          fi
+          version="${raw#v}"
+          tag="relaycat-relay-v${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check Cargo package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${{ steps.version.outputs.version }}"
+          actual="$(awk -F '"' '/^version = / { print $2; exit }' relaycat-server/Cargo.toml)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::relaycat-server/Cargo.toml version is $actual, expected $expected"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.artifact_suffix }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: macos
+            artifact_suffix: macos-arm64
+            target: aarch64-apple-darwin
+            exe_ext: ""
+          - os: macos-15-intel
+            platform: macos
+            artifact_suffix: macos-x86_64
+            target: x86_64-apple-darwin
+            exe_ext: ""
+          - os: ubuntu-22.04
+            platform: linux
+            artifact_suffix: linux
+            target: x86_64-unknown-linux-gnu
+            exe_ext: ""
+          - os: windows-2022
+            platform: windows
+            artifact_suffix: windows
+            target: x86_64-pc-windows-msvc
+            exe_ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Import macOS signing certificates
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_INSTALLER_CERTIFICATE: ${{ secrets.APPLE_INSTALLER_CERTIFICATE }}
+          APPLE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for var in \
+            APPLE_CERTIFICATE \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_INSTALLER_CERTIFICATE \
+            APPLE_INSTALLER_CERTIFICATE_PASSWORD
+          do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var is required for notarized macOS Relay releases."
+              exit 1
+            fi
+          done
+
+          keychain_path="$RUNNER_TEMP/macos-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          app_certificate_path="$RUNNER_TEMP/apple-application-certificate.p12"
+          certificate_path="$RUNNER_TEMP/apple-installer-certificate.p12"
+
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$app_certificate_path"
+          printf '%s' "$APPLE_INSTALLER_CERTIFICATE" | base64 -D > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$app_certificate_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_INSTALLER_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/pkgbuild \
+            -T /usr/bin/productsign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security default-keychain -s "$keychain_path"
+
+          app_sign_id="$(security find-identity -v "$keychain_path" | awk -F '"' '/Developer ID Application/ { print $2; exit }')"
+          installer_sign_id="$(security find-identity -v "$keychain_path" | awk -F '"' '/Developer ID Installer/ { print $2; exit }')"
+          if [ -z "$app_sign_id" ]; then
+            echo "::error::APPLE_CERTIFICATE does not contain a Developer ID Application identity."
+            exit 1
+          fi
+          if [ -z "$installer_sign_id" ]; then
+            echo "::error::APPLE_INSTALLER_CERTIFICATE does not contain a Developer ID Installer identity."
+            exit 1
+          fi
+          echo "MACOS_APP_SIGN_ID=$app_sign_id" >> "$GITHUB_ENV"
+          echo "MACOS_INSTALLER_SIGN_ID=$installer_sign_id" >> "$GITHUB_ENV"
+          echo "MACOS_SIGNING_KEYCHAIN_PATH=$keychain_path" >> "$GITHUB_ENV"
+
+      - name: Build Relay
+        shell: bash
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            --manifest-path relaycat-server/Cargo.toml \
+            -p relaycat-relay
+
+      - name: Codesign macOS Relay binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="relaycat-server/target/${{ matrix.target }}/release/relaycat-relay"
+          codesign --force --timestamp --options runtime \
+            --keychain "$MACOS_SIGNING_KEYCHAIN_PATH" \
+            --sign "$MACOS_APP_SIGN_ID" \
+            "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+          codesign --display --verbose=2 "$binary"
+
+      - name: Package Relay
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate.outputs.version }}"
+          name="relaycat-relay-${version}-${{ matrix.artifact_suffix }}"
+          profile_dir="relaycat-server/target/${{ matrix.target }}/release"
+          mkdir -p dist
+
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            cp "${profile_dir}/relaycat-relay${{ matrix.exe_ext }}" "dist/${name}${{ matrix.exe_ext }}"
+            exit 0
+          fi
+
+          package_dir="dist/${name}"
+          mkdir -p "$package_dir"
+          cp "${profile_dir}/relaycat-relay${{ matrix.exe_ext }}" "$package_dir/relaycat-relay${{ matrix.exe_ext }}"
+          chmod 755 "$package_dir/relaycat-relay${{ matrix.exe_ext }}"
+
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            tar -czf "dist/${name}.tar.gz" -C dist "$name"
+            exit 0
+          fi
+
+          payload_dir="$RUNNER_TEMP/${name}-payload"
+          mkdir -p "$payload_dir"
+          cp "$package_dir/relaycat-relay" "$payload_dir/relaycat-relay"
+          pkgbuild \
+            --root "$payload_dir" \
+            --identifier "ai.relaycat.relay" \
+            --version "$version" \
+            --install-location "/usr/local/bin" \
+            --sign "$MACOS_INSTALLER_SIGN_ID" \
+            "dist/${name}.pkg"
+          pkgutil --check-signature "dist/${name}.pkg"
+
+      - name: Notarize macOS pkg
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
+            echo "::error::Apple notarization credentials are required for macOS Relay releases."
+            exit 1
+          fi
+          for pkg in dist/*.pkg; do
+            result_path="$RUNNER_TEMP/$(basename "$pkg").notary.json"
+            submit_status=0
+            xcrun notarytool submit "$pkg" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait \
+              --output-format json | tee "$result_path" || submit_status=$?
+
+            submission_id="$(jq -r '.id // empty' "$result_path")"
+            status="$(jq -r '.status // empty' "$result_path")"
+            if [ "$submit_status" -ne 0 ] || [ "$status" != "Accepted" ]; then
+              echo "::error::Apple notarization failed for $pkg with status: ${status:-unknown}"
+              if [ -n "$submission_id" ]; then
+                xcrun notarytool log "$submission_id" \
+                  --apple-id "$APPLE_ID" \
+                  --password "$APPLE_APP_PASSWORD" \
+                  --team-id "$APPLE_TEAM_ID" || true
+              fi
+              exit 1
+            fi
+
+            xcrun stapler staple "$pkg"
+            xcrun stapler validate "$pkg"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relaycat-relay-${{ matrix.artifact_suffix }}
+          path: |
+            dist/*.pkg
+            dist/*.tar.gz
+            dist/*.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish Relay release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create tag for manual releases
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.validate.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git rev-parse "$tag" >/dev/null 2>&1; then
+            git tag -a "$tag" -m "Release $tag"
+          fi
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            git push origin "refs/tags/$tag"
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Generate checksums and relay.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate.outputs.version }}"
+          tag="${{ needs.validate.outputs.tag }}"
+          base="https://github.com/${{ github.repository }}/releases/download/${tag}"
+          homepage="https://github.com/${{ github.repository }}/releases/tag/${tag}"
+          released_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p dist
+          find release-assets -maxdepth 3 -type f -print0 | xargs -0 -I{} cp {} dist/
+
+          (cd dist && sha256sum relaycat-relay-* > SHA256SUMS)
+
+          sha() { sha256sum "$1" | awk '{print $1}'; }
+          fsize() { stat -c%s "$1"; }
+          entries=(
+            "aarch64-apple-darwin|relaycat-relay-${version}-macos-arm64.pkg|installer"
+            "x86_64-apple-darwin|relaycat-relay-${version}-macos-x86_64.pkg|installer"
+            "x86_64-unknown-linux-gnu|relaycat-relay-${version}-linux.tar.gz|archive"
+            "x86_64-pc-windows-msvc|relaycat-relay-${version}-windows.exe|binary"
+          )
+
+          downloads="[]"
+          for entry in "${entries[@]}"; do
+            IFS='|' read -r target file kind <<< "$entry"
+            if [ ! -f "dist/$file" ]; then
+              echo "::warning::missing Relay artifact for $target ($file)"
+              continue
+            fi
+            downloads="$(jq \
+              --arg t "$target" \
+              --arg u "${base}/${file}" \
+              --arg s "$(sha "dist/$file")" \
+              --argjson b "$(fsize "dist/$file")" \
+              --arg k "$kind" \
+              '. += [{target: $t, url: $u, sha256: $s, kind: $k, size_bytes: $b}]' \
+              <<<"$downloads")"
+          done
+
+          jq -n \
+            --arg v "$version" \
+            --arg d "$released_at" \
+            --arg h "$homepage" \
+            --argjson dl "$downloads" \
+            '{schema: 1, app: "relaycat", platform: "relay", channel: "stable",
+              latest_version: $v, mandatory: false, released_at: $d,
+              notes: {}, downloads: $dl, homepage_url: $h}' \
+            > dist/relay.json
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: RelayCat Relay ${{ needs.validate.outputs.version }}
+          files: dist/*
