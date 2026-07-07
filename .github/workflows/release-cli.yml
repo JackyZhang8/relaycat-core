@@ -93,27 +93,43 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Import macOS installer certificate
+      - name: Import macOS signing certificates
         if: runner.os == 'macOS'
         shell: bash
         env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_INSTALLER_CERTIFICATE: ${{ secrets.APPLE_INSTALLER_CERTIFICATE }}
           APPLE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ -z "${APPLE_INSTALLER_CERTIFICATE:-}" ] || [ -z "${APPLE_INSTALLER_CERTIFICATE_PASSWORD:-}" ]; then
-            echo "::warning::APPLE_INSTALLER_CERTIFICATE not set; building an unsigned pkg."
-            exit 0
-          fi
+          for var in \
+            APPLE_CERTIFICATE \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_INSTALLER_CERTIFICATE \
+            APPLE_INSTALLER_CERTIFICATE_PASSWORD
+          do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var is required for notarized macOS CLI releases."
+              exit 1
+            fi
+          done
 
-          keychain_path="$RUNNER_TEMP/installer-signing.keychain-db"
+          keychain_path="$RUNNER_TEMP/macos-signing.keychain-db"
           keychain_password="$(uuidgen)"
+          app_certificate_path="$RUNNER_TEMP/apple-application-certificate.p12"
           certificate_path="$RUNNER_TEMP/apple-installer-certificate.p12"
 
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$app_certificate_path"
           printf '%s' "$APPLE_INSTALLER_CERTIFICATE" | base64 -D > "$certificate_path"
           security create-keychain -p "$keychain_password" "$keychain_path"
           security set-keychain-settings -lut 21600 "$keychain_path"
           security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$app_certificate_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
           security import "$certificate_path" \
             -k "$keychain_path" \
             -P "$APPLE_INSTALLER_CERTIFICATE_PASSWORD" \
@@ -121,19 +137,26 @@ jobs:
             -T /usr/bin/productsign \
             -T /usr/bin/security
           security set-key-partition-list \
-            -S apple-tool:,apple: \
+            -S apple-tool:,apple:,codesign: \
             -s \
             -k "$keychain_password" \
             "$keychain_path"
           security list-keychains -d user -s "$keychain_path"
           security default-keychain -s "$keychain_path"
 
-          sign_id="$(security find-identity -v "$keychain_path" | awk -F '"' '/Developer ID Installer/ { print $2; exit }')"
-          if [ -z "$sign_id" ]; then
+          app_sign_id="$(security find-identity -v "$keychain_path" | awk -F '"' '/Developer ID Application/ { print $2; exit }')"
+          installer_sign_id="$(security find-identity -v "$keychain_path" | awk -F '"' '/Developer ID Installer/ { print $2; exit }')"
+          if [ -z "$app_sign_id" ]; then
+            echo "::error::APPLE_CERTIFICATE does not contain a Developer ID Application identity."
+            exit 1
+          fi
+          if [ -z "$installer_sign_id" ]; then
             echo "::error::APPLE_INSTALLER_CERTIFICATE does not contain a Developer ID Installer identity."
             exit 1
           fi
-          echo "MACOS_INSTALLER_SIGN_ID=$sign_id" >> "$GITHUB_ENV"
+          echo "MACOS_APP_SIGN_ID=$app_sign_id" >> "$GITHUB_ENV"
+          echo "MACOS_INSTALLER_SIGN_ID=$installer_sign_id" >> "$GITHUB_ENV"
+          echo "MACOS_SIGNING_KEYCHAIN_PATH=$keychain_path" >> "$GITHUB_ENV"
 
       - name: Build CLI
         shell: bash
@@ -141,6 +164,19 @@ jobs:
           cargo build --release --locked --target "${{ matrix.target }}" \
             --manifest-path relaycat-cli/Cargo.toml \
             -p relaycat-cli
+
+      - name: Codesign macOS CLI binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="relaycat-cli/target/${{ matrix.target }}/release/relaycat"
+          codesign --force --timestamp --options runtime \
+            --keychain "$MACOS_SIGNING_KEYCHAIN_PATH" \
+            --sign "$MACOS_APP_SIGN_ID" \
+            "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+          codesign --display --verbose=2 "$binary"
 
       - name: Package CLI
         shell: bash
@@ -169,22 +205,14 @@ jobs:
           payload_dir="$RUNNER_TEMP/${name}-payload"
           mkdir -p "$payload_dir"
           cp "$package_dir/relaycat" "$payload_dir/relaycat"
-          if [ -n "${MACOS_INSTALLER_SIGN_ID:-}" ]; then
-            pkgbuild \
-              --root "$payload_dir" \
-              --identifier "ai.relaycat.cli" \
-              --version "$version" \
-              --install-location "/usr/local/bin" \
-              --sign "$MACOS_INSTALLER_SIGN_ID" \
-              "dist/${name}.pkg"
-          else
-            pkgbuild \
-              --root "$payload_dir" \
-              --identifier "ai.relaycat.cli" \
-              --version "$version" \
-              --install-location "/usr/local/bin" \
-              "dist/${name}.pkg"
-          fi
+          pkgbuild \
+            --root "$payload_dir" \
+            --identifier "ai.relaycat.cli" \
+            --version "$version" \
+            --install-location "/usr/local/bin" \
+            --sign "$MACOS_INSTALLER_SIGN_ID" \
+            "dist/${name}.pkg"
+          pkgutil --check-signature "dist/${name}.pkg"
 
       - name: Notarize macOS pkg
         if: runner.os == 'macOS'
@@ -195,20 +223,33 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          if [ -z "${MACOS_INSTALLER_SIGN_ID:-}" ]; then
-            echo "::warning::Pkg was unsigned; skipping notarization."
-            exit 0
-          fi
           if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
-            echo "::warning::Apple notarization credentials are missing; pkg is signed but not notarized."
-            exit 0
+            echo "::error::Apple notarization credentials are required for macOS CLI releases."
+            exit 1
           fi
           for pkg in dist/*.pkg; do
+            result_path="$RUNNER_TEMP/$(basename "$pkg").notary.json"
+            submit_status=0
             xcrun notarytool submit "$pkg" \
               --apple-id "$APPLE_ID" \
               --password "$APPLE_APP_PASSWORD" \
               --team-id "$APPLE_TEAM_ID" \
-              --wait
+              --wait \
+              --output-format json | tee "$result_path" || submit_status=$?
+
+            submission_id="$(jq -r '.id // empty' "$result_path")"
+            status="$(jq -r '.status // empty' "$result_path")"
+            if [ "$submit_status" -ne 0 ] || [ "$status" != "Accepted" ]; then
+              echo "::error::Apple notarization failed for $pkg with status: ${status:-unknown}"
+              if [ -n "$submission_id" ]; then
+                xcrun notarytool log "$submission_id" \
+                  --apple-id "$APPLE_ID" \
+                  --password "$APPLE_APP_PASSWORD" \
+                  --team-id "$APPLE_TEAM_ID" || true
+              fi
+              exit 1
+            fi
+
             xcrun stapler staple "$pkg"
             xcrun stapler validate "$pkg"
           done
