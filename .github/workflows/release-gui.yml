@@ -1,0 +1,302 @@
+name: Release GUI
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - "relaycat-gui-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "GUI version, for example 0.1.5 or v0.1.5"
+        required: true
+
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  validate:
+    name: Validate GUI version
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            raw="${{ inputs.version }}"
+          else
+            raw="${{ github.ref_name }}"
+            raw="${raw#relaycat-gui-}"
+          fi
+          version="${raw#v}"
+          tag="relaycat-gui-v${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check Tauri version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${{ steps.version.outputs.version }}"
+          actual="$(jq -r '.version' relaycat-gui/src-tauri/tauri.conf.json)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::relaycat-gui/src-tauri/tauri.conf.json version is $actual, expected $expected"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.artifact_suffix }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            artifact_suffix: macos-arm64
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - os: macos-15-intel
+            artifact_suffix: macos-x86_64
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+          - os: ubuntu-22.04
+            artifact_suffix: linux
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+          - os: windows-2022
+            artifact_suffix: windows
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: relaycat-gui/package-lock.json
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            file
+
+      - name: Import Apple Developer ID certificate
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ] || [ -z "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
+            echo "::warning::APPLE_CERTIFICATE not set; building an unsigned macOS bundle."
+            exit 0
+          fi
+
+          keychain_path="$RUNNER_TEMP/app-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          certificate_path="$RUNNER_TEMP/apple-certificate.p12"
+
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security default-keychain -s "$keychain_path"
+
+          sign_id="$(security find-identity -v -p codesigning "$keychain_path" | awk -F '"' '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$sign_id" ]; then
+            echo "::error::APPLE_CERTIFICATE does not contain a Developer ID Application identity."
+            exit 1
+          fi
+          echo "APPLE_SIGNING_IDENTITY=$sign_id" >> "$GITHUB_ENV"
+
+      - name: Build GUI bundles
+        working-directory: relaycat-gui
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          npm ci
+          extra=()
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY not set; building without updater artifacts."
+            extra+=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
+          fi
+          npx tauri build \
+            --target "${{ matrix.target }}" \
+            --bundles ${{ matrix.bundles }} \
+            ${extra[@]+"${extra[@]}"}
+
+      - name: Collect GUI artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate.outputs.version }}"
+          name="relaycat-gui-${version}-${{ matrix.artifact_suffix }}"
+          bundle_dir="relaycat-gui/src-tauri/target/${{ matrix.target }}/release/bundle"
+          mkdir -p dist
+          found=0
+
+          while IFS= read -r -d '' f; do
+            ext="${f##*.}"
+            cp "$f" "dist/${name}.${ext}"
+            found=1
+          done < <(find "$bundle_dir" -type f \
+            \( -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" \
+               -o -name "*.msi" -o -name "*.exe" \) -print0)
+
+          while IFS= read -r -d '' f; do
+            cp "$f" "dist/${name}.app.tar.gz"
+          done < <(find "$bundle_dir" -type f -name "*.app.tar.gz" -print0)
+
+          while IFS= read -r -d '' sig; do
+            case "${sig%.sig}" in
+              *.app.tar.gz) uext="app.tar.gz" ;;
+              *.AppImage)   uext="AppImage" ;;
+              *.exe)        uext="exe" ;;
+              *.msi)        uext="msi" ;;
+              *)            continue ;;
+            esac
+            cp "$sig" "dist/${name}.${uext}.sig"
+          done < <(find "$bundle_dir" -type f -name "*.sig" -print0)
+
+          if [ "$found" -eq 0 ]; then
+            echo "No GUI bundles found under $bundle_dir" >&2
+            find "$bundle_dir" -type f >&2 || true
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relaycat-gui-${{ matrix.artifact_suffix }}
+          path: dist/relaycat-gui-*
+          if-no-files-found: error
+
+  release:
+    name: Publish GUI release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create tag for manual releases
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.validate.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git rev-parse "$tag" >/dev/null 2>&1; then
+            git tag -a "$tag" -m "Release $tag"
+          fi
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            git push origin "refs/tags/$tag"
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Generate checksums and gui.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate.outputs.version }}"
+          tag="${{ needs.validate.outputs.tag }}"
+          base="https://github.com/${{ github.repository }}/releases/download/${tag}"
+          mkdir -p dist
+          find release-assets -maxdepth 3 -type f -print0 | xargs -0 -I{} cp {} dist/
+          (cd dist && sha256sum relaycat-gui-* > SHA256SUMS)
+
+          suffixes=(
+            "macos-arm64.app.tar.gz=darwin-aarch64"
+            "macos-x86_64.app.tar.gz=darwin-x86_64"
+            "linux.AppImage=linux-x86_64"
+            "windows.exe=windows-x86_64"
+          )
+
+          platforms="{}"
+          for entry in "${suffixes[@]}"; do
+            suffix="${entry%%=*}"
+            key="${entry#*=}"
+            file="relaycat-gui-${version}-${suffix}"
+            if [ -f "dist/$file" ] && [ -f "dist/${file}.sig" ]; then
+              platforms="$(jq \
+                --arg k "$key" \
+                --arg s "$(cat "dist/${file}.sig")" \
+                --arg u "${base}/${file}" \
+                '.[$k] = {signature: $s, url: $u}' \
+                <<<"$platforms")"
+            else
+              echo "::warning::missing signed updater artifact for $key ($file)"
+            fi
+          done
+
+          if [ "$platforms" != "{}" ]; then
+            jq -n \
+              --arg v "$version" \
+              --arg d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --argjson p "$platforms" \
+              '{version: $v, notes: "", pub_date: $d, platforms: $p}' \
+              > dist/gui.json
+          else
+            echo "::warning::No signed updater artifacts found; gui.json was not generated."
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: RelayCat GUI ${{ needs.validate.outputs.version }}
+          files: dist/*

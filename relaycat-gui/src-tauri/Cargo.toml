@@ -1,0 +1,71 @@
+[package]
+name = "relaycat-gui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "RelayCat desktop GUI (Tauri): a multi-tab terminal that reuses the relaycat CLI session core."
+repository = "https://example.invalid/relaycat-gui"
+
+[workspace]
+
+[lib]
+name = "relaycat_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "relaycat-gui"
+path = "src/main.rs"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+base64 = "0.22"
+qrcode = "0.14"
+regex = "1"
+relaycat-cli = { path = "../../relaycat-cli/crates/cli" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSButton",
+    "NSCell",
+    "NSControl",
+    "NSImage",
+    "NSResponder",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSGeometry",
+    "NSThread",
+] }
+
+[patch.crates-io]
+# relaycat-cli depends on the locally patched vt100 (wide-glyph resize fix);
+# the patch must be declared by the workspace doing the build.
+vt100 = { path = "../../relaycat-cli/third_party/vt100" }

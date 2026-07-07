@@ -1,0 +1,36 @@
+[workspace]
+members = [
+    "crates/cli",
+    "crates/crypto",
+]
+exclude = ["third_party/vt100"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://example.invalid/relaycat-cli"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[workspace.dependencies]
+relaycat-protocol = { version = "0.1", path = "../relaycat-protocol" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+portable-pty = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+
+[patch.crates-io]
+# Local vt100 carries a small wide-character resize fix until it is available
+# upstream: shrinking a row through the second half of a wide glyph must not
+# leave the first half dangling in the new last column.
+vt100 = { path = "third_party/vt100" }
