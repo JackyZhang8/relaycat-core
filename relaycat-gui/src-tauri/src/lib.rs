@@ -1058,8 +1058,8 @@ fn install_crash_logging() {
 
 /// Open an external https URL in the user's default browser.
 ///
-/// Restricted to https URLs on the RelayCat domains so the command can only
-/// ever launch the official website pages referenced from the About dialog.
+/// Restricted to https URLs for official RelayCat pages and the source repo
+/// links referenced from the UI.
 #[tauri::command]
 async fn open_url(url: String) -> Result<(), String> {
     let allowed = url.starts_with("https://")
@@ -1073,6 +1073,7 @@ async fn open_url(url: String) -> Result<(), String> {
                 || host == "www.relaycat.cn"
                 || host == "relaycat.app"
                 || host == "www.relaycat.app"
+                || (host == "github.com" && url == "https://github.com/jackyZhang8/relaycat-core")
         };
     if !allowed {
         return Err("blocked url".into());

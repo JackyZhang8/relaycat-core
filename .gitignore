@@ -1,0 +1,9 @@
+relaycat-server/target
+relaycat-cli/target
+relaycat-gui/dist
+relaycat-gui/node_modules
+relaycat-protocol/target
+relaycat-cli/third_party
+relaycat-server/conf.d
+.idea
+relaycat-server/rtasr_go

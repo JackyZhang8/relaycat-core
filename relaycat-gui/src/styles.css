@@ -463,8 +463,8 @@ button {
   display: flex;
   align-items: center;
   gap: 12px;
-  min-width: 220px;
-  padding: 10px 18px;
+  min-width: 260px;
+  padding: 9px 12px 9px 16px;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--panel);
@@ -483,6 +483,10 @@ button {
   flex: none;
   color: var(--text);
 }
+.lp-dl-txt {
+  flex: 1;
+  min-width: 0;
+}
 .lp-dl-name {
   font-size: 14px;
   font-weight: 700;
@@ -491,6 +495,57 @@ button {
 .lp-dl-meta {
   font-size: 11px;
   color: var(--gray);
+}
+.lp-dl-qr {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  cursor: pointer;
+  outline: none;
+  overflow: visible;
+}
+.lp-dl-qr img {
+  box-sizing: content-box;
+  width: 34px;
+  height: 34px;
+  display: block;
+  padding: 0;
+  border: 0 solid transparent;
+  border-radius: 4px;
+  background: #fff;
+  image-rendering: pixelated;
+  transform-origin: center right;
+  transition: transform 0.18s cubic-bezier(0.2, 0.9, 0.2, 1.12), box-shadow 0.18s ease, border-color 0.18s ease, padding 0.18s ease;
+}
+.lp-dl-qr:hover,
+.lp-dl-qr:focus-visible {
+  border-color: var(--accent);
+  z-index: 8;
+}
+.lp-dl-qr:hover img,
+.lp-dl-qr:focus-visible img {
+  transform: scale(3.6);
+  padding: 1px;
+  border: 1px solid #e8ded2;
+  box-shadow: 0 16px 34px -14px rgba(0, 0, 0, 0.42);
+  animation: qr-pop 0.22s ease-out;
+}
+@keyframes qr-pop {
+  0% {
+    transform: scale(1);
+  }
+  70% {
+    transform: scale(3.75);
+  }
+  100% {
+    transform: scale(3.6);
+  }
 }
 /* shared section */
 .lp-section {
