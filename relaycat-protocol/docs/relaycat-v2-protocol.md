@@ -435,6 +435,10 @@ input_seq == highest_contiguous_input_seq + 1 -> accept
 否则 -> gap
 ```
 
+`gap` 不得写入 PTY，也不得推进 `highest_contiguous_input_seq`。CLI 应重建
+relay transport，使 App 在 `PeerJoined(cli)` 后按序重发仍未 ACK 的输入；否则
+执行 gap 后的字节再累计确认会静默丢弃缺失输入。
+
 ### 5.11 input_ack_v2
 
 CLI 确认已经连续处理到哪个输入序号。

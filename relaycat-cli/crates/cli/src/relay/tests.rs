@@ -808,6 +808,54 @@ fn relay_input_action_routes_v2_input_events_for_dedupe() {
 }
 
 #[test]
+fn input_gap_requests_reconnect_without_writing_or_acknowledging() {
+    assert_eq!(
+        input_handling_for_decision(InputDecision::Gap),
+        InputHandling::Reconnect
+    );
+    assert_eq!(
+        input_handling_for_decision(InputDecision::Accept),
+        InputHandling::WriteAndAck
+    );
+    assert_eq!(
+        input_handling_for_decision(InputDecision::Duplicate),
+        InputHandling::AckOnly
+    );
+}
+
+#[tokio::test]
+async fn reliable_plain_event_waits_for_output_queue_capacity() {
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.send(PtyEvent::Output(vec![1]))
+        .await
+        .expect("fill queue");
+    let ack = PlainMsg::InputAckV2(InputAckV2 {
+        input_stream_id: "stream-1".to_string(),
+        highest_contiguous_input_seq: 1,
+    });
+    let send_task = tokio::spawn({
+        let tx = tx.clone();
+        let ack = ack.clone();
+        async move { enqueue_reliable_plain_event(&tx, ack).await }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !send_task.is_finished(),
+        "reliable ACK must wait while the queue is full"
+    );
+    assert!(matches!(rx.recv().await, Some(PtyEvent::Output(_))));
+    assert!(send_task.await.expect("send task"));
+    assert!(matches!(
+        rx.recv().await,
+        Some(PtyEvent::Plain(PlainMsg::InputAckV2(InputAckV2 {
+            input_stream_id,
+            highest_contiguous_input_seq: 1,
+        }))) if input_stream_id == "stream-1"
+    ));
+}
+
+#[test]
 fn local_input_filter_drops_focus_events() {
     let mut filter = LocalInputFilter::default();
 

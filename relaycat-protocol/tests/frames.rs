@@ -878,14 +878,14 @@ fn input_dedupe_accepts_next_sequence_once() {
 }
 
 #[test]
-fn input_dedupe_accepts_gap_and_fast_forwards_watermark() {
+fn input_dedupe_rejects_gap_without_advancing_watermark() {
     let mut dedupe = InputDedupe::default();
 
     assert_eq!(dedupe.observe("stream-1", 2), InputDecision::Gap);
+    assert_eq!(dedupe.highest_contiguous_input_seq(), 0);
+    assert_eq!(dedupe.observe("stream-1", 1), InputDecision::Accept);
+    assert_eq!(dedupe.observe("stream-1", 2), InputDecision::Accept);
     assert_eq!(dedupe.highest_contiguous_input_seq(), 2);
-    assert_eq!(dedupe.observe("stream-1", 1), InputDecision::Duplicate);
-    assert_eq!(dedupe.observe("stream-1", 3), InputDecision::Accept);
-    assert_eq!(dedupe.highest_contiguous_input_seq(), 3);
 }
 
 #[test]

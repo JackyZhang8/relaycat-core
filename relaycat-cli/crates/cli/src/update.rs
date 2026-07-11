@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::{args::UpdateArgs, config, i18n::CliLanguage};
 
 pub const DEFAULT_CLI_MANIFEST_URL: &str = "https://www.relaycat.cn/update/cli.json";
-pub const FALLBACK_CLI_MANIFEST_URL: &str = "https://relaycat.app/update/cli.json";
+pub const FALLBACK_CLI_MANIFEST_URL: &str = "https://relaycat.dev/update/cli.json";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CliUpdateManifest {

@@ -451,17 +451,10 @@ impl InputDedupe {
         if input_seq <= self.highest_contiguous_input_seq {
             return InputDecision::Duplicate;
         }
-        // A gap can only come from input the app deliberately dropped (its
-        // retransmit buffer trims the oldest un-acked events past a byte
-        // budget): the app sends in order on one socket and always resends
-        // pending events before new ones, so waiting for the missing seq would
-        // stall the stream forever. Accept the input and fast-forward the
-        // watermark; anything already applied sits at or below it, so this can
-        // never double-apply.
-        self.highest_contiguous_input_seq = input_seq;
         if input_seq != expected {
             return InputDecision::Gap;
         }
+        self.highest_contiguous_input_seq = input_seq;
         InputDecision::Accept
     }
 

@@ -101,7 +101,8 @@ const TERMINAL_V2_PATCH_RETENTION: usize = 4096;
 const PTY_OUTPUT_COALESCE_WINDOW: Duration = Duration::from_millis(250);
 /// Flush coalesced PTY output early once this many bytes have accumulated, so a
 /// single window can never grow an unbounded patch.
-const PTY_OUTPUT_COALESCE_MAX_BYTES: usize = 256 * 1024;/// How long after a PTY resize to wait for the TUI's repaint to start before
+const PTY_OUTPUT_COALESCE_MAX_BYTES: usize = 256 * 1024;
+/// How long after a PTY resize to wait for the TUI's repaint to start before
 /// thawing app-facing scrollback history. Node-based TUIs (claude, opencode)
 /// debounce SIGWINCH and begin their full-screen repaint hundreds of
 /// milliseconds after the resize; thawing before that lets the repaint scroll
@@ -188,6 +189,25 @@ enum PtyEvent {
     Output(Vec<u8>),
     Plain(PlainMsg),
     Exit(ExitStatus),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputHandling {
+    WriteAndAck,
+    AckOnly,
+    Reconnect,
+}
+
+fn input_handling_for_decision(decision: InputDecision) -> InputHandling {
+    match decision {
+        InputDecision::Accept => InputHandling::WriteAndAck,
+        InputDecision::Duplicate => InputHandling::AckOnly,
+        InputDecision::Gap => InputHandling::Reconnect,
+    }
+}
+
+async fn enqueue_reliable_plain_event(tx: &mpsc::Sender<PtyEvent>, msg: PlainMsg) -> bool {
+    tx.send(PtyEvent::Plain(msg)).await.is_ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1364,6 +1384,7 @@ where
     let heartbeat_output_tx_for_input = output_tx.clone();
     let terminal_v2_control_tx_for_input = terminal_v2_control_tx.clone();
     let reconnect_signal_tx_for_output = reconnect_signal_tx.clone();
+    let reconnect_signal_tx_for_input_gap = reconnect_signal_tx.clone();
     let pty_work_mode_for_input = pty_work_mode.clone();
     let pty_work_mode_for_relay_input = pty_work_mode.clone();
     let terminal_palette_for_relay = terminal_palette.palette.clone();
@@ -2214,38 +2235,53 @@ where
                             ),
                         );
                     }
-                    if decision != InputDecision::Duplicate {
-                        let bytes = if rewrite_app_wheel_input {
-                            let encoding = mouse_report_modes_for_relay_input
+                    match input_handling_for_decision(decision) {
+                        InputHandling::Reconnect => {
+                            relaycat_log(
+                                "WARN",
+                                format!(
+                                    "terminal input sequence gap stream={input_stream_id} seq={input_seq} highest_contiguous={}; reconnecting transport",
+                                    input_dedupe.highest_contiguous_input_seq(),
+                                ),
+                            );
+                            let _ = reconnect_signal_tx_for_input_gap.send(());
+                            continue;
+                        }
+                        InputHandling::AckOnly => {}
+                        InputHandling::WriteAndAck => {
+                            let bytes = if rewrite_app_wheel_input {
+                                let encoding = mouse_report_modes_for_relay_input
+                                    .lock()
+                                    .map(|modes| modes.wheel_encoding())
+                                    .unwrap_or(WheelEncoding::Sgr);
+                                let rewritten = rewrite_app_wheel_reports(&bytes, encoding);
+                                if rewritten.reports > 0 {
+                                    relaycat_log(
+                                        "INFO",
+                                        format!(
+                                            "terminal_input_wheel_rewrite encoding={encoding:?} reports={} bytes={}",
+                                            rewritten.reports,
+                                            rewritten.bytes.len()
+                                        ),
+                                    );
+                                }
+                                rewritten.bytes
+                            } else {
+                                bytes
+                            };
+                            let mut pty_writer = pty_writer_for_relay
                                 .lock()
-                                .map(|modes| modes.wheel_encoding())
-                                .unwrap_or(WheelEncoding::Sgr);
-                            let rewritten = rewrite_app_wheel_reports(&bytes, encoding);
-                            if rewritten.reports > 0 {
-                                relaycat_log(
-                                    "INFO",
-                                    format!(
-                                        "terminal_input_wheel_rewrite encoding={encoding:?} reports={} bytes={}",
-                                        rewritten.reports,
-                                        rewritten.bytes.len()
-                                    ),
-                                );
-                            }
-                            rewritten.bytes
-                        } else {
-                            bytes
-                        };
-                        let mut pty_writer = pty_writer_for_relay
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("pty writer lock poisoned"))?;
-                        pty_writer
-                            .write_all(&bytes)
-                            .context("failed to write terminal input")?;
-                        pty_writer
-                            .flush()
-                            .context("failed to flush terminal input")?;
+                                .map_err(|_| anyhow::anyhow!("pty writer lock poisoned"))?;
+                            pty_writer
+                                .write_all(&bytes)
+                                .context("failed to write terminal input")?;
+                            pty_writer
+                                .flush()
+                                .context("failed to flush terminal input")?;
+                        }
                     }
-                    let _ = heartbeat_output_tx_for_input.try_send(PtyEvent::Plain(
+                    if !enqueue_reliable_plain_event(
+                        &heartbeat_output_tx_for_input,
                         PlainMsg::InputAckV2(InputAckV2 {
                             input_stream_id: input_dedupe
                                 .input_stream_id()
@@ -2254,7 +2290,11 @@ where
                             highest_contiguous_input_seq: input_dedupe
                                 .highest_contiguous_input_seq(),
                         }),
-                    ));
+                    )
+                    .await
+                    {
+                        break;
+                    }
                 }
                 Some(RelayInputAction::ResumeV2(resume)) => {
                     input_dedupe.synchronize_ack(&resume.input_stream_id, resume.last_input_ack);
