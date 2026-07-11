@@ -372,7 +372,7 @@ fn deferred_history_thaw_keeps_delayed_resize_repaint_out_of_scrollback() {
     for line in 7..=9 {
         core.feed_vt_bytes(format!("line {line}\r\n").as_bytes());
     }
-    assert!(thaw.take_due(repaint_at + PTY_RESIZE_REPAINT_QUIET_WINDOW));
+    assert!(thaw.take_due(now + PTY_RESIZE_REPAINT_START_WINDOW));
     core.thaw_history();
 
     let snapshot = core.snapshot();
@@ -399,6 +399,41 @@ fn deferred_history_thaw_ignores_render_ack_during_resize_quiet_window() {
 }
 
 #[test]
+fn deferred_history_thaw_waits_for_a_debounced_repaint_to_start() {
+    // Node-based TUIs (claude, opencode) debounce SIGWINCH: their full-screen
+    // repaint begins hundreds of milliseconds after the resize. History must
+    // stay frozen until then, or the repaint scrolls the stale pre-resize
+    // frame into the app's history as duplicated rows.
+    let start = Instant::now();
+    let mut thaw = DeferredHistoryThaw::default();
+    thaw.request(start);
+
+    // Small unrelated writes (spinner frames, query replies) before the
+    // repaint must not cut the wait-for-repaint window short.
+    thaw.observe_pty_output(start + Duration::from_millis(10));
+    assert!(
+        !thaw.take_due(start + Duration::from_millis(10) + PTY_RESIZE_REPAINT_QUIET_WINDOW),
+        "early unrelated output must not shorten the wait-for-repaint window"
+    );
+
+    let repaint_at = start + Duration::from_millis(300);
+    assert!(
+        !thaw.take_due(repaint_at),
+        "history must stay frozen until the debounced repaint starts"
+    );
+    thaw.observe_pty_output(repaint_at);
+
+    // A repaint chunk near the end of the start window keeps extending it.
+    let late_chunk_at = start + PTY_RESIZE_REPAINT_START_WINDOW - Duration::from_millis(1);
+    thaw.observe_pty_output(late_chunk_at);
+    assert!(
+        !thaw.take_due(start + PTY_RESIZE_REPAINT_START_WINDOW),
+        "repaint chunks must extend the freeze past the start window"
+    );
+    assert!(thaw.take_due(late_chunk_at + PTY_RESIZE_REPAINT_QUIET_WINDOW));
+}
+
+#[test]
 fn deferred_history_thaw_has_maximum_freeze_window() {
     let start = Instant::now();
     let mut thaw = DeferredHistoryThaw::default();
@@ -410,6 +445,14 @@ fn deferred_history_thaw_has_maximum_freeze_window() {
     assert!(
         thaw.take_due(start + PTY_RESIZE_REPAINT_FREEZE_MAX_WINDOW),
         "continuous output after resize must not keep history frozen indefinitely"
+    );
+}
+
+#[test]
+fn codex_does_not_receive_a_synthetic_startup_resize_kick() {
+    assert!(
+        !should_schedule_startup_resize_kick(&SessionKind::codex()),
+        "codex already paints at the negotiated PTY size; a delayed synthetic SIGWINCH triggers a second, broken full-screen repaint"
     );
 }
 
@@ -1199,6 +1242,221 @@ fn local_output_filter_passes_decxcpr_to_local_only() {
     assert_eq!(filtered.local_output, b"a\x1b[?6nb");
     assert_eq!(filtered.remote_output, b"ab");
     assert_eq!(filtered.pty_input, b"");
+}
+
+#[test]
+fn local_output_filter_answers_cpr_for_managed_alt_screen() {
+    let mut filter = LocalOutputFilter {
+        strip_alternate_screen_from_remote: true,
+        ..LocalOutputFilter::default()
+    };
+
+    // For managed-alt-screen TUIs (codex, opencode) the host terminal's
+    // geometry differs from the child PTY, so answer without consulting the
+    // host and without leaving the child on a timeout/fallback path.
+    let filtered = filter.filter(b"a\x1b[6nb");
+    assert_eq!(filtered.local_output, b"ab");
+    assert_eq!(filtered.remote_output, b"ab");
+    assert_eq!(filtered.pty_input, b"\x1b[1;1R");
+
+    let filtered = filter.filter(b"a\x1b[?6nb");
+    assert_eq!(filtered.local_output, b"ab");
+    assert_eq!(filtered.remote_output, b"ab");
+    assert_eq!(filtered.pty_input, b"\x1b[?1;1R");
+}
+
+#[test]
+fn local_output_filter_answers_text_area_size_for_managed_alt_screen() {
+    let mut filter = LocalOutputFilter {
+        strip_alternate_screen_from_remote: true,
+        pty_cols: 48,
+        pty_rows: 35,
+        ..LocalOutputFilter::default()
+    };
+
+    let filtered = filter.filter(b"a\x1b[18tb");
+    assert_eq!(filtered.local_output, b"ab");
+    assert_eq!(filtered.remote_output, b"ab");
+    assert_eq!(filtered.pty_input, b"\x1b[8;35;48t");
+}
+
+fn oversized_codex_welcome_card() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"before\r\n\x1b[2m");
+    bytes.extend_from_slice("╭".as_bytes());
+    bytes.extend_from_slice("─".repeat(50).as_bytes());
+    bytes.extend_from_slice("╮\x1b[0m\r\n".as_bytes());
+    bytes.extend_from_slice("\x1b[2m│ >_ \x1b[1mOpenAI Codex\x1b[22m (v0.144.1)".as_bytes());
+    bytes.extend_from_slice(" ".repeat(20).as_bytes());
+    bytes.extend_from_slice("│\x1b[0m\r\n".as_bytes());
+    bytes.extend_from_slice(
+        "\x1b[2m│ model:     \x1b[22mgpt-5.6-sol medium   /model to change │\x1b[0m\r\n".as_bytes(),
+    );
+    bytes.extend_from_slice("\x1b[2m│ directory: \x1b[22m~/rustdev/relaycat-v3".as_bytes());
+    bytes.extend_from_slice(" ".repeat(14).as_bytes());
+    bytes.extend_from_slice("│\x1b[0m\r\n".as_bytes());
+    bytes.extend_from_slice("\x1b[2m╰".as_bytes());
+    bytes.extend_from_slice("─".repeat(50).as_bytes());
+    bytes.extend_from_slice("╯\x1b[0m\r\nafter".as_bytes());
+    bytes
+}
+
+#[test]
+fn codex_welcome_normalizer_uses_current_pty_width() {
+    for cols in [48_u16, 50, 60] {
+        let mut normalizer = CodexWelcomeNormalizer::new(true);
+        let output = normalizer.filter(&oversized_codex_welcome_card(), cols);
+        assert_eq!(normalizer.take_normalized_count(), 1);
+        let visible = terminal_visible_text_for_test(&output);
+        let box_lines: Vec<&str> = visible
+            .lines()
+            .filter(|line| line.starts_with('╭') || line.starts_with('│') || line.starts_with('╰'))
+            .collect();
+        assert_eq!(box_lines.len(), 5);
+        for line in box_lines {
+            assert_eq!(
+                terminal_display_width_for_test(line),
+                usize::from(cols - 1),
+                "{line:?}"
+            );
+        }
+        assert!(visible.starts_with("before\n╭"));
+        assert!(visible.ends_with("after"));
+    }
+}
+
+#[test]
+fn codex_welcome_normalizer_leaves_last_terminal_column_unused() {
+    let mut normalizer = CodexWelcomeNormalizer::new(true);
+    let output = normalizer.filter(&oversized_codex_welcome_card(), 48);
+    let visible = terminal_visible_text_for_test(&output);
+
+    for line in visible
+        .lines()
+        .filter(|line| matches!(line.chars().next(), Some('╭' | '│' | '╰')))
+    {
+        assert_eq!(terminal_display_width_for_test(line), 47, "{line:?}");
+    }
+}
+
+#[test]
+fn codex_welcome_normalizer_handles_byte_by_byte_chunks() {
+    let input = oversized_codex_welcome_card();
+    let mut normalizer = CodexWelcomeNormalizer::new(true);
+    let mut output = Vec::new();
+    for byte in input {
+        output.extend_from_slice(&normalizer.filter(&[byte], 48));
+    }
+    output.extend_from_slice(&normalizer.finish());
+
+    let visible = terminal_visible_text_for_test(&output);
+    assert!(visible.contains("OpenAI Codex"));
+    for line in visible
+        .lines()
+        .filter(|line| matches!(line.chars().next(), Some('╭' | '│' | '╰')))
+    {
+        assert_eq!(terminal_display_width_for_test(line), 47);
+    }
+}
+
+#[test]
+fn codex_welcome_normalizer_passes_unrelated_box_and_disabled_sessions_unchanged() {
+    let unrelated = "prefix╭────────╮\r\n│ settings │\r\n╰────────╯\r\nsuffix".as_bytes();
+    let mut enabled = CodexWelcomeNormalizer::new(true);
+    assert_eq!(enabled.filter(unrelated, 48), unrelated);
+
+    let card = oversized_codex_welcome_card();
+    let mut disabled = CodexWelcomeNormalizer::new(false);
+    assert_eq!(disabled.filter(&card, 48), card);
+}
+
+#[test]
+fn codex_welcome_normalizer_flushes_incomplete_candidate_unchanged() {
+    let incomplete = "prefix╭────────────────\r\n│ OpenAI Codex".as_bytes();
+    let mut normalizer = CodexWelcomeNormalizer::new(true);
+    let mut output = normalizer.filter(incomplete, 48);
+    output.extend_from_slice(&normalizer.finish());
+    assert_eq!(output, incomplete);
+}
+
+#[test]
+fn codex_welcome_normalizer_does_not_capture_live_cursor_positioned_screen() {
+    let live = concat!(
+        "\x1b[2;1H\x1b[2m╭────────────────────────╮",
+        "\x1b[3;1H│ >_ \x1b[1mOpenAI Codex\x1b[22m │",
+        "\x1b[4;1H╰────────────────────────╯",
+        "\x1b[10;1H›\r\nlater"
+    )
+    .as_bytes();
+    let mut normalizer = CodexWelcomeNormalizer::new(true);
+    let mut output = normalizer.filter(live, 48);
+    output.extend_from_slice(&normalizer.finish());
+    assert_eq!(output, live);
+}
+
+#[test]
+fn codex_welcome_normalizer_preserves_utf8_cell_boundaries() {
+    let card = concat!(
+        "\r\n╭──────────────────────────╮\r\n",
+        "│ OpenAI Codex             │\r\n",
+        "│ 模型: 你好世界你好世界   │\r\n",
+        "╰──────────────────────────╯\r\n"
+    )
+    .as_bytes();
+    let mut normalizer = CodexWelcomeNormalizer::new(true);
+    let output = normalizer.filter(card, 20);
+    let visible = terminal_visible_text_for_test(&output);
+    assert!(!visible.contains('�'));
+    assert!(visible.contains("模型"));
+    for line in visible
+        .lines()
+        .filter(|line| matches!(line.chars().next(), Some('╭' | '│' | '╰')))
+    {
+        assert_eq!(terminal_display_width_for_test(line), 19);
+    }
+}
+
+#[test]
+fn codex_welcome_normalizer_bounds_candidate_memory_and_falls_back() {
+    let mut input = "\r\n╭────────\r\n│ OpenAI Codex ".as_bytes().to_vec();
+    input.extend(std::iter::repeat_n(b'x', 33 * 1024));
+    let mut normalizer = CodexWelcomeNormalizer::new(true);
+    let mut output = normalizer.filter(&input, 48);
+    output.extend_from_slice(&normalizer.finish());
+    assert_eq!(output, input);
+}
+
+#[test]
+fn local_output_filter_answers_split_text_area_size_query() {
+    let mut filter = LocalOutputFilter {
+        strip_alternate_screen_from_remote: true,
+        pty_cols: 48,
+        pty_rows: 35,
+        ..LocalOutputFilter::default()
+    };
+
+    let first = filter.filter(b"a\x1b[1");
+    assert_eq!(first.local_output, b"a");
+    assert_eq!(first.remote_output, b"a");
+    assert!(first.pty_input.is_empty());
+
+    let second = filter.filter(b"8tb");
+    assert_eq!(second.local_output, b"b");
+    assert_eq!(second.remote_output, b"b");
+    assert_eq!(second.pty_input, b"\x1b[8;35;48t");
+}
+
+#[test]
+fn local_output_filter_does_not_invent_unknown_text_area_size() {
+    let mut filter = LocalOutputFilter {
+        strip_alternate_screen_from_remote: true,
+        ..LocalOutputFilter::default()
+    };
+
+    let filtered = filter.filter(b"a\x1b[18tb");
+    assert_eq!(filtered.local_output, b"ab");
+    assert_eq!(filtered.remote_output, b"ab");
+    assert!(filtered.pty_input.is_empty());
 }
 
 #[test]

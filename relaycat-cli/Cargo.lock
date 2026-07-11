@@ -1106,6 +1106,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tokio-tungstenite",
+ "unicode-width 0.2.2",
  "vt100",
 ]
 

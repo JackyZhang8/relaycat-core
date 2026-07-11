@@ -101,14 +101,34 @@ const TERMINAL_V2_PATCH_RETENTION: usize = 4096;
 const PTY_OUTPUT_COALESCE_WINDOW: Duration = Duration::from_millis(250);
 /// Flush coalesced PTY output early once this many bytes have accumulated, so a
 /// single window can never grow an unbounded patch.
-const PTY_OUTPUT_COALESCE_MAX_BYTES: usize = 256 * 1024;
-/// Quiet window used only after PTY resize to absorb delayed TUI repaint bytes
-/// before app-facing scrollback history is thawed again.
-const PTY_RESIZE_REPAINT_QUIET_WINDOW: Duration = Duration::from_millis(25);
+const PTY_OUTPUT_COALESCE_MAX_BYTES: usize = 256 * 1024;/// How long after a PTY resize to wait for the TUI's repaint to start before
+/// thawing app-facing scrollback history. Node-based TUIs (claude, opencode)
+/// debounce SIGWINCH and begin their full-screen repaint hundreds of
+/// milliseconds after the resize; thawing before that lets the repaint scroll
+/// the stale pre-resize frame into the app's history, where it shows up as
+/// duplicated rows right above the redrawn screen.
+const PTY_RESIZE_REPAINT_START_WINDOW: Duration = Duration::from_millis(500);
+/// Quiet window used only after PTY resize: each observed repaint chunk keeps
+/// history frozen for at least this much longer, so a repaint that spans
+/// several PTY reads is absorbed in full.
+const PTY_RESIZE_REPAINT_QUIET_WINDOW: Duration = Duration::from_millis(100);
 /// Maximum time to keep scrollback history frozen after an explicit PTY resize.
 /// The quiet window absorbs delayed TUI repaint bytes, but this cap prevents
 /// real post-resize output from being discarded indefinitely.
-const PTY_RESIZE_REPAINT_FREEZE_MAX_WINDOW: Duration = Duration::from_millis(150);
+const PTY_RESIZE_REPAINT_FREEZE_MAX_WINDOW: Duration = Duration::from_millis(1500);
+/// A remote resize that lands moments after the child spawns can race the
+/// child's own startup: the TUI reads the terminal size before the resize is
+/// applied, and the resize's SIGWINCH is delivered before the TUI installs its
+/// handler, so it keeps rendering at the stale pre-resize width. When a remote
+/// resize is applied within this window after spawn, re-signal SIGWINCH shortly
+/// after so the TUI re-reads the (already correct) PTY size and repaints.
+const PTY_STARTUP_RESIZE_KICK_WINDOW: Duration = Duration::from_secs(10);
+/// Delays after such an early remote resize at which SIGWINCH is re-sent to the
+/// child's process group. Multiple kicks cover a TUI that is still
+/// initialising (and thus not yet listening) at the time of the first kick.
+#[cfg(unix)]
+const PTY_STARTUP_RESIZE_KICK_DELAYS: [Duration; 2] =
+    [Duration::from_millis(1200), Duration::from_millis(3000)];
 /// Bound on buffered PTY events. A bounded channel applies backpressure to the
 /// PTY reader (and thus the child process) when the relay cannot keep up,
 /// instead of letting memory grow without limit during output bursts.
@@ -398,17 +418,19 @@ struct DeferredHistoryThaw {
 impl DeferredHistoryThaw {
     fn request(&mut self, now: Instant) {
         self.started_at = Some(now);
-        self.deadline = Some(now + PTY_RESIZE_REPAINT_QUIET_WINDOW);
+        self.deadline = Some(now + PTY_RESIZE_REPAINT_START_WINDOW);
     }
 
     fn observe_pty_output(&mut self, now: Instant) {
-        if self.deadline.is_some()
+        if let Some(deadline) = self.deadline
             && let Some(started_at) = self.started_at
         {
-            self.deadline = Some(
-                (now + PTY_RESIZE_REPAINT_QUIET_WINDOW)
-                    .min(started_at + PTY_RESIZE_REPAINT_FREEZE_MAX_WINDOW),
-            );
+            // Only ever extend the window: small unrelated writes (spinner
+            // frames, query replies) before the repaint starts must not cut
+            // the wait-for-repaint window short.
+            let extended = (now + PTY_RESIZE_REPAINT_QUIET_WINDOW)
+                .min(started_at + PTY_RESIZE_REPAINT_FREEZE_MAX_WINDOW);
+            self.deadline = Some(deadline.max(extended));
         }
     }
 
@@ -827,6 +849,7 @@ where
         .spawn_command(command)
         .with_context(|| format!("failed to spawn {}", target.program))?;
     let child_pid = child.process_id();
+    let child_spawned_at = Instant::now();
     let child_program_name = target.program.clone();
     let child_program_name_for_exit = child_program_name.clone();
     let child_killer = Arc::new(Mutex::new(child.clone_killer()));
@@ -936,6 +959,8 @@ where
     let output_filter_color_query_palette =
         child_color_query_palette(&terminal_palette, &target.session_kind);
     let strip_alternate_screen_from_remote = target.session_kind.uses_managed_alt_screen();
+    let normalize_codex_welcome = target.session_kind == SessionKind::codex();
+    let allow_startup_resize_kick = should_schedule_startup_resize_kick(&target.session_kind);
     // On Windows the GUI relay child runs under a ConPTY and the host xterm's
     // CPR response never makes it back into the inner pseudoconsole, so answer
     // the shell's cursor-position query ourselves rather than forwarding it.
@@ -945,6 +970,10 @@ where
     // viewport). The output thread reads it to expand a full-screen child's
     // bottom-anchored scroll region to the taller host terminal's height; the
     // resize handlers below update it whenever they re-size the PTY.
+    let pty_viewport_cols = Arc::new(AtomicU16::new(initial_terminal_cols));
+    let pty_viewport_cols_for_output = pty_viewport_cols.clone();
+    let pty_viewport_cols_for_local_input = pty_viewport_cols.clone();
+    let pty_viewport_cols_for_relay_input = pty_viewport_cols.clone();
     let pty_viewport_rows = Arc::new(AtomicU16::new(initial_terminal_rows));
     let pty_viewport_rows_for_output = pty_viewport_rows.clone();
     let pty_viewport_rows_for_local_input = pty_viewport_rows.clone();
@@ -975,6 +1004,7 @@ where
         let stdout = io::stdout();
         let mut output_filter =
             LocalOutputFilter::new_with_color_query_palette(output_filter_color_query_palette);
+        let mut codex_welcome_normalizer = CodexWelcomeNormalizer::new(normalize_codex_welcome);
         output_filter.strip_alternate_screen_from_remote = strip_alternate_screen_from_remote;
         output_filter.answer_cursor_position_query = answer_cursor_position_query;
         let _ = pty_work_mode_for_output_thread;
@@ -983,6 +1013,27 @@ where
         loop {
             let read = pty_reader.read(&mut buffer)?;
             if read == 0 {
+                let trailing = codex_welcome_normalizer.finish();
+                if !trailing.is_empty() {
+                    let filtered_output = output_filter.filter(&trailing);
+                    if !filtered_output.pty_input.is_empty()
+                        && let Ok(mut writer) = pty_writer_for_output_thread.lock()
+                    {
+                        writer.write_all(&filtered_output.pty_input)?;
+                        writer.flush()?;
+                    }
+                    if !filtered_output.local_output.is_empty() {
+                        let mut handle = stdout.lock();
+                        handle.write_all(&filtered_output.local_output)?;
+                        handle.flush()?;
+                        status_bar_for_output_thread
+                            .observe_child_output(&filtered_output.local_output);
+                    }
+                    if !filtered_output.remote_output.is_empty() {
+                        let _ = output_thread_tx
+                            .blocking_send(PtyEvent::Output(filtered_output.remote_output));
+                    }
+                }
                 break;
             }
             let log_this_read = !logged_first_read;
@@ -1002,6 +1053,7 @@ where
             // terminal height (re-read here so a mid-session host resize is
             // picked up). TIOCGWINSZ is a cheap ioctl, so polling per read is
             // fine.
+            output_filter.pty_cols = pty_viewport_cols_for_output.load(Ordering::Acquire);
             output_filter.pty_rows = pty_viewport_rows_for_output.load(Ordering::Acquire);
             // On the Windows GUI pipe bridge the desktop terminal is letterboxed
             // to the negotiated (phone) grid, so its xterm is exactly `pty_rows`
@@ -1018,12 +1070,24 @@ where
             } else {
                 current_terminal_size().map(|size| size.rows).unwrap_or(0)
             };
+            let normalized_output =
+                codex_welcome_normalizer.filter(&buffer[..read], output_filter.pty_cols);
+            let normalized_cards = codex_welcome_normalizer.take_normalized_count();
+            if normalized_cards > 0 {
+                relaycat_log(
+                    "INFO",
+                    format!(
+                        "codex welcome: normalized {normalized_cards} card(s) to {} columns",
+                        output_filter.pty_cols
+                    ),
+                );
+            }
             if rewrite_app_wheel_input
                 && let Ok(mut modes) = mouse_report_modes_for_output_thread.lock()
             {
-                modes.observe_output(&buffer[..read]);
+                modes.observe_output(&normalized_output);
             }
-            let filtered_output = output_filter.filter(&buffer[..read]);
+            let filtered_output = output_filter.filter(&normalized_output);
             if log_this_read {
                 relaycat_log(
                     "INFO",
@@ -1140,6 +1204,7 @@ where
                             // to stop letterboxing to the phone grid and use its
                             // full width; remote mode re-pins it below.
                             clear_remote_size_for_gui();
+                            pty_viewport_cols_for_local_input.store(size.cols, Ordering::Release);
                             pty_viewport_rows_for_local_input.store(size.rows, Ordering::Release);
                             let _ = terminal_v2_control_tx
                                 .send(TerminalV2Control::LocalResize { pty_size: size });
@@ -1190,6 +1255,8 @@ where
                                     // Tell the GUI the negotiated grid so it can
                                     // letterbox the desktop window to match.
                                     emit_remote_size_for_gui(pty_cols, pty_rows);
+                                    pty_viewport_cols_for_local_input
+                                        .store(pty_cols, Ordering::Release);
                                     pty_viewport_rows_for_local_input
                                         .store(pty_rows, Ordering::Release);
                                     let (model_cols, model_rows) =
@@ -2269,6 +2336,8 @@ where
                             // Tell the GUI the negotiated grid so it can
                             // letterbox the desktop window to match the phone.
                             emit_remote_size_for_gui(effective_cols, effective_rows);
+                            pty_viewport_cols_for_relay_input
+                                .store(effective_cols, Ordering::Release);
                             pty_viewport_rows_for_relay_input
                                 .store(effective_rows, Ordering::Release);
                             // The app-facing model mirrors the PTY so the desktop
@@ -2293,6 +2362,14 @@ where
                                 });
                             let _ = terminal_v2_control_tx_for_input
                                 .send(TerminalV2Control::ThawHistory);
+                            if allow_startup_resize_kick
+                                && child_spawned_at.elapsed() < PTY_STARTUP_RESIZE_KICK_WINDOW
+                            {
+                                schedule_startup_resize_kick(
+                                    child_pid,
+                                    terminal_v2_control_tx_for_input.clone(),
+                                );
+                            }
                         } else {
                             relaycat_log(
                                 "INFO",
@@ -2383,6 +2460,60 @@ pub(crate) fn kill_child_process_group(child_pid: Option<u32>) {
 
 #[cfg(not(unix))]
 pub(crate) fn kill_child_process_group(_child_pid: Option<u32>) {}
+
+fn should_schedule_startup_resize_kick(session_kind: &SessionKind) -> bool {
+    // Codex already observes the negotiated PTY size before its first frame.
+    // A delayed synthetic SIGWINCH forces a second full-screen repaint; on
+    // macOS that repaint is the transition that produces the right-edge wrap
+    // seen by both the GUI and the paired app.
+    session_kind.as_str() != "codex"
+}
+
+/// See [`PTY_STARTUP_RESIZE_KICK_WINDOW`]. Re-sends `SIGWINCH` to the child's
+/// process group after an early remote resize so a TUI that read the terminal
+/// size before the resize was applied (and missed the resize's own SIGWINCH
+/// while still installing handlers) re-reads the PTY size and repaints at the
+/// correct width. A kick is a no-op for a TUI already at the right size beyond
+/// a same-size repaint; history is frozen around each kick so that repaint
+/// churn never reaches app-facing scrollback, mirroring the resize path.
+#[cfg(unix)]
+fn schedule_startup_resize_kick(
+    child_pid: Option<u32>,
+    control_tx: mpsc::UnboundedSender<TerminalV2Control>,
+) {
+    let Some(pid) = child_pid.and_then(|pid| i32::try_from(pid).ok()) else {
+        return;
+    };
+    thread::spawn(move || {
+        let mut slept = Duration::ZERO;
+        for delay in PTY_STARTUP_RESIZE_KICK_DELAYS {
+            thread::sleep(delay.saturating_sub(slept));
+            slept = delay;
+            if control_tx.send(TerminalV2Control::FreezeHistory).is_err() {
+                return;
+            }
+            relaycat_log(
+                "INFO",
+                "size: startup resize kick; re-sent SIGWINCH to child process group",
+            );
+            // SAFETY: sending a signal to a process group is memory-safe; the
+            // result is intentionally ignored (the group may already be gone).
+            unsafe {
+                libc::kill(-pid, libc::SIGWINCH);
+            }
+            if control_tx.send(TerminalV2Control::ThawHistory).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn schedule_startup_resize_kick(
+    _child_pid: Option<u32>,
+    _control_tx: mpsc::UnboundedSender<TerminalV2Control>,
+) {
+}
 
 /// Build the `(program, args)` used to launch the inner tool inside the ConPTY
 /// on Windows. Batch-file shims (`.cmd`/`.bat`, e.g. npm-installed codex /

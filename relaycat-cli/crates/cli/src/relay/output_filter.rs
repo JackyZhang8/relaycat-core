@@ -1,4 +1,315 @@
 use super::*;
+use unicode_width::UnicodeWidthChar;
+#[cfg(test)]
+use unicode_width::UnicodeWidthStr;
+
+const CODEX_WELCOME_TOP_LEFT: &[u8] = "╭".as_bytes();
+const CODEX_WELCOME_BOTTOM_LEFT: &[u8] = "╰".as_bytes();
+const CODEX_WELCOME_MAX_BYTES: usize = 32 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct CodexWelcomeNormalizer {
+    enabled: bool,
+    marker_probe: Vec<u8>,
+    candidate: Vec<u8>,
+    in_candidate: bool,
+    normal_line_prefix: Vec<u8>,
+    normal_line_started_by_newline: bool,
+    normalized_since_take: usize,
+}
+
+impl CodexWelcomeNormalizer {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            marker_probe: Vec::new(),
+            candidate: Vec::new(),
+            in_candidate: false,
+            normal_line_prefix: Vec::new(),
+            normal_line_started_by_newline: false,
+            normalized_since_take: 0,
+        }
+    }
+
+    pub(crate) fn filter(&mut self, bytes: &[u8], cols: u16) -> Vec<u8> {
+        if !self.enabled {
+            return bytes.to_vec();
+        }
+
+        let mut output = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            if self.in_candidate {
+                self.candidate.push(byte);
+                if self.candidate.len() > CODEX_WELCOME_MAX_BYTES {
+                    let original = std::mem::take(&mut self.candidate);
+                    output.extend_from_slice(&original);
+                    self.observe_normal_bytes(&original);
+                    self.in_candidate = false;
+                    continue;
+                }
+                if byte == b'\n' && contains_bytes(&self.candidate, CODEX_WELCOME_BOTTOM_LEFT) {
+                    if contains_bytes(&self.candidate, b"OpenAI Codex") {
+                        output.extend_from_slice(&normalize_codex_welcome_card(
+                            &self.candidate,
+                            cols,
+                        ));
+                        self.normalized_since_take += 1;
+                    } else {
+                        output.append(&mut self.candidate);
+                    }
+                    self.candidate.clear();
+                    self.in_candidate = false;
+                    self.normal_line_prefix.clear();
+                    self.normal_line_started_by_newline = true;
+                }
+                continue;
+            }
+
+            self.marker_probe.push(byte);
+            while !CODEX_WELCOME_TOP_LEFT.starts_with(&self.marker_probe) {
+                let emitted = self.marker_probe.remove(0);
+                output.push(emitted);
+                self.observe_normal_byte(emitted);
+            }
+            if self.marker_probe == CODEX_WELCOME_TOP_LEFT {
+                let visible_prefix = terminal_visible_text(&self.normal_line_prefix);
+                if self.normal_line_started_by_newline && visible_prefix.is_empty() {
+                    self.candidate.append(&mut self.marker_probe);
+                    self.in_candidate = true;
+                } else {
+                    let marker = std::mem::take(&mut self.marker_probe);
+                    output.extend_from_slice(&marker);
+                    self.observe_normal_bytes(&marker);
+                }
+            }
+        }
+        output
+    }
+
+    pub(crate) fn finish(&mut self) -> Vec<u8> {
+        let mut output = Vec::new();
+        output.append(&mut self.marker_probe);
+        output.append(&mut self.candidate);
+        self.in_candidate = false;
+        output
+    }
+
+    pub(crate) fn take_normalized_count(&mut self) -> usize {
+        std::mem::take(&mut self.normalized_since_take)
+    }
+
+    fn observe_normal_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.observe_normal_byte(byte);
+        }
+    }
+
+    fn observe_normal_byte(&mut self, byte: u8) {
+        if byte == b'\n' {
+            self.normal_line_prefix.clear();
+            self.normal_line_started_by_newline = true;
+            return;
+        }
+        if self.normal_line_prefix.len() < 4 * 1024 {
+            self.normal_line_prefix.push(byte);
+        }
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn normalize_codex_welcome_card(card: &[u8], cols: u16) -> Vec<u8> {
+    if cols < 4 {
+        return card.to_vec();
+    }
+    let mut output = Vec::with_capacity(card.len());
+    let mut start = 0;
+    for (index, byte) in card.iter().enumerate() {
+        if *byte == b'\n' {
+            output.extend_from_slice(&normalize_codex_welcome_line(&card[start..=index], cols));
+            start = index + 1;
+        }
+    }
+    if start < card.len() {
+        output.extend_from_slice(&card[start..]);
+    }
+    output
+}
+
+fn normalize_codex_welcome_line(line: &[u8], cols: u16) -> Vec<u8> {
+    // Keep the final PTY column unused. Filling it leaves many VT emulators in
+    // the delayed-autowrap state, so the next printable byte can create a
+    // one-line continuation at column zero even though the card was already
+    // narrowed to the reported terminal width.
+    let card_cols = cols.saturating_sub(1);
+    let visible = terminal_visible_text(line);
+    let Some(first) = visible.chars().next() else {
+        return line.to_vec();
+    };
+    match first {
+        '╭' => rebuild_codex_border_line(line, card_cols, '╭', '╮'),
+        '╰' => rebuild_codex_border_line(line, card_cols, '╰', '╯'),
+        '│' => rebuild_codex_content_line(line, card_cols),
+        _ => line.to_vec(),
+    }
+}
+
+fn rebuild_codex_border_line(line: &[u8], cols: u16, left: char, right: char) -> Vec<u8> {
+    let (body, ending) = split_line_ending(line);
+    let first_printable = first_printable_offset(body).unwrap_or(0);
+    let mut output = Vec::with_capacity(body.len());
+    output.extend_from_slice(&body[..first_printable]);
+    output.extend_from_slice(left.to_string().as_bytes());
+    output.extend_from_slice("─".repeat(usize::from(cols.saturating_sub(2))).as_bytes());
+    output.extend_from_slice(right.to_string().as_bytes());
+    output.extend_from_slice(b"\x1b[0m");
+    output.extend_from_slice(ending);
+    output
+}
+
+fn rebuild_codex_content_line(line: &[u8], cols: u16) -> Vec<u8> {
+    let (body, ending) = split_line_ending(line);
+    let target_before_right_border = usize::from(cols.saturating_sub(1));
+    let mut output = Vec::with_capacity(body.len());
+    let mut index = 0;
+    let mut width = 0;
+    let mut saw_printable = false;
+    while index < body.len() {
+        if let Some(len) = terminal_control_sequence_len(&body[index..]) {
+            output.extend_from_slice(&body[index..index + len]);
+            index += len;
+            continue;
+        }
+        let Some((ch, len)) = next_utf8_char(&body[index..]) else {
+            output.push(body[index]);
+            index += 1;
+            continue;
+        };
+        let char_width = ch.width().unwrap_or(0);
+        if saw_printable && ch == '│' {
+            break;
+        }
+        if width + char_width > target_before_right_border {
+            break;
+        }
+        output.extend_from_slice(&body[index..index + len]);
+        width += char_width;
+        saw_printable = saw_printable || char_width > 0;
+        index += len;
+    }
+    output.extend(std::iter::repeat_n(
+        b' ',
+        target_before_right_border.saturating_sub(width),
+    ));
+    output.extend_from_slice(b"\x1b[0m\x1b[2m");
+    output.extend_from_slice("│".as_bytes());
+    output.extend_from_slice(b"\x1b[0m");
+    output.extend_from_slice(ending);
+    output
+}
+
+fn split_line_ending(line: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(body) = line.strip_suffix(b"\r\n") {
+        (body, b"\r\n")
+    } else if let Some(body) = line.strip_suffix(b"\n") {
+        (body, b"\n")
+    } else {
+        (line, b"")
+    }
+}
+
+fn first_printable_offset(bytes: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(len) = terminal_control_sequence_len(&bytes[index..]) {
+            index += len;
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn terminal_control_sequence_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.first().copied() != Some(0x1b) {
+        return None;
+    }
+    match bytes.get(1).copied() {
+        Some(b'[') => bytes[2..]
+            .iter()
+            .position(|byte| (0x40..=0x7e).contains(byte))
+            .map(|offset| offset + 3),
+        Some(b']' | b'P') => {
+            let mut index = 2;
+            while index < bytes.len() {
+                if bytes[index] == 0x07 {
+                    return Some(index + 1);
+                }
+                if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                    return Some(index + 2);
+                }
+                index += 1;
+            }
+            None
+        }
+        Some(_) => Some(bytes.len().min(2)),
+        None => None,
+    }
+}
+
+fn next_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
+    let width = match *bytes.first()? {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => return None,
+    };
+    let text = std::str::from_utf8(bytes.get(..width)?).ok()?;
+    Some((text.chars().next()?, width))
+}
+
+fn terminal_visible_text(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(len) = terminal_control_sequence_len(&bytes[index..]) {
+            index += len;
+            continue;
+        }
+        match bytes[index] {
+            b'\r' => index += 1,
+            b'\n' => {
+                text.push('\n');
+                index += 1;
+            }
+            _ => {
+                if let Some((ch, len)) = next_utf8_char(&bytes[index..]) {
+                    text.push(ch);
+                    index += len;
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+    text
+}
+
+#[cfg(test)]
+pub(crate) fn terminal_visible_text_for_test(bytes: &[u8]) -> String {
+    terminal_visible_text(bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn terminal_display_width_for_test(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
 
 #[derive(Debug)]
 pub(crate) struct LocalOutputFilter {
@@ -21,6 +332,7 @@ pub(crate) struct LocalOutputFilter {
     // exceeds `pty_rows` we expand such bottom-anchored scroll regions to the
     // host height on `local_output` only (see `host_scroll_region_sequence`).
     // 0 means unknown -> no rewriting.
+    pub(crate) pty_cols: u16,
     pub(crate) pty_rows: u16,
     pub(crate) host_rows: u16,
     // When true, answer a child's cursor-position query (`\x1b[6n` / `\x1b[?6n`)
@@ -55,6 +367,7 @@ impl LocalOutputFilter {
             pending: Vec::new(),
             color_query_palette,
             strip_alternate_screen_from_remote: false,
+            pty_cols: 0,
             pty_rows: 0,
             host_rows: 0,
             answer_cursor_position_query: false,
@@ -114,11 +427,29 @@ impl LocalOutputFilter {
                         result
                             .pty_input
                             .extend_from_slice(cursor_position_report(sequence));
+                    } else if self.strip_alternate_screen_from_remote {
+                        // Managed-alt-screen TUIs (codex, opencode) run in a
+                        // child PTY sized to the phone grid while the host
+                        // terminal keeps its own geometry. Answer directly so
+                        // neither the host grid nor a query timeout can affect
+                        // the child's later layout decision.
+                        result
+                            .pty_input
+                            .extend_from_slice(cursor_position_report(sequence));
                     } else {
                         // Pass to the host terminal so the shell receives the
                         // real cursor position. Do NOT send to remote
                         // (terminal_core doesn't need it).
                         result.local_output.extend_from_slice(sequence);
+                    }
+                    index += final_offset + 1;
+                    continue;
+                }
+                if is_text_area_size_query(sequence) {
+                    if self.strip_alternate_screen_from_remote
+                        && let Some(report) = text_area_size_report(self.pty_rows, self.pty_cols)
+                    {
+                        result.pty_input.extend_from_slice(&report);
                     }
                     index += final_offset + 1;
                     continue;
@@ -253,6 +584,17 @@ pub(crate) fn cursor_position_report(query: &[u8]) -> &'static [u8] {
     } else {
         b"\x1b[1;1R"
     }
+}
+
+pub(crate) fn is_text_area_size_query(sequence: &[u8]) -> bool {
+    sequence == b"\x1b[18t"
+}
+
+pub(crate) fn text_area_size_report(rows: u16, cols: u16) -> Option<Vec<u8>> {
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+    Some(format!("\x1b[8;{rows};{cols}t").into_bytes())
 }
 
 pub(crate) fn is_host_terminal_control_prefix(bytes: &[u8]) -> bool {

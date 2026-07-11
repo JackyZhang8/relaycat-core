@@ -213,6 +213,12 @@ pub(crate) fn configure_child_terminal_env(
     // Without this, readline/zle can't output backspace sequences and cursor
     // positioning breaks, causing characters to overlay instead of replace.
     command.env("TERM", "xterm-256color");
+    // Stale COLUMNS/LINES inherited from whatever launched this process (e.g.
+    // the shell that started the desktop GUI) override the child PTY's real
+    // winsize in programs that consult them, so the TUI lays out at the old
+    // desktop width even after the PTY is resized to the phone grid.
+    command.env_remove("COLUMNS");
+    command.env_remove("LINES");
 
     // Suppress escape sequences that apps without a full VT emulator can't render:
     // - PROMPT_EOL_MARK: zsh's reverse-video "%" shown at end of partial lines

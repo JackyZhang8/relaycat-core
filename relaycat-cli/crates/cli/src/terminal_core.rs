@@ -996,7 +996,12 @@ impl TerminalCore {
         self.attr_index = new_attrs
             .iter()
             .enumerate()
-            .map(|(id, attr)| (attr.clone(), u32::try_from(id).expect("attr table index overflow")))
+            .map(|(id, attr)| {
+                (
+                    attr.clone(),
+                    u32::try_from(id).expect("attr table index overflow"),
+                )
+            })
             .collect();
         self.attrs = new_attrs;
         // Retained patches still reference the old ids and the app's current
