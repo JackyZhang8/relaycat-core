@@ -1,0 +1,11 @@
+node_modules/
+dist/
+target/
+.DS_Store
+
+# Tauri build-time generated schemas
+src-tauri/gen/
+
+# Bundled relaycat CLI sidecar staged during release builds
+src-tauri/binaries/
+.relaycat/

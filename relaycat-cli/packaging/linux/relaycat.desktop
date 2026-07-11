@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=RelayCat
+GenericName=Remote AI agent controller
+Comment=Launch the RelayCat TUI to pick a tool, project and relay
+Exec=@RELAYCAT_BIN@ tui
+Terminal=true
+Categories=Development;
+Keywords=relay;terminal;ai;agent;codex;claude;

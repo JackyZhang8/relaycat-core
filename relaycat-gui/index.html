@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="zh">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RelayCat</title>
+    <style>
+      /* Paint the theme background on the very first frame so the webview
+         never flashes its default white before CSS/JS load. The boot splash
+         (see #boot-splash) is styled off the same early theme attribute so it
+         renders in the right colors before the bundle runs. */
+      html,
+      body {
+        background: #0f0b09;
+      }
+      html[data-boot-theme="light"],
+      html[data-boot-theme="light"] body {
+        background: #f6f1e8;
+      }
+    </style>
+    <script>
+      // Resolve the saved theme as early as possible (before the bundle runs)
+      // so both the page background and the boot splash use the right colors.
+      try {
+        var th =
+          localStorage.getItem("relaycat.theme") === "light" ? "light" : "dark";
+        document.documentElement.setAttribute("data-boot-theme", th);
+      } catch (e) {
+        document.documentElement.setAttribute("data-boot-theme", "dark");
+      }
+    </script>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <!-- Boot splash: shown immediately on first paint (theme-colored), then
+         faded out by main.ts once the UI is ready and a minimum delay passed. -->
+    <div id="boot-splash">
+      <img class="boot-logo" src="/logo.png" alt="RelayCat" />
+      <div class="boot-bar"><div class="boot-bar-fill"></div></div>
+    </div>
+    <div class="app">
+      <!-- title bar -->
+      <div class="titlebar" data-tauri-drag-region>
+        <div class="title"><img class="brand-logo" src="/logo.png" alt="RelayCat" /><b>RelayCat</b></div>
+        <div class="right">
+          <button class="iconbtn" id="btn-new" data-i18n="nav_new">＋ 新建</button>
+          <button class="iconbtn" id="btn-split" data-i18n="nav_split" data-i18n-title="nav_split_title">分屏</button>
+          <button class="iconbtn" id="btn-help" data-i18n="nav_help">帮助</button>
+          <button class="iconbtn" id="btn-about" data-i18n="nav_about">关于</button>
+          <button class="iconbtn" id="btn-settings" data-i18n="nav_settings">⚙ 设置</button>
+          <button class="iconbtn icon-only" id="btn-theme" data-i18n-title="theme_toggle_title" title="切换浅色/深色"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg></button>
+        </div>
+      </div>
+
+      <!-- update banner -->
+      <div class="update-banner" id="update-banner"></div>
+
+      <!-- tabs -->
+      <div class="tabbar" id="tabbar">
+        <div class="newtab" id="btn-newtab" data-i18n-title="newtab_title">＋</div>
+      </div>
+
+      <!-- stage -->
+      <div class="stage">
+        <div class="terminals" id="terminals"></div>
+
+        <div class="empty" id="empty">
+          <div class="lp-actions">
+            <button class="lp-act-btn primary" id="empty-new" data-i18n="empty_new_btn">＋ 新建会话</button>
+            <button class="lp-act-btn" id="empty-recent-btn" data-i18n="recent_label">最近会话</button>
+          </div>
+          <div class="landing">
+            <!-- hero -->
+            <section class="lp-hero">
+              <img class="lp-logo" src="/logo.png" alt="RelayCat" />
+              <h1 class="lp-title" data-i18n="lp_hero_title">手机接管本地 AI Coding Agent</h1>
+              <p class="lp-sub" data-i18n="lp_hero_sub">
+                在手机上远程控制本地电脑里的 Claude Code、Codex、OpenCode 和 Shell。跑“/goal”长任务、审批操作、查看执行结果、同步想法，不必等在电脑前。
+              </p>
+              <div class="lp-dl-bars">
+                <div class="lp-dl-bar">
+                  <svg class="lp-dl-ic" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17.05 12.04c-.03-2.9 2.37-4.3 2.48-4.36-1.35-1.98-3.46-2.25-4.21-2.28-1.79-.18-3.5 1.05-4.41 1.05-.91 0-2.31-1.03-3.8-1-1.95.03-3.76 1.13-4.76 2.88-2.03 3.52-.52 8.74 1.46 11.6.97 1.4 2.12 2.97 3.63 2.91 1.46-.06 2.01-.94 3.77-.94 1.76 0 2.26.94 3.8.91 1.57-.03 2.56-1.42 3.52-2.83 1.11-1.62 1.57-3.19 1.6-3.27-.04-.02-3.07-1.18-3.1-4.68zM14.13 4.7c.8-.97 1.34-2.32 1.19-3.66-1.15.05-2.55.77-3.38 1.74-.74.86-1.39 2.23-1.21 3.55 1.28.1 2.59-.65 3.4-1.63z"/></svg>
+                  <div class="lp-dl-txt">
+                    <div class="lp-dl-name">App Store</div>
+                    <div class="lp-dl-meta" data-i18n="lp_dl_ios">iOS App Store</div>
+                  </div>
+                  <div class="lp-dl-qr" tabindex="0">
+                    <img src="https://api.qrserver.com/v1/create-qr-code/?size=216x216&amp;data=https%3A%2F%2Fapps.apple.com%2Fcn%2Fapp%2Frelaycat%25E7%25BC%2596%25E7%25A8%258B%25E5%258A%25A9%25E6%2589%258B%2Fid6781284514" alt="" />
+                  </div>
+                </div>
+                <div class="lp-dl-bar">
+                  <svg class="lp-dl-ic" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 18c0 .55.45 1 1 1h1v3.5a1.5 1.5 0 0 0 3 0V19h2v3.5a1.5 1.5 0 0 0 3 0V19h1c.55 0 1-.45 1-1V8H6v10zM3.5 8A1.5 1.5 0 0 0 2 9.5v7a1.5 1.5 0 0 0 3 0v-7A1.5 1.5 0 0 0 3.5 8zm17 0A1.5 1.5 0 0 0 19 9.5v7a1.5 1.5 0 0 0 3 0v-7A1.5 1.5 0 0 0 20.5 8zM15.53 2.16l1.3-1.3a.5.5 0 0 0-.7-.7l-1.48 1.48A6.97 6.97 0 0 0 12 1c-.96 0-1.87.2-2.7.55L7.82.16a.5.5 0 1 0-.7.7l1.3 1.3A6.99 6.99 0 0 0 6 8h12c0-2.42-1.23-4.55-3.1-5.84zM10 5.5a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5zm4 0a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5z"/></svg>
+                  <div class="lp-dl-txt">
+                    <div class="lp-dl-name">Android</div>
+                    <div class="lp-dl-meta" data-i18n="lp_dl_android">Android APK</div>
+                  </div>
+                  <div class="lp-dl-qr" tabindex="0">
+                    <img src="https://api.qrserver.com/v1/create-qr-code/?size=216x216&amp;data=https%3A%2F%2Fcdn.relaycat.cn%2Fdownload%2Frelaycat-app-0.1.4-android-arm64.apk" alt="" />
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- features -->
+            <section class="lp-section">
+              <h2 class="lp-h2" data-i18n="lp_ft_title">把碎片时间变成有效进展</h2>
+              <p class="lp-sec-sub" data-i18n="lp_ft_sub">RelayCat 不是云 IDE，而是你的本地 Coding Agent 遥控器。</p>
+              <div class="lp-ft-grid">
+                <div class="lp-ft-card">
+                  <div class="lp-ft-emoji">☕</div>
+                  <div class="lp-ft-name" data-i18n="lp_ft1_title">等咖啡、坐地铁、排队时</div>
+                  <div class="lp-ft-desc" data-i18n="lp_ft1_desc">RelayCat.app 让本地 Agent 留在你的电脑里继续跑，你可以快速看一眼 Agent 做到哪了，遇到需要人工判断的地方，直接回复，任务就不必停在电脑前等你回来。</div>
+                </div>
+                <div class="lp-ft-card">
+                  <div class="lp-ft-emoji">💡</div>
+                  <div class="lp-ft-name" data-i18n="lp_ft2_title">把新想法及时落地</div>
+                  <div class="lp-ft-desc" data-i18n="lp_ft2_desc">逛街、散步、听播客时想到什么，一个优化点、一个产品思路、一个重构方向时，直接在手机上用 RelayCat.app 同步想法。等你回到电脑前，碎片想法已经变成可 review、可继续、可演示的成果。</div>
+                </div>
+                <div class="lp-ft-card">
+                  <div class="lp-ft-emoji">🛋️</div>
+                  <div class="lp-ft-name" data-i18n="lp_ft3_title">准备好在沙发上写代码了吗？</div>
+                  <div class="lp-ft-desc" data-i18n="lp_ft3_desc">可自托管中继，支持主流 Coding Agent，五分钟内配对你的 iPhone。无需订阅，无需注册——跑“/goal”长任务，你需要 RelayCat.app。</div>
+                </div>
+              </div>
+            </section>
+
+            <!-- footer: links + author + star -->
+            <div class="lp-footer">
+              <a href="#" class="about-link lp-foot-link" data-url="https://relaycat.app" data-i18n="lp_foot_site">官网(https://relaycat.app)</a>
+              <span class="lp-foot-sep">·</span>
+              <a href="#" class="about-link lp-foot-link" data-url="https://github.com/jackyZhang8/relaycat-core" data-i18n="lp_foot_repo">开源地址</a>
+              <span class="lp-foot-sep">·</span>
+              <span class="lp-foot-author" data-i18n="lp_foot_author">作者 JackyZhang8</span>
+              <a href="#" class="about-link lp-foot-star" data-url="https://github.com/jackyZhang8/relaycat-core" data-i18n="lp_foot_star" data-i18n-title="lp_foot_star_title" title="去 GitHub 点个 Star">★ Star</a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- status bar -->
+      <div class="statusbar" id="statusbar">
+        <span class="muted" data-i18n="ready">就绪</span>
+      </div>
+    </div>
+
+    <!-- new session overlay -->
+    <div class="overlay" id="ov-new">
+      <div class="card">
+        <h3 data-i18n="ns_title">新建会话</h3>
+        <div class="body">
+          <div class="field">
+            <div class="field-head">
+              <label data-i18n="ns_tool">工具</label>
+              <a href="#" class="about-link ns-tool-check" id="ns-tool-check" data-i18n="ns_tool_check">检测工具</a>
+            </div>
+            <div class="chips" id="tool-chips"></div>
+          </div>
+          <div class="field">
+            <label data-i18n="ns_project">项目目录</label>
+            <div class="proj" id="proj-list"></div>
+            <div class="proj-input-row">
+              <input class="txt" id="proj-input" data-i18n-ph="ph_proj" placeholder="或手动输入路径…" spellcheck="false" />
+              <button class="btn" id="btn-browse" data-i18n="ns_browse">浏览…</button>
+            </div>
+          </div>
+          <div class="field">
+            <label data-i18n="ns_relay">Relay（必填）</label>
+            <input class="txt" id="relay-input" placeholder="wss://relay.example.com" spellcheck="false" required />
+            <div class="hint" data-i18n="ns_relay_hint">填入后生成配对二维码，手机扫码后即可实时镜像、双向输入（复用 relaycat 的端到端加密会话）。</div>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn" data-close data-i18n="cancel">取消</button>
+          <button class="btn primary" id="btn-launch" data-i18n="launch">启动 ▶</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- recent sessions overlay -->
+    <div class="overlay" id="ov-recent">
+      <div class="card">
+        <h3 data-i18n="recent_label">最近会话</h3>
+        <div class="body">
+          <div class="recent recent-scroll" id="empty-recent"></div>
+          <div class="empty-note" id="recent-empty" data-i18n="recent_none">还没有最近会话</div>
+        </div>
+        <div class="actions">
+          <button class="btn" data-close data-i18n="close">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- pairing overlay -->
+    <div class="overlay" id="ov-pair">
+      <div class="card" style="width: 360px">
+        <h3 id="pair-heading" data-i18n="pair_title">扫码连接手机</h3>
+        <div class="body" style="text-align: center">
+          <div class="pair-connecting" id="pair-connecting" hidden>
+            <div class="pair-progress"><div class="pair-progress-bar"></div></div>
+            <div class="pair-connecting-log" id="pair-connecting-log" data-i18n="relay_connecting_log">正在连接 relay url…</div>
+          </div>
+          <div class="pair-error" id="pair-error" hidden>
+            <div class="pair-error-ic">!</div>
+            <div class="pair-error-title" id="pair-error-title" data-i18n="relay_failed_title">连接失败</div>
+            <div class="pair-error-log" id="pair-error-log"></div>
+          </div>
+          <div id="pair-main">
+            <div class="qr" id="qrbox">
+              <div class="qr-svg" id="qr-svg"></div>
+              <img class="qr-logo" src="/logo.png" alt="" aria-hidden="true" />
+            </div>
+            <div class="pairlink">
+              <code id="pair-url"></code>
+              <button class="btn" id="pair-copy" data-i18n="copy">复制</button>
+            </div>
+            <div class="pairstatus" id="pair-status">
+              <span class="spinner"></span> <span data-i18n="pair_waiting">等待手机扫码…</span>
+            </div>
+            <div class="hint" style="margin-top: 10px" data-i18n="pair_hint">
+              注意：配对二维码含敏感配对材料，请勿外发。
+            </div>
+          </div>
+          <div class="pair-success" id="pair-success" hidden>
+            <div class="pair-success-ic">✓</div>
+            <div class="pair-success-title" data-i18n="pair_success">配对成功</div>
+            <div class="pair-success-sub" id="pair-countdown"></div>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn" data-close data-i18n="close">关闭</button>
+          <button class="btn primary" id="pair-retry" data-i18n="relay_retry" hidden>重试</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- diagnostics overlay -->
+    <div class="overlay" id="ov-diag" data-parent="ov-settings">
+      <div class="card wide">
+        <h3 data-i18n="diag_title">诊断</h3>
+        <div class="body">
+          <div class="diag-info" id="diag-info"></div>
+          <div class="seclabel" data-i18n="diag_log_label">当前会话日志（cli.log）</div>
+          <pre class="diag-log" id="diag-log"></pre>
+          <div class="hint" data-i18n="diag_export_hint">
+            导出诊断包会收集环境信息、崩溃日志与当前会话日志，并自动脱敏（隐去家目录、配对材料、密钥与 IP）后保存为文本文件。
+          </div>
+        </div>
+        <div class="actions">
+          <span class="diag-export-status" id="diag-export-status"></span>
+          <button class="btn" id="btn-diag-export" data-i18n="diag_export">导出诊断包…</button>
+          <button class="btn" data-close data-i18n="close">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- about overlay -->
+    <div class="overlay" id="ov-about">
+      <div class="card big" style="width: 540px">
+        <h3 data-i18n="about_title">关于 RelayCat</h3>
+        <div class="body">
+          <div class="about-head">
+            <div class="about-mark"><img src="/logo.png" alt="RelayCat" /></div>
+            <div class="about-meta">
+              <div class="about-name">RelayCat</div>
+              <div class="about-tagline" data-i18n="about_tagline">远程 AI 编码助手</div>
+              <div class="about-ver">
+                <span data-i18n="about_version">版本</span>
+                <code id="about-app-version">—</code>
+                <span class="about-ver-cli">· CLI <code id="about-cli-version">—</code></span>
+              </div>
+            </div>
+          </div>
+
+          <p class="about-desc" data-i18n="about_desc">
+            在手机上远程控制本地电脑里的 Claude Code、Codex、OpenCode 和 Shell。跑“/goal”长任务、审批操作、查看执行结果、同步想法，不必等在电脑前。
+          </p>
+
+          <div class="seclabel" data-i18n="about_security">安全与加密</div>
+          <ul class="about-sec">
+            <li data-i18n="about_sec_e2ee">端到端加密：X25519 密钥协商，输入与终端输出全程加密，仅你的设备能解密。</li>
+            <li data-i18n="about_sec_relay">Relay 只做中转：仅转发加密数据，不解密、不存储任何业务内容。</li>
+            <li data-i18n="about_sec_local">本地执行：命令在你自己的电脑上运行（本地 PTY），代码与凭据不离开本机。</li>
+            <li data-i18n="about_sec_pair">扫码配对：一次性配对材料，支持多会话恢复，配对二维码请勿外发。</li>
+          </ul>
+
+          <div class="about-update">
+            <button class="btn" id="btn-check-update" data-i18n="about_check_update">检查更新</button>
+            <button class="btn primary" id="btn-install-update" data-i18n="about_install_update" hidden>下载并安装</button>
+            <span class="about-update-status" id="about-update-status"></span>
+          </div>
+          <div class="about-update-notes" id="about-update-notes" hidden></div>
+
+          <div class="about-links">
+            <a href="#" class="about-link" data-url="https://www.relaycat.cn/" data-i18n="about_site">官网</a>
+            <a href="#" class="about-link" data-url="https://www.relaycat.cn/privacy" data-i18n="about_privacy">隐私政策</a>
+            <a href="#" class="about-link" data-url="https://www.relaycat.cn/terms" data-i18n="about_terms">服务条款</a>
+            <a href="#" class="about-link" data-url="https://www.relaycat.cn/disclaimer" data-i18n="about_disclaimer">免责声明</a>
+            <a href="#" class="about-link" id="about-licenses" data-i18n="about_licenses">开源许可</a>
+          </div>
+          <div class="about-copy">© 2026 RelayCat</div>
+        </div>
+        <div class="actions">
+          <button class="btn" data-close data-i18n="close">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- settings overlay -->
+    <div class="overlay settings" id="ov-settings">
+      <div class="card wide">
+        <div class="set-head">
+          <h3 data-i18n="set_title">⚙ 设置</h3>
+          <div class="set-tabs" id="set-tabs">
+            <button class="set-tab active" data-group="general" data-i18n="set_tab_general">常规</button>
+            <button class="set-tab" data-group="appearance" data-i18n="set_tab_appearance">外观</button>
+            <button class="set-tab" data-group="tools" data-i18n="set_tab_tools">工具</button>
+            <button class="set-tab" data-group="detect" data-i18n="set_tab_detect">工具检测</button>
+            <button class="set-tab" data-group="data" data-i18n="set_tab_data">隐私与数据</button>
+          </div>
+        </div>
+        <div class="body">
+          <!-- group: general -->
+          <div class="set-group active" data-group="general">
+            <div class="seclabel" data-i18n="set_general">常规</div>
+            <div class="setrow">
+              <span class="kwrap"><span class="k" data-i18n="set_default_tool">默认工具</span><span class="tip" data-tip="tip_default_tool">?</span></span>
+              <select class="sel-mini" id="set-default-tool"></select>
+            </div>
+            <div class="setrow">
+              <span class="kwrap"><span class="k" data-i18n="set_default_relay">默认 Relay</span><span class="tip" data-tip="tip_default_relay">?</span></span>
+              <input class="txt" style="width: 300px" id="set-default-relay" placeholder="wss://relay.example.com" spellcheck="false" />
+            </div>
+            <div class="hint">
+              <span data-i18n="set_default_relay_hint">新建会话时自动填入此地址。默认使用官方中转 wss://001.relaycat.cn，开箱即用；高峰期可能拥挤，你也可以自建专属 Relay 获得更稳定的连接。</span>
+              <a href="#" class="about-link" data-url="https://www.relaycat.cn/self-host" data-i18n="ob_relay_selfhost">想自建 Relay 服务器？查看教程 →</a>
+            </div>
+            <div class="setrow">
+              <span class="kwrap"><span class="k" data-i18n="set_return">会话结束后回到启动页</span><span class="tip" data-tip="tip_return">?</span></span>
+              <input type="checkbox" id="set-return" />
+            </div>
+
+            <div class="seclabel" data-i18n="set_system">系统</div>
+            <div class="setrow">
+              <span class="kwrap"><span class="k" data-i18n="set_autostart">开机自动启动</span><span class="tip" data-tip="tip_autostart">?</span></span>
+              <input type="checkbox" id="set-autostart" />
+            </div>
+            <div class="setrow">
+              <span class="kwrap"><span class="k" data-i18n="set_tray">关闭窗口时最小化到托盘</span><span class="tip" data-tip="tip_tray">?</span></span>
+              <input type="checkbox" id="set-tray" />
+            </div>
+            <div class="hint" data-i18n="set_system_hint">最小化到托盘后，应用仍在后台运行，会话保持连接；从托盘图标可重新打开或退出。</div>
+          </div>
+
+          <!-- group: appearance -->
+          <div class="set-group" data-group="appearance">
+            <div class="seclabel" data-i18n="set_appearance">外观</div>
+            <div class="setrow">
+              <span class="kwrap"><span class="k" data-i18n="set_language">语言</span><span class="tip" data-tip="tip_language">?</span></span>
+              <select class="sel-mini" id="set-lang">
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+              </select>
+            </div>
+            <div class="setrow">
+              <span class="kwrap"><span class="k" data-i18n="set_theme">主题</span><span class="tip" data-tip="tip_theme">?</span></span>
+              <select class="sel-mini" id="set-theme">
+                <option value="dark" data-i18n="theme_dark">深色</option>
+                <option value="light" data-i18n="theme_light">浅色</option>
+              </select>
+            </div>
+            <div class="setrow">
+              <span class="kwrap"><span class="k" data-i18n="set_fontsize">字号</span><span class="tip" data-tip="tip_fontsize">?</span></span>
+              <select class="sel-mini" id="set-fontsize">
+                <option value="12">12</option>
+                <option value="13">13</option>
+                <option value="14" selected>14</option>
+                <option value="16">16</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- group: tools -->
+          <div class="set-group" data-group="tools">
+            <div class="seclabel" data-i18n="set_custom_tools">自定义工具</div>
+            <div class="toollist" id="set-tools"></div>
+            <div class="toolform">
+              <input class="txt" id="set-tool-name" data-i18n-ph="ph_tool_name" placeholder="名称（如 gemini）" spellcheck="false" />
+              <input class="txt" id="set-tool-cmd" data-i18n-ph="ph_tool_cmd" placeholder="命令（如 gemini）" spellcheck="false" />
+              <input class="txt" id="set-tool-args" data-i18n-ph="ph_tool_args" placeholder="参数（空格分隔，可选）" spellcheck="false" />
+              <button class="btn" id="btn-add-tool" data-i18n="set_add">＋ 添加</button>
+            </div>
+            <div class="hint" data-i18n="set_tools_hint">自定义工具保存到 config.json，与 CLI 共用；增删立即生效。</div>
+
+            <div class="seclabel" data-i18n="set_favorites">收藏项目</div>
+            <div class="toollist" id="set-favorites"></div>
+          </div>
+
+          <!-- group: tool detection -->
+          <div class="set-group" data-group="detect">
+            <div class="seclabel" data-i18n="set_detect_title">检测编码工具</div>
+            <p class="hint" data-i18n="set_detect_hint">检测本机是否已安装所选编码工具。安装新工具（如 OpenCode）后，可点「重新检测」再次确认。</p>
+            <ul class="ob-tools" id="set-detect-list"></ul>
+            <div class="setrow">
+              <button class="btn" id="btn-redetect" data-i18n="set_redetect">重新检测</button>
+            </div>
+          </div>
+
+          <!-- group: privacy & data -->
+          <div class="set-group" data-group="data">
+            <div class="seclabel" data-i18n="set_privacy">隐私与数据</div>
+            <div class="setrow">
+              <span class="k" data-i18n="set_devices_hint">查看并撤销已保存的配对凭证（撤销后需重新扫码配对）</span>
+              <button class="btn" id="btn-open-devices" data-i18n="set_devices_open">管理设备</button>
+            </div>
+            <div class="setrow">
+              <span class="k" data-i18n="set_clear_hint">清除本机保存的配对凭证、会话记录与日志</span>
+              <button class="btn danger" id="btn-open-clear" data-i18n="set_clear_open">清除敏感数据…</button>
+            </div>
+            <div class="setrow">
+              <span class="k" data-i18n="set_diag_hint">查看运行环境、会话日志并导出诊断包</span>
+              <button class="btn" id="btn-open-diag" data-i18n="set_diag_open">诊断</button>
+            </div>
+
+            <div class="seclabel" data-i18n="set_about">关于</div>
+            <div class="setrow">
+              <span class="k" data-i18n="set_about_hint">版本信息、安全说明与检查更新</span>
+              <button class="btn" id="btn-open-about" data-i18n="set_about_open">打开关于</button>
+            </div>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn primary" data-close data-i18n="close">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- onboarding overlay -->
+    <div class="overlay" id="ov-onboard">
+      <div class="card onboard big" style="width: 560px">
+        <div class="body">
+          <div class="ob-step" data-step="0">
+            <div class="ob-mark"><img src="/logo.png" alt="RelayCat" /></div>
+            <h3 data-i18n="ob_welcome_title">欢迎使用 RelayCat</h3>
+            <p class="ob-desc" data-i18n="ob_welcome_desc">
+              在手机上安全远程操控本地电脑里的 Claude Code、Codex、OpenCode 和 Shell——查 Bug、跑测试、审批操作，不必守在电脑前。
+            </p>
+            <ul class="ob-points">
+              <li data-i18n="ob_point_e2ee">端到端加密，Relay 只中转不解密，代码与凭据不离开本机。</li>
+              <li data-i18n="ob_point_fast">扫码即连，约 3 步、几分钟即可开始第一段会话。</li>
+            </ul>
+          </div>
+
+          <div class="ob-step" data-step="1" hidden>
+            <h3 data-i18n="ob_pair_title">三步连接手机</h3>
+            <ol class="ob-list">
+              <li data-i18n="ob_pair_1">在手机上安装 RelayCat App（iOS / Android）。</li>
+              <li data-i18n="ob_pair_2">在电脑上「新建会话」，选好工具与项目目录，填入 Relay 地址。</li>
+              <li data-i18n="ob_pair_3">用手机扫描弹出的配对二维码，即可实时镜像、双向输入。</li>
+            </ol>
+            <button class="btn" id="ob-get-app" data-i18n="ob_get_app">前往官网下载手机 App</button>
+          </div>
+
+          <div class="ob-step" data-step="2" hidden>
+            <h3 data-i18n="ob_setup_title">快速设置</h3>
+            <div class="field">
+              <label data-i18n="ob_setup_relay">默认 Relay 地址（必填）</label>
+              <input class="txt" id="ob-relay" placeholder="wss://001.relaycat.cn" spellcheck="false" required />
+              <div class="hint">
+                <span data-i18n="ob_setup_relay_hint">已为你填好官方中转地址 wss://001.relaycat.cn，开箱即用。官方中转在高峰期可能拥挤，你也可以自建专属 Relay 获得更稳定的连接；之后可在「设置」里随时修改。</span>
+                <a href="#" class="about-link ob-relay-help" data-url="https://www.relaycat.cn/self-host" data-i18n="ob_relay_selfhost">想自建 Relay 服务器？查看教程 →</a>
+              </div>
+            </div>
+            <p class="ob-desc" data-i18n="ob_setup_done">
+              点击「下一步」检测本机可用的 AI 编码工具。
+            </p>
+          </div>
+
+          <div class="ob-step" data-step="3" hidden>
+            <h3 data-i18n="ob_tools_title">检测本机工具</h3>
+            <p class="ob-desc" data-i18n="ob_tools_desc">
+              RelayCat 在手机上接管这些本地工具。已安装的可直接使用；未检测到的可点右侧「安装教程」按提示装好后回来即可。
+            </p>
+            <ul class="ob-tools" id="ob-tools"></ul>
+            <p class="ob-desc ob-tools-foot" data-i18n="ob_tools_foot">
+              没装齐也没关系——先用「Shell」体验，之后随时安装其它工具。点击「开始使用」创建第一段会话。
+            </p>
+          </div>
+        </div>
+        <div class="actions ob-actions">
+          <button class="btn" id="ob-skip" data-i18n="ob_skip">跳过</button>
+          <div class="ob-dots" id="ob-dots"></div>
+          <button class="btn" id="ob-back" data-i18n="ob_back" hidden>上一步</button>
+          <button class="btn primary" id="ob-next" data-i18n="ob_next">下一步</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- help overlay -->
+    <div class="overlay" id="ov-help">
+      <div class="card big" style="width: 480px">
+        <h3 data-i18n="help_title">帮助与支持</h3>
+        <div class="body">
+          <div class="help-list">
+            <button class="help-item" id="help-guide" data-i18n="help_guide">重新查看配对向导</button>
+            <button class="help-item" id="help-shortcuts" data-i18n="help_shortcuts">键盘快捷键</button>
+            <button class="help-item" id="help-licenses" data-i18n="help_licenses">开源许可</button>
+            <button class="help-item" id="help-docs" data-i18n="help_docs">帮助文档</button>
+            <button class="help-item" id="help-detect" data-i18n="help_detect">检测编码工具</button>
+            <button class="help-item" id="help-feedback" data-i18n="help_feedback">反馈与支持</button>
+            <button class="help-item" id="help-about" data-i18n="help_about">关于 RelayCat</button>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn" data-close data-i18n="close">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- licenses overlay -->
+    <div class="overlay" id="ov-licenses">
+      <div class="card" style="width: 560px">
+        <h3 data-i18n="lic_title">开源许可</h3>
+        <div class="body">
+          <div class="hint" data-i18n="lic_hint">RelayCat 桌面端基于以下开源软件构建，感谢各项目的作者与贡献者。每个组件均以其各自的许可证分发。</div>
+          <pre class="lic-text" id="lic-text"></pre>
+        </div>
+        <div class="actions">
+          <button class="btn" data-close data-i18n="close">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- paired devices overlay -->
+    <div class="overlay" id="ov-devices" data-parent="ov-settings">
+      <div class="card" style="width: 540px">
+        <h3 data-i18n="dev_title">已配对设备</h3>
+        <div class="body">
+          <div class="hint" data-i18n="dev_hint">这些是本机为各项目保存的配对凭证，可用于免扫码恢复会话。撤销后，对应项目需重新扫码配对。</div>
+          <div class="dev-list" id="dev-list"></div>
+        </div>
+        <div class="actions">
+          <button class="btn" data-close data-i18n="close">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- clear sensitive data overlay -->
+    <div class="overlay" id="ov-clear" data-parent="ov-settings">
+      <div class="card" style="width: 460px">
+        <h3 data-i18n="clr_title">清除敏感数据</h3>
+        <div class="body">
+          <div class="hint" data-i18n="clr_hint">勾选要清除的内容。此操作不可恢复；正在运行的会话不受影响，但下次需重新配对。</div>
+          <label class="clr-row"><input type="checkbox" id="clr-pairings" checked /> <span data-i18n="clr_pairings">已保存的配对凭证（各项目）</span></label>
+          <label class="clr-row"><input type="checkbox" id="clr-recents" checked /> <span data-i18n="clr_recents">最近会话记录</span></label>
+          <label class="clr-row"><input type="checkbox" id="clr-logs" /> <span data-i18n="clr_logs">会话日志（各项目 cli.log）</span></label>
+          <label class="clr-row"><input type="checkbox" id="clr-crash" /> <span data-i18n="clr_crash">崩溃日志</span></label>
+        </div>
+        <div class="actions">
+          <span class="clr-status" id="clr-status"></span>
+          <button class="btn" data-close data-i18n="cancel">取消</button>
+          <button class="btn danger" id="btn-clear-confirm" data-i18n="clr_confirm">清除</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- confirm overlay -->
+    <div class="overlay" id="ov-confirm">
+      <div class="card confirm" style="width: 380px">
+        <h3 id="confirm-title"></h3>
+        <div class="body">
+          <p class="confirm-message" id="confirm-message"></p>
+        </div>
+        <div class="actions">
+          <button class="btn" id="confirm-cancel" data-i18n="cancel">取消</button>
+          <button class="btn danger" id="confirm-ok" data-i18n="confirm_ok">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- shortcuts overlay -->
+    <div class="overlay" id="ov-shortcuts">
+      <div class="card" style="width: 380px">
+        <h3 data-i18n="sc_title">键盘快捷键</h3>
+        <div class="body">
+          <div class="sc-list" id="sc-list"></div>
+        </div>
+        <div class="actions">
+          <button class="btn" data-close data-i18n="close">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

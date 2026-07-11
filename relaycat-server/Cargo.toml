@@ -1,0 +1,37 @@
+[package]
+name = "relaycat-relay"
+version = "0.1.1"
+edition = "2024"
+license = "MIT"
+repository = "https://example.invalid/relaycat-server"
+
+[workspace]
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+dashmap = "6.1"
+futures-util = "0.3"
+hmac = "0.12"
+libc = "0.2"
+relaycat-protocol = { version = "0.1", path = "../relaycat-protocol" }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_urlencoded = "0.7"
+sha1 = "0.10"
+sysinfo = "0.33"
+thiserror = "1.0"
+tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tower = "0.5"
