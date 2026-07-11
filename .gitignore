@@ -3,9 +3,10 @@ relaycat-cli/target
 relaycat-gui/dist
 relaycat-gui/node_modules
 relaycat-protocol/target
-relaycat-cli/third_party
+relaycat-cli/third_party/vt100/target
 relaycat-server/conf.d
 .idea
 relaycat-server/rtasr_go
 certs_desktop
 .DS_Store
+docs
