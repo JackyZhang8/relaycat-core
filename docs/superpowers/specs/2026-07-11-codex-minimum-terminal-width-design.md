@@ -1,5 +1,9 @@
 # Codex Minimum Terminal Width Compatibility Design
 
+> Superseded by `2026-07-11-codex-inline-welcome-normalization-design.md`.
+> Raising the PTY grid above the phone's measured width can clip columns on
+> real devices, so this design must not be implemented.
+
 ## Problem
 
 Codex CLI 0.144.1 renders its live TUI correctly in a 48-column PTY, but after
