@@ -35,7 +35,7 @@ use crate::{
     xfyun::{RtasrUrlResponse, signed_rtasr_url},
 };
 
-pub const MAX_BINARY_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_BINARY_FRAME_BYTES: usize = relaycat_protocol::MAX_OUTER_FRAME_BYTES;
 /// Default transport limits. These are the values the relay shipped with before
 /// they became configurable; `config::LimitsConfig` falls back to them when a
 /// field is absent from the config file.
@@ -245,6 +245,15 @@ mod tests {
             MAX_BINARY_FRAME_BYTES + 1,
             MAX_BINARY_FRAME_BYTES
         ));
+    }
+
+    #[test]
+    fn outbound_frame_guard_returns_error_instead_of_silent_drop() {
+        let oversized = OuterFrame::Error {
+            message: "x".repeat(MAX_BINARY_FRAME_BYTES),
+        };
+
+        assert!(encode_outbound_frame(&oversized).is_err());
     }
 
     #[test]
@@ -664,7 +673,9 @@ async fn ws_handler(
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(state, query, socket))
+    ws.max_message_size(MAX_BINARY_FRAME_BYTES)
+        .max_frame_size(MAX_BINARY_FRAME_BYTES)
+        .on_upgrade(move |socket| handle_socket(state, query, socket))
 }
 
 async fn root_handler() -> impl IntoResponse {
@@ -1292,14 +1303,32 @@ impl InboundRateLimiter {
     }
 }
 
-async fn send_frame(socket: &mut WebSocket, frame: &OuterFrame) -> Result<(), axum::Error> {
-    let Ok(bytes) = encode_frame(frame) else {
-        return Ok(());
-    };
-    socket.send(Message::Binary(bytes.into())).await
+fn encode_outbound_frame(frame: &OuterFrame) -> anyhow::Result<Vec<u8>> {
+    let bytes = encode_frame(frame).context("failed to encode outbound relay frame")?;
+    if !binary_frame_within_limit(bytes.len(), MAX_BINARY_FRAME_BYTES) {
+        relaycat_log(
+            "WARN",
+            &format!(
+                "relay: refusing oversized outbound frame bytes={}",
+                bytes.len()
+            ),
+        );
+        anyhow::bail!(
+            "outbound relay frame exceeds {} bytes: {}",
+            MAX_BINARY_FRAME_BYTES,
+            bytes.len()
+        );
+    }
+    Ok(bytes)
 }
 
-async fn send_error(socket: &mut WebSocket, message: &str) -> Result<(), axum::Error> {
+async fn send_frame(socket: &mut WebSocket, frame: &OuterFrame) -> anyhow::Result<()> {
+    let bytes = encode_outbound_frame(frame)?;
+    socket.send(Message::Binary(bytes.into())).await?;
+    Ok(())
+}
+
+async fn send_error(socket: &mut WebSocket, message: &str) -> anyhow::Result<()> {
     send_frame(
         socket,
         &OuterFrame::Error {

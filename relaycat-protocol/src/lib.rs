@@ -9,6 +9,9 @@ pub use compression::{
 
 pub type Result<T> = std::result::Result<T, rmp_serde::decode::Error>;
 
+/// Maximum encoded binary WebSocket message accepted by the relay and apps.
+pub const MAX_OUTER_FRAME_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -341,6 +344,19 @@ pub enum TerminalTranscriptEntryKind {
     ScreenFrame,
 }
 
+/// Identifies one row-boundary fragment of a logical screen-frame transcript
+/// entry. The field containing this metadata is optional so older V2 peers can
+/// ignore it while continuing to decode every fragment as an ordinary entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalTranscriptFrameFragmentV2 {
+    /// `entry_id` of the first fragment in this logical frame.
+    pub frame_id: u64,
+    /// Zero-based position within the logical frame.
+    pub fragment_index: u32,
+    /// Total number of fragments required to reconstruct the frame.
+    pub fragment_count: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalTranscriptEntryV2 {
     pub entry_id: u64,
@@ -350,6 +366,8 @@ pub struct TerminalTranscriptEntryV2 {
     pub cols: u16,
     pub rows: Vec<TerminalRow>,
     pub captured_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_fragment: Option<TerminalTranscriptFrameFragmentV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,7 +570,7 @@ pub struct CliStatus {
 }
 
 pub fn encode_frame(frame: &OuterFrame) -> std::result::Result<Vec<u8>, rmp_serde::encode::Error> {
-    rmp_serde::to_vec_named(frame)
+    encode_named(frame)
 }
 
 pub fn decode_frame(bytes: &[u8]) -> Result<OuterFrame> {
@@ -560,7 +578,18 @@ pub fn decode_frame(bytes: &[u8]) -> Result<OuterFrame> {
 }
 
 pub fn encode_plain_msg(msg: &PlainMsg) -> std::result::Result<Vec<u8>, rmp_serde::encode::Error> {
-    rmp_serde::to_vec_named(msg)
+    encode_named(msg)
+}
+
+fn encode_named<T: Serialize + ?Sized>(
+    value: &T,
+) -> std::result::Result<Vec<u8>, rmp_serde::encode::Error> {
+    let mut bytes = Vec::new();
+    let mut serializer = rmp_serde::Serializer::new(&mut bytes)
+        .with_struct_map()
+        .with_bytes(rmp_serde::config::BytesMode::ForceIterables);
+    value.serialize(&mut serializer)?;
+    Ok(bytes)
 }
 
 /// An `io::Write` sink that only tallies how many bytes were written.
@@ -586,7 +615,9 @@ impl std::io::Write for ByteCounter {
 /// fully encoded large snapshots/patches just to read off the length.
 fn named_encoded_len<T: Serialize + ?Sized>(value: &T) -> usize {
     let mut counter = ByteCounter::default();
-    let mut serializer = rmp_serde::Serializer::new(&mut counter).with_struct_map();
+    let mut serializer = rmp_serde::Serializer::new(&mut counter)
+        .with_struct_map()
+        .with_bytes(rmp_serde::config::BytesMode::ForceIterables);
     match value.serialize(&mut serializer) {
         Ok(()) => counter.count,
         Err(_) => usize::MAX,
@@ -636,11 +667,153 @@ pub fn terminal_snapshot_v2_encoded_len(snapshot: &TerminalSnapshotV2) -> usize 
     })
 }
 
-pub fn transcript_chunk_v2_encoded_len(chunk: &TranscriptChunkV2) -> usize {
+/// Exact encoded length of an encrypted data frame without allocating the
+/// ciphertext body. The serializer emits non-empty `Vec<u8>` values as a
+/// MessagePack binary value, so a one-byte sample frame supplies all metadata
+/// overhead and only the binary payload length needs to be substituted.
+pub fn outer_data_frame_encoded_len(
+    room_id: &str,
+    direction: Direction,
+    seq: u64,
+    nonce: [u8; 12],
+    ciphertext_len: usize,
+) -> usize {
+    let sample_ciphertext = if ciphertext_len == 0 {
+        Vec::new()
+    } else {
+        vec![0]
+    };
+    let sample = OuterFrame::Data {
+        room_id: room_id.to_owned(),
+        direction,
+        seq,
+        nonce,
+        ciphertext: sample_ciphertext,
+    };
+    let sample_len = named_encoded_len(&sample);
+    if ciphertext_len == 0 {
+        return sample_len;
+    }
+
+    sample_len
+        .checked_sub(messagepack_binary_encoded_len(1))
+        .and_then(|base| base.checked_add(messagepack_binary_encoded_len(ciphertext_len)))
+        .unwrap_or(usize::MAX)
+}
+
+fn messagepack_binary_encoded_len(len: usize) -> usize {
+    let prefix_len: usize = if u8::try_from(len).is_ok() {
+        2
+    } else if u16::try_from(len).is_ok() {
+        3
+    } else if u32::try_from(len).is_ok() {
+        5
+    } else {
+        return usize::MAX;
+    };
+    prefix_len.checked_add(len).unwrap_or(usize::MAX)
+}
+
+#[derive(Serialize)]
+struct TranscriptChunkV2Parts<'a> {
+    terminal_run_id: &'a str,
+    before_entry_id: Option<u64>,
+    entries: &'a [TerminalTranscriptEntryV2],
+    attrs: &'a [CellAttr],
+    has_more: bool,
+}
+
+/// Exact encoded length of a transcript chunk assembled from borrowed parts.
+/// This avoids cloning large transcript entries while planning row-boundary
+/// fragmentation.
+pub fn transcript_chunk_v2_parts_encoded_len(
+    terminal_run_id: &str,
+    before_entry_id: Option<u64>,
+    entries: &[TerminalTranscriptEntryV2],
+    attrs: &[CellAttr],
+    has_more: bool,
+) -> usize {
+    let parts = TranscriptChunkV2Parts {
+        terminal_run_id,
+        before_entry_id,
+        entries,
+        attrs,
+        has_more,
+    };
     named_encoded_len(&ExternallyTagged {
         label: "transcript_chunk_v2",
-        value: chunk,
+        value: &parts,
     })
+}
+
+pub fn transcript_chunk_v2_encoded_len(chunk: &TranscriptChunkV2) -> usize {
+    transcript_chunk_v2_parts_encoded_len(
+        &chunk.terminal_run_id,
+        chunk.before_entry_id,
+        &chunk.entries,
+        &chunk.attrs,
+        chunk.has_more,
+    )
+}
+
+#[derive(Serialize)]
+struct TerminalTranscriptEntryV2Parts<'a> {
+    entry_id: u64,
+    terminal_run_id: &'a str,
+    state_seq: u64,
+    kind: TerminalTranscriptEntryKind,
+    cols: u16,
+    rows: &'a [TerminalRow],
+    captured_at_unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frame_fragment: Option<&'a TerminalTranscriptFrameFragmentV2>,
+}
+
+/// Exact encoded length of a transcript entry assembled from borrowed rows.
+/// Screen-frame storage uses this to choose row-boundary fragments without
+/// repeatedly cloning large terminal rows during size planning.
+#[allow(clippy::too_many_arguments)]
+pub fn terminal_transcript_entry_v2_parts_encoded_len(
+    entry_id: u64,
+    terminal_run_id: &str,
+    state_seq: u64,
+    kind: TerminalTranscriptEntryKind,
+    cols: u16,
+    rows: &[TerminalRow],
+    captured_at_unix_ms: u64,
+    frame_fragment: Option<&TerminalTranscriptFrameFragmentV2>,
+) -> usize {
+    named_encoded_len(&TerminalTranscriptEntryV2Parts {
+        entry_id,
+        terminal_run_id,
+        state_seq,
+        kind,
+        cols,
+        rows,
+        captured_at_unix_ms,
+        frame_fragment,
+    })
+}
+
+/// Exact encoded length of one terminal row using the named MessagePack wire
+/// configuration.
+pub fn terminal_row_v2_encoded_len(row: &TerminalRow) -> usize {
+    named_encoded_len(row)
+}
+
+/// Exact encoded length of one transcript entry using the same named
+/// MessagePack configuration as [`encode_plain_msg`].
+pub fn terminal_transcript_entry_v2_encoded_len(entry: &TerminalTranscriptEntryV2) -> usize {
+    terminal_transcript_entry_v2_parts_encoded_len(
+        entry.entry_id,
+        &entry.terminal_run_id,
+        entry.state_seq,
+        entry.kind,
+        entry.cols,
+        &entry.rows,
+        entry.captured_at_unix_ms,
+        entry.frame_fragment.as_ref(),
+    )
 }
 
 pub fn decode_plain_msg(bytes: &[u8]) -> Result<PlainMsg> {

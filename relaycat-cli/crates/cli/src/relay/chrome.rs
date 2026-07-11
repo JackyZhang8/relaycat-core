@@ -134,7 +134,13 @@ impl TerminalStatusBar {
 }
 
 pub(crate) fn local_content_pty_size(host_size: PtySize) -> PtySize {
-    host_size
+    let (cols, rows) = bounded_terminal_size(host_size.cols, host_size.rows);
+    PtySize {
+        cols,
+        rows,
+        pixel_width: host_size.pixel_width,
+        pixel_height: host_size.pixel_height,
+    }
 }
 
 #[cfg(test)]
@@ -197,7 +203,10 @@ pub(crate) fn reset_terminal_chrome_sequence() -> Vec<u8> {
     b"\x1b]2;relaycat\x07".to_vec()
 }
 
-pub(crate) fn configure_child_terminal_env(command: &mut CommandBuilder, session_kind: &SessionKind) {
+pub(crate) fn configure_child_terminal_env(
+    command: &mut CommandBuilder,
+    session_kind: &SessionKind,
+) {
     // Set TERM explicitly so the shell always gets correct cursor-movement and
     // line-editing escape sequences regardless of how relaycat was launched
     // (IDE, SSH session, launchd service, etc. may leave TERM unset or wrong).
@@ -260,7 +269,10 @@ pub(crate) fn force_render_terminal_chrome_for_status_bar(
     status_bar.force_set_mode_title(mode, size, title_context);
 }
 
-pub(crate) fn terminal_chrome_render_size(current_size: Option<PtySize>, fallback_size: PtySize) -> PtySize {
+pub(crate) fn terminal_chrome_render_size(
+    current_size: Option<PtySize>,
+    fallback_size: PtySize,
+) -> PtySize {
     current_size.unwrap_or(fallback_size)
 }
 
@@ -316,4 +328,3 @@ pub(crate) fn extract_latest_osc_title(bytes: &[u8]) -> Option<Vec<u8>> {
     }
     latest
 }
-

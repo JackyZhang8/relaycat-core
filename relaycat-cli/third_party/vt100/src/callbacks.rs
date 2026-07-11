@@ -7,30 +7,21 @@ pub trait Callbacks {
     /// This callback is called when the terminal requests a visual bell
     /// (typically with `\eg`).
     fn visual_bell(&mut self, _: &mut crate::Screen) {}
+    /// This callback is called after a full terminal reset (`ESC c`).
+    fn terminal_reset(&mut self, _: &mut crate::Screen) {}
     /// This callback is called when the terminal requests a resize
     /// (typically with `\e[8;<rows>;<cols>t`).
     fn resize(&mut self, _: &mut crate::Screen, _request: (u16, u16)) {}
     /// This callback is called when the terminal requests the window title
     /// to be set (typically with `\e]1;<icon_name>\a`)
-    fn set_window_icon_name(
-        &mut self,
-        _: &mut crate::Screen,
-        _icon_name: &[u8],
-    ) {
-    }
+    fn set_window_icon_name(&mut self, _: &mut crate::Screen, _icon_name: &[u8]) {}
     /// This callback is called when the terminal requests the window title
     /// to be set (typically with `\e]2;<title>\a`)
     fn set_window_title(&mut self, _: &mut crate::Screen, _title: &[u8]) {}
     /// This callback is called when the terminal requests data to be copied
     /// to the system clipboard (typically with `\e]52;<ty>;<data>\a`). Note
     /// that `data` will be encoded as base64.
-    fn copy_to_clipboard(
-        &mut self,
-        _: &mut crate::Screen,
-        _ty: &[u8],
-        _data: &[u8],
-    ) {
-    }
+    fn copy_to_clipboard(&mut self, _: &mut crate::Screen, _ty: &[u8], _data: &[u8]) {}
     /// This callback is called when the terminal requests data to be pasted
     /// from the system clipboard (typically with `\e]52;<ty>;?\a`).
     fn paste_from_clipboard(&mut self, _: &mut crate::Screen, _ty: &[u8]) {}

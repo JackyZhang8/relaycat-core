@@ -1,5 +1,11 @@
 use super::*;
 
+struct SnapshotPlan {
+    snapshot: TerminalSnapshotV2,
+    patches: Vec<TerminalPatchV2>,
+    final_state_seq: u64,
+}
+
 impl TerminalCore {
     pub fn snapshot(&mut self) -> TerminalSnapshotV2 {
         self.snapshot_with_reset_app_cache(false)
@@ -22,6 +28,277 @@ impl TerminalCore {
         snapshot
     }
 
+    /// Build a relay-safe snapshot transaction and commit it atomically.
+    ///
+    /// A normal-sized state is one snapshot. An oversized state starts with a
+    /// lightweight snapshot and reconstructs scrollback and visible rows with
+    /// independently sequenced patches that can be resumed after disconnect.
+    pub fn snapshot_messages(
+        &mut self,
+        reset_app_cache: bool,
+    ) -> Result<Vec<PlainMsg>, TerminalWireError> {
+        self.snapshot_messages_with_scrollback(reset_app_cache, self.snapshot_scrollback_window())
+    }
+
+    pub(crate) fn snapshot_messages_with_full_history(
+        &mut self,
+        reset_app_cache: bool,
+    ) -> Result<Vec<PlainMsg>, TerminalWireError> {
+        let cols = usize::from(self.cols);
+        let history = self
+            .history
+            .iter()
+            .map(|row| normalize_row_to_cols(row, cols))
+            .collect();
+        self.snapshot_messages_with_scrollback(reset_app_cache, history)
+    }
+
+    pub(crate) fn snapshot_messages_with_scrollback(
+        &mut self,
+        reset_app_cache: bool,
+        scrollback_window: Vec<TerminalRow>,
+    ) -> Result<Vec<PlainMsg>, TerminalWireError> {
+        let snapshot_id = if self.snapshot_emitted {
+            self.next_snapshot_id
+        } else {
+            self.active_snapshot_id
+        };
+        let plan = self.build_snapshot_plan(
+            snapshot_id,
+            reset_app_cache,
+            scrollback_window,
+            TERMINAL_RELAY_SAFE_PLAIN_MSG_BYTES,
+        )?;
+        self.commit_snapshot_plan(&plan);
+
+        let mut messages = Vec::with_capacity(plan.patches.len().saturating_add(1));
+        messages.push(PlainMsg::TerminalSnapshotV2(plan.snapshot));
+        messages.extend(plan.patches.into_iter().map(PlainMsg::TerminalPatchV2));
+        Ok(messages)
+    }
+
+    fn build_snapshot_plan(
+        &self,
+        snapshot_id: u64,
+        reset_app_cache: bool,
+        scrollback_window: Vec<TerminalRow>,
+        budget: usize,
+    ) -> Result<SnapshotPlan, TerminalWireError> {
+        let mut full_snapshot = self.current_snapshot();
+        full_snapshot.snapshot_id = snapshot_id;
+        full_snapshot.reset_app_cache = reset_app_cache;
+        full_snapshot.scrollback_window = scrollback_window;
+        if terminal_snapshot_v2_encoded_len(&full_snapshot) <= budget {
+            return Ok(SnapshotPlan {
+                final_state_seq: full_snapshot.state_seq,
+                snapshot: full_snapshot,
+                patches: Vec::new(),
+            });
+        }
+
+        let reconstruction_scrollback = std::mem::take(&mut full_snapshot.scrollback_window);
+        let reconstruction_screen = std::mem::take(&mut full_snapshot.screen_rows);
+        full_snapshot.state_seq = 0;
+        full_snapshot.screen_rows = reconstruction_screen
+            .iter()
+            .map(|row| TerminalRow {
+                line_id: row.line_id,
+                wrapped: row.wrapped,
+                cells: Vec::new(),
+            })
+            .collect();
+        let snapshot_len = terminal_snapshot_v2_encoded_len(&full_snapshot);
+        if snapshot_len > budget {
+            return Err(TerminalWireError::new(format!(
+                "terminal bootstrap snapshot exceeds relay budget: {snapshot_len} > {budget}"
+            )));
+        }
+
+        let mut patches = Vec::new();
+        let mut next_state_seq = 1_u64;
+        self.build_scrollback_reconstruction_patches(
+            snapshot_id,
+            &reconstruction_scrollback,
+            budget,
+            &mut next_state_seq,
+            &mut patches,
+        )?;
+        let screen_ops = reconstruction_screen
+            .into_iter()
+            .enumerate()
+            .map(|(row, line)| {
+                let row = u16::try_from(row).map_err(|_| {
+                    TerminalWireError::new("terminal screen row index exceeds protocol range")
+                })?;
+                Ok(PatchOp::ReplaceRow { row, line })
+            })
+            .collect::<Result<Vec<_>, TerminalWireError>>()?;
+        self.build_op_reconstruction_patches(
+            snapshot_id,
+            &screen_ops,
+            budget,
+            &mut next_state_seq,
+            &mut patches,
+        )?;
+
+        Ok(SnapshotPlan {
+            snapshot: full_snapshot,
+            final_state_seq: next_state_seq.saturating_sub(1),
+            patches,
+        })
+    }
+
+    fn build_scrollback_reconstruction_patches(
+        &self,
+        snapshot_id: u64,
+        rows: &[TerminalRow],
+        budget: usize,
+        next_state_seq: &mut u64,
+        patches: &mut Vec<TerminalPatchV2>,
+    ) -> Result<(), TerminalWireError> {
+        let mut offset = 0usize;
+        while offset < rows.len() {
+            let mut low = 1usize;
+            let mut high = rows.len() - offset;
+            let mut best = 0usize;
+            while low <= high {
+                let middle = low + (high - low) / 2;
+                let patch = self.reconstruction_patch(
+                    snapshot_id,
+                    *next_state_seq,
+                    vec![PatchOp::AppendScrollback {
+                        rows: rows[offset..offset + middle].to_vec(),
+                    }],
+                );
+                if terminal_patch_v2_encoded_len(&patch) <= budget {
+                    best = middle;
+                    low = middle.saturating_add(1);
+                } else {
+                    high = middle.saturating_sub(1);
+                }
+            }
+            if best == 0 {
+                return Err(TerminalWireError::new(
+                    "single terminal scrollback row exceeds relay budget",
+                ));
+            }
+            patches.push(self.reconstruction_patch(
+                snapshot_id,
+                *next_state_seq,
+                vec![PatchOp::AppendScrollback {
+                    rows: rows[offset..offset + best].to_vec(),
+                }],
+            ));
+            *next_state_seq = next_state_seq.saturating_add(1);
+            offset += best;
+        }
+        Ok(())
+    }
+
+    fn build_op_reconstruction_patches(
+        &self,
+        snapshot_id: u64,
+        ops: &[PatchOp],
+        budget: usize,
+        next_state_seq: &mut u64,
+        patches: &mut Vec<TerminalPatchV2>,
+    ) -> Result<(), TerminalWireError> {
+        let mut offset = 0usize;
+        while offset < ops.len() {
+            let mut low = 1usize;
+            let mut high = ops.len() - offset;
+            let mut best = 0usize;
+            while low <= high {
+                let middle = low + (high - low) / 2;
+                let patch = self.reconstruction_patch(
+                    snapshot_id,
+                    *next_state_seq,
+                    ops[offset..offset + middle].to_vec(),
+                );
+                if terminal_patch_v2_encoded_len(&patch) <= budget {
+                    best = middle;
+                    low = middle.saturating_add(1);
+                } else {
+                    high = middle.saturating_sub(1);
+                }
+            }
+            if best == 0 {
+                return Err(TerminalWireError::new(
+                    "single terminal screen row exceeds relay budget",
+                ));
+            }
+            patches.push(self.reconstruction_patch(
+                snapshot_id,
+                *next_state_seq,
+                ops[offset..offset + best].to_vec(),
+            ));
+            *next_state_seq = next_state_seq.saturating_add(1);
+            offset += best;
+        }
+        Ok(())
+    }
+
+    fn reconstruction_patch(
+        &self,
+        snapshot_id: u64,
+        state_seq: u64,
+        ops: Vec<PatchOp>,
+    ) -> TerminalPatchV2 {
+        TerminalPatchV2 {
+            terminal_run_id: self.terminal_run_id.clone(),
+            base_snapshot_id: snapshot_id,
+            from_state_seq: state_seq,
+            to_state_seq: state_seq,
+            attrs: Vec::new(),
+            attrs_base_len: None,
+            ops,
+        }
+    }
+
+    fn commit_snapshot_plan(&mut self, plan: &SnapshotPlan) {
+        if self.snapshot_emitted {
+            self.active_snapshot_id = plan.snapshot.snapshot_id;
+            self.next_snapshot_id = plan.snapshot.snapshot_id.saturating_add(1);
+        } else {
+            self.snapshot_emitted = true;
+            self.active_snapshot_id = plan.snapshot.snapshot_id;
+        }
+        self.state_seq = plan.final_state_seq;
+        self.retained_patches.clear();
+        for patch in &plan.patches {
+            self.retain_patch(patch.clone());
+        }
+        self.emitted_attrs_len = self.attrs.len();
+    }
+
+    pub fn resize_messages(
+        &mut self,
+        event: ResizeEventV2,
+        reset_app_cache: bool,
+    ) -> Result<Vec<PlainMsg>, TerminalWireError> {
+        let (cols, rows) = bounded_terminal_size(event.cols, event.rows);
+        let ack = ResizeAckV2 {
+            resize_seq: event.resize_seq,
+        };
+        if cols != self.cols || rows != self.rows {
+            // Trim at the new cell budget before widening retained vt100 rows;
+            // otherwise a narrow 2048-row history can briefly expand to 4096
+            // columns before being reduced to 64 rows.
+            self.parser
+                .screen_mut()
+                .set_scrollback_len(terminal_history_max_rows(cols));
+            self.parser.screen_mut().set_size(rows, cols);
+            self.sync_vt_screen_state();
+            self.normalize_history_to_current_cols();
+        }
+
+        let transaction = self.snapshot_messages(reset_app_cache)?;
+        let mut messages = Vec::with_capacity(transaction.len().saturating_add(1));
+        messages.push(PlainMsg::ResizeAckV2(ack));
+        messages.extend(transaction);
+        Ok(messages)
+    }
+
     /// Serve a page of screen transcript entries. Unlike terminal scrollback,
     /// this can include deduplicated alternate-screen frames for full-screen
     /// TUIs such as codex, vim, or htop.
@@ -31,7 +308,8 @@ impl TerminalCore {
     }
 
     pub fn resize(&mut self, event: ResizeEventV2) -> (ResizeAckV2, TerminalSnapshotV2) {
-        if event.cols == self.cols && event.rows == self.rows {
+        let (cols, rows) = bounded_terminal_size(event.cols, event.rows);
+        if cols == self.cols && rows == self.rows {
             self.emitted_attrs_len = self.attrs.len();
             return (
                 ResizeAckV2 {
@@ -46,13 +324,14 @@ impl TerminalCore {
         self.snapshot_emitted = true;
         self.state_seq = 0;
         self.retained_patches.clear();
-        // vt100 resizes only the visible grid; it never reflows or rewrites the
-        // scrollback, so `scrollback_seen` stays valid across a resize and the
-        // running TUI's post-resize repaint is captured faithfully (one copy,
-        // exactly like the local terminal) instead of being amplified.
-        self.parser.screen_mut().set_size(event.rows, event.cols);
-        self.scroll_region_history = None;
+        // Apply the new history budget before resizing retained rows to the new
+        // width, then synchronize the visible grid and pending scrollback.
+        self.parser
+            .screen_mut()
+            .set_scrollback_len(terminal_history_max_rows(cols));
+        self.parser.screen_mut().set_size(rows, cols);
         self.sync_vt_screen_state();
+        self.normalize_history_to_current_cols();
         self.emitted_attrs_len = self.attrs.len();
 
         (
@@ -137,25 +416,27 @@ impl TerminalCore {
         None
     }
 
-    pub fn resume_messages(&mut self, resume: &ResumeV2) -> Vec<PlainMsg> {
+    pub fn resume_messages(
+        &mut self,
+        resume: &ResumeV2,
+    ) -> Result<Vec<PlainMsg>, TerminalWireError> {
         let can_resume = resume.terminal_run_id.as_deref() == Some(self.terminal_run_id.as_str())
             && resume.last_snapshot_id == Some(self.active_snapshot_id);
 
         if can_resume
             && let Some(patches) =
                 self.retained_patches_after(self.active_snapshot_id, resume.last_applied_state_seq)
+            && (self.incremental_attrs_enabled()
+                || patches.iter().all(|patch| patch.attrs_base_len.is_none()))
             && patches_fit_relay_budget(&patches)
-            && patches_fit_resume_scrollback_window(&patches, self.rows)
         {
-            return coalesce_resume_patches(patches)
+            return Ok(coalesce_resume_patches(patches)
                 .into_iter()
                 .map(PlainMsg::TerminalPatchV2)
-                .collect();
+                .collect());
         }
 
-        vec![PlainMsg::TerminalSnapshotV2(
-            self.snapshot_with_reset_app_cache(true),
-        )]
+        self.snapshot_messages(true)
     }
 
     pub(crate) fn current_snapshot(&self) -> TerminalSnapshotV2 {

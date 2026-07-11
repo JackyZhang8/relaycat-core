@@ -160,4 +160,3 @@ pub(crate) fn raw_terminal_mode_from(original: libc::termios) -> libc::termios {
     raw.c_cc[libc::VTIME] = 0;
     raw
 }
-

@@ -160,8 +160,7 @@ pub(crate) fn select_launch(
                         }
                         // Remove from recent records.
                         if let Ok(recent_path) = recent_store::recent_file_path()
-                            && let Ok(mut store) =
-                                recent_store::RecentStore::load(&recent_path)
+                            && let Ok(mut store) = recent_store::RecentStore::load(&recent_path)
                         {
                             store.forget_project(&path);
                             let _ = store.save(&recent_path);
@@ -170,8 +169,7 @@ pub(crate) fn select_launch(
                         records = load_recent_records();
                         projects = project_choices(&records, config, language);
                         let selected = project_state.selected().unwrap_or(0);
-                        project_state
-                            .select(Some(selected.min(projects.len().saturating_sub(1))));
+                        project_state.select(Some(selected.min(projects.len().saturating_sub(1))));
                     }
                 }
                 KeyCode::Enter => match &selected_project(&projects, &project_state).kind {

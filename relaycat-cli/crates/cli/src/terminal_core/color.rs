@@ -1,5 +1,7 @@
 use super::*;
 
+pub(crate) const MAX_WIRE_ATTRS: usize = 4_096;
+
 pub(crate) fn default_terminal_palette() -> PaletteState {
     PaletteState {
         default_fg: TerminalColor::Rgb { r: 0, g: 0, b: 0 },
@@ -116,7 +118,7 @@ pub(crate) fn terminal_cell_from_vt_cell(cell: &vt100::Cell) -> TerminalCell {
 
     TerminalCell {
         text: if cell.has_contents() {
-            cell.contents().to_string()
+            truncate_utf8(cell.contents(), MAX_TERMINAL_CELL_TEXT_BYTES).to_string()
         } else {
             " ".to_string()
         },
@@ -131,6 +133,11 @@ pub(crate) fn attr_id_for(
 ) -> u32 {
     if let Some(&id) = index.get(&attr) {
         return id;
+    }
+    if attrs.len() >= MAX_WIRE_ATTRS {
+        // Keep adversarial truecolor streams bounded. Attribute zero is the
+        // default style, so the peer still renders the text with its palette.
+        return 0;
     }
     let id = u32::try_from(attrs.len()).expect("attr table index overflow");
     attrs.push(attr.clone());

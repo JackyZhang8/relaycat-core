@@ -7,7 +7,9 @@ use relaycat_crypto::{
     Direction as CryptoDirection, KeyPair, PairingRole, SessionKeys, pairing_token_hash,
     pairing_token_proof,
 };
-use relaycat_protocol::{Direction, OuterFrame, PlainMsg, Role};
+use relaycat_protocol::{
+    Direction, MAX_OUTER_FRAME_BYTES, OuterFrame, PlainMsg, Role, decode_frame,
+};
 
 #[test]
 fn secure_data_frame_round_trips_plain_msg() {
@@ -54,6 +56,47 @@ fn secure_data_frame_round_trips_compressed_payload() {
     // ...and still decode back to the original message (decode auto-detects framing).
     let decoded = decode_secure_data(&compressed, &keys).expect("decode compressed secure data");
     assert_eq!(decoded, Some(msg));
+}
+
+#[test]
+fn secure_session_encode_wire_rejects_oversized_before_consuming_sequence() {
+    let mut session = SecureSession::new("room-1", test_keys());
+    let oversized = PlainMsg::InputEventV2(relaycat_protocol::InputEventV2 {
+        input_stream_id: "stream-1".to_string(),
+        input_seq: 1,
+        bytes: vec![0xff; 1024],
+    });
+
+    let error = session
+        .encode_wire(Direction::CliToApp, oversized, 128)
+        .expect_err("oversized frame should be rejected");
+    assert!(error.to_string().contains("exceeds"));
+
+    let accepted = session
+        .encode_wire(
+            Direction::CliToApp,
+            PlainMsg::Heartbeat,
+            MAX_OUTER_FRAME_BYTES,
+        )
+        .expect("encode accepted frame");
+    let frame = decode_frame(&accepted).expect("decode accepted frame");
+    assert!(matches!(frame, OuterFrame::Data { seq: 1, .. }));
+}
+
+#[test]
+fn secure_session_encode_wire_accepts_near_limit_binary_payload() {
+    let mut session = SecureSession::new("r".repeat(256), test_keys());
+    let msg = PlainMsg::InputEventV2(relaycat_protocol::InputEventV2 {
+        input_stream_id: "stream-1".to_string(),
+        input_seq: u64::MAX,
+        bytes: vec![0xff; 960 * 1024],
+    });
+
+    let encoded = session
+        .encode_wire(Direction::CliToApp, msg, MAX_OUTER_FRAME_BYTES)
+        .expect("near-limit frame should fit");
+
+    assert!(encoded.len() <= MAX_OUTER_FRAME_BYTES);
 }
 
 #[test]
@@ -155,7 +198,13 @@ fn cli_secure_handshake_mixes_connection_salts_when_app_provides_one() {
     let app = KeyPair::from_private_bytes([25; 32]);
     let token = vec![26; 16];
     let app_salt = [77_u8; 32];
-    let proof = pairing_token_proof(&token, b"room-1", PairingRole::App, &app.public(), &app_salt);
+    let proof = pairing_token_proof(
+        &token,
+        b"room-1",
+        PairingRole::App,
+        &app.public(),
+        &app_salt,
+    );
     let handshake = CliSecureHandshake::new("room-1", cli, token.clone());
 
     let keys = handshake
@@ -189,7 +238,13 @@ fn cli_secure_handshake_rejects_proof_bound_to_tampered_salt() {
     // The app proved its real salt, but a malicious relay swapped the salt it
     // forwards. The proof no longer matches the forwarded salt → reject.
     let real_salt = [44_u8; 32];
-    let proof = pairing_token_proof(&token, b"room-1", PairingRole::App, &app.public(), &real_salt);
+    let proof = pairing_token_proof(
+        &token,
+        b"room-1",
+        PairingRole::App,
+        &app.public(),
+        &real_salt,
+    );
     let handshake = CliSecureHandshake::new("room-1", cli, token.clone());
 
     let err = handshake
@@ -242,7 +297,12 @@ fn secure_join_frame_binds_cli_proof_to_its_connection_salt() {
     // The CLI now proves token possession and binds the proof to that salt.
     assert_eq!(
         pairing_token_proof,
-        Some(pairing_token_proof_for(&[52; 32], "room-1", &handshake.cli_public(), &salt))
+        Some(pairing_token_proof_for(
+            &[52; 32],
+            "room-1",
+            &handshake.cli_public(),
+            &salt
+        ))
     );
     assert_eq!(
         relay_admission,
@@ -264,7 +324,12 @@ fn secure_join_frame_reuses_cli_salt_across_transport_reconnects() {
     assert_eq!(handshake.connection_salt(), first_salt);
 }
 
-fn pairing_token_proof_for(token: &[u8], room: &str, pubkey: &[u8; 32], salt: &[u8; 32]) -> [u8; 32] {
+fn pairing_token_proof_for(
+    token: &[u8],
+    room: &str,
+    pubkey: &[u8; 32],
+    salt: &[u8; 32],
+) -> [u8; 32] {
     pairing_token_proof(token, room.as_bytes(), PairingRole::Cli, pubkey, salt)
 }
 

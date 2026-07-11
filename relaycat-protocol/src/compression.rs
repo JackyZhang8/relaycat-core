@@ -21,11 +21,10 @@
 //! never has to decode a tag it does not understand.
 
 use std::borrow::Cow;
-use std::io::{Read, Write};
+use std::io::Write;
 
-use flate2::Compression;
-use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
+use flate2::{Compression, Decompress, FlushDecompress, Status};
 
 /// Tag for an uncompressed (raw msgpack) framed payload.
 pub const PAYLOAD_FRAME_IDENTITY: u8 = 0x00;
@@ -85,18 +84,57 @@ fn deflate(input: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn inflate(input: &[u8]) -> std::io::Result<Vec<u8>> {
-    // Bound the decompressed size: read at most one byte past the cap so an
-    // over-large stream is detected without ever materializing the full bomb.
-    let mut decoder = DeflateDecoder::new(input).take(MAX_INFLATED_PAYLOAD_BYTES as u64 + 1);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out)?;
-    if out.len() > MAX_INFLATED_PAYLOAD_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "decompressed payload exceeds maximum allowed size",
-        ));
+    let mut decoder = Decompress::new(false);
+    let mut input_offset = 0;
+    let mut out = Vec::with_capacity(input.len().min(MAX_INFLATED_PAYLOAD_BYTES));
+    let mut chunk = [0_u8; 8192];
+
+    loop {
+        let total_in_before = decoder.total_in();
+        let total_out_before = decoder.total_out();
+        let flush = if input_offset == input.len() {
+            FlushDecompress::Finish
+        } else {
+            FlushDecompress::None
+        };
+        let status = decoder
+            .decompress(&input[input_offset..], &mut chunk, flush)
+            .map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid DEFLATE payload: {err}"),
+                )
+            })?;
+
+        let consumed = (decoder.total_in() - total_in_before) as usize;
+        let produced = (decoder.total_out() - total_out_before) as usize;
+        input_offset += consumed;
+
+        if out.len().saturating_add(produced) > MAX_INFLATED_PAYLOAD_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decompressed payload exceeds maximum allowed size",
+            ));
+        }
+        out.extend_from_slice(&chunk[..produced]);
+
+        if status == Status::StreamEnd {
+            if input_offset != input.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "trailing bytes after DEFLATE stream",
+                ));
+            }
+            return Ok(out);
+        }
+
+        if consumed == 0 && produced == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated DEFLATE stream",
+            ));
+        }
     }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -170,11 +208,39 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_deflate_stream() {
+        assert!(unframe_payload(&[PAYLOAD_FRAME_DEFLATE]).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_deflate_stream() {
+        let payload = vec![b'a'; 4096];
+        let mut framed = frame_payload(&payload, true);
+        assert_eq!(framed[0], PAYLOAD_FRAME_DEFLATE);
+        framed.pop();
+
+        assert!(unframe_payload(&framed).is_err());
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_after_deflate_stream() {
+        let payload = vec![b'a'; 4096];
+        let mut framed = frame_payload(&payload, true);
+        assert_eq!(framed[0], PAYLOAD_FRAME_DEFLATE);
+        framed.push(0);
+
+        assert!(unframe_payload(&framed).is_err());
+    }
+
+    #[test]
     fn accepts_payload_at_inflated_cap() {
         let at_cap = vec![0_u8; MAX_INFLATED_PAYLOAD_BYTES];
         let framed = frame_payload(&at_cap, true);
         assert_eq!(framed[0], PAYLOAD_FRAME_DEFLATE);
-        assert_eq!(unframe_payload(&framed).unwrap().as_ref(), at_cap.as_slice());
+        assert_eq!(
+            unframe_payload(&framed).unwrap().as_ref(),
+            at_cap.as_slice()
+        );
     }
 
     #[test]

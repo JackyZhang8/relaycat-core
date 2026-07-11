@@ -398,9 +398,20 @@ TerminalTranscriptEntryV2 = {
   "kind": "normal_scrollback" | "alt_screen_frame" | "screen_frame",
   "cols": uint16,
   "rows": TerminalRow[],
-  "captured_at_unix_ms": uint64
+  "captured_at_unix_ms": uint64,
+  "frame_fragment"?: {
+    "frame_id": uint64,          # 该逻辑 frame 的首个 entry_id
+    "fragment_index": uint32,    # 从 0 开始
+    "fragment_count": uint32
+  }
 }
 ```
+
+`frame_fragment` 只用于超过单 entry 预算的 `screen_frame` /
+`alt_screen_frame`。同一逻辑 frame 的 fragments 按 `entry_id` 连续排列，App
+可跨 transcript pages 按 `frame_id` 和 index 无损重组；缺少任一 fragment
+时不得把剩余部分当成完整 frame。该字段是可选 map 字段，旧 V2 App 会忽略
+它并继续正常解码 entry。
 
 ### 5.10 input_event_v2
 

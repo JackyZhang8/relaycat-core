@@ -2,8 +2,19 @@ use super::*;
 
 impl TerminalCore {
     pub(crate) fn trim_history(&mut self) {
-        while self.history.len() > TERMINAL_HISTORY_MAX_ROWS {
+        let max_rows = terminal_history_max_rows(self.cols);
+        while self.history.len() > max_rows {
             self.history.pop_front();
+        }
+    }
+
+    pub(crate) fn normalize_history_to_current_cols(&mut self) {
+        // Drop rows that the new width cannot retain before normalizing them,
+        // avoiding unnecessary work on history that will be evicted anyway.
+        self.trim_history();
+        let cols = usize::from(self.cols);
+        for row in &mut self.history {
+            *row = normalize_row_to_cols(row, cols);
         }
     }
 

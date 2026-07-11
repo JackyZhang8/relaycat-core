@@ -91,7 +91,10 @@ pub(crate) fn spawn_update_notice_check() -> mpsc::Receiver<UpdateNotice> {
     rx
 }
 
-pub(crate) fn poll_update_notice(rx: &mpsc::Receiver<UpdateNotice>, update_notice: &mut Option<UpdateNotice>) {
+pub(crate) fn poll_update_notice(
+    rx: &mpsc::Receiver<UpdateNotice>,
+    update_notice: &mut Option<UpdateNotice>,
+) {
     if update_notice.is_some() {
         return;
     }

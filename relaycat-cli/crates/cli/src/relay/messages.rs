@@ -22,4 +22,3 @@ pub(crate) fn relaycat_logs_message(path: &Path, language: CliLanguage) -> Strin
 pub(crate) fn pairing_url_message(url: &str, language: CliLanguage) -> String {
     format!("{}:\n  {}", language.t("Pairing URL", "配对链接"), url)
 }
-

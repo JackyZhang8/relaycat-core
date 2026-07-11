@@ -369,7 +369,11 @@ mod tests {
         assert!(SessionKind::opencode().uses_managed_alt_screen());
         assert!(!SessionKind::claude().uses_managed_alt_screen());
         assert!(!SessionKind::shell().uses_managed_alt_screen());
-        assert!(!SessionKind::new("gemini").unwrap().uses_managed_alt_screen());
+        assert!(
+            !SessionKind::new("gemini")
+                .unwrap()
+                .uses_managed_alt_screen()
+        );
     }
 
     #[test]

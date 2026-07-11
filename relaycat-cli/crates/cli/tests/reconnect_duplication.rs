@@ -112,7 +112,10 @@ fn relay_resume_legacy(
                 .expect("buffered output should emit a patch"),
         ));
     }
-    msgs.extend(core.resume_messages(resume));
+    msgs.extend(
+        core.resume_messages(resume)
+            .expect("legacy resume messages"),
+    );
     msgs
 }
 
@@ -129,6 +132,7 @@ fn relay_resume_folding(
         let _ = core.feed_vt_bytes(&bytes);
     }
     core.resume_messages(resume)
+        .expect("folded resume messages")
 }
 
 fn relay_dirty_local_mode_snapshot(core: &mut TerminalCore, pending: &mut Vec<u8>) -> PlainMsg {
@@ -344,7 +348,10 @@ fn resume_replays_short_disconnect_gap_before_new_live_patches() {
     app.apply(&PlainMsg::TerminalSnapshotV2(core.snapshot()));
 
     apply_ops_repeatedly(&mut core, 4, "connected");
-    for msg in core.resume_messages(&resume_msg(&app, "run-1")) {
+    for msg in core
+        .resume_messages(&resume_msg(&app, "run-1"))
+        .expect("connected resume messages")
+    {
         app.apply(&msg);
     }
     assert_eq!(app.rejected_patches, 0);
@@ -352,7 +359,9 @@ fn resume_replays_short_disconnect_gap_before_new_live_patches() {
 
     apply_ops_repeatedly(&mut core, 14, "offline");
 
-    let replay = core.resume_messages(&resume_msg(&app, "run-1"));
+    let replay = core
+        .resume_messages(&resume_msg(&app, "run-1"))
+        .expect("short disconnect replay");
     let [PlainMsg::TerminalPatchV2(patch)] = replay.as_slice() else {
         panic!("short disconnect gap should replay retained patches");
     };

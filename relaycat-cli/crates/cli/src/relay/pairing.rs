@@ -151,7 +151,9 @@ pub(crate) fn pairing_control_action_for_key(key: KeyEvent) -> Option<PairingCon
     }
 }
 
-pub(crate) fn poll_pairing_control_action(timeout: Duration) -> Result<Option<PairingControlAction>> {
+pub(crate) fn poll_pairing_control_action(
+    timeout: Duration,
+) -> Result<Option<PairingControlAction>> {
     if !event::poll(timeout).context("failed to poll pairing control input")? {
         return Ok(None);
     }
@@ -617,7 +619,6 @@ pub(crate) fn pairing_qr_png_written_message(path: &Path, language: CliLanguage)
     )
 }
 
-
 #[cfg(unix)]
 pub(crate) struct PairingControlModeGuard {
     original: Option<libc::termios>,
@@ -658,4 +659,3 @@ impl Drop for PairingControlModeGuard {
         disable_local_focus_reporting();
     }
 }
-

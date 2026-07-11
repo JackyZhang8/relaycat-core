@@ -7,3 +7,4 @@ relaycat-cli/third_party
 relaycat-server/conf.d
 .idea
 relaycat-server/rtasr_go
+certs_desktop

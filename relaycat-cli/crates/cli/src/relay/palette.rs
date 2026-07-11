@@ -349,4 +349,3 @@ pub(crate) fn trim_string_control_terminator(bytes: &[u8]) -> &[u8] {
     }
     bytes
 }
-

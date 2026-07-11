@@ -96,6 +96,10 @@ impl Cell {
         self.len() > 0
     }
 
+    pub(crate) fn is_default_blank(&self) -> bool {
+        self == &Self::new()
+    }
+
     /// Returns whether the text data in the cell represents a wide character.
     #[must_use]
     pub fn is_wide(&self) -> bool {

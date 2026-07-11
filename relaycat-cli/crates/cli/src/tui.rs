@@ -30,9 +30,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-    },
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -51,17 +49,17 @@ use crate::recent_store::RecentRecord;
 use crate::update::{self, UpdateNotice};
 use crate::{command::TargetCommand, pty, recent_store, relay};
 
-mod tools;
 mod config_load;
-mod session;
-mod select;
 mod render;
+mod select;
+mod session;
+mod tools;
 
-pub(crate) use tools::*;
 pub(crate) use config_load::*;
-pub(crate) use session::*;
-pub(crate) use select::*;
 pub(crate) use render::*;
+pub(crate) use select::*;
+pub(crate) use session::*;
+pub(crate) use tools::*;
 
 /// What a tool entry launches: either a built-in session kind or a user-defined
 /// custom tool with an explicit program/args.
@@ -92,10 +90,6 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
 ];
 
 const UPDATE_NOTICE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-
-
-
-
 
 /// RAII guard that owns the alternate-screen/raw-mode terminal and restores the
 /// real terminal on drop, including on panic or early return. Restoring on
@@ -225,40 +219,11 @@ pub async fn run() -> Result<()> {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LauncherMainLayout {
     content: Rect,
     brand: Option<Rect>,
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[cfg(test)]
 mod tests;

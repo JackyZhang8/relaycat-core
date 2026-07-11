@@ -6,11 +6,14 @@ pub(crate) fn process_exit_msg(status: &ExitStatus) -> PlainMsg {
     }
 }
 
-pub(crate) fn plain_msg_fits_relay_budget(msg: &PlainMsg) -> Result<bool> {
-    Ok(encode_plain_msg(msg)
-        .context("failed to encode PlainMsg for relay budget check")?
-        .len()
-        <= RELAY_SAFE_PLAIN_MSG_BYTES)
+pub(crate) fn encode_relay_frame_bytes(frame: &OuterFrame) -> Result<Vec<u8>> {
+    let bytes = encode_frame(frame).context("failed to encode relay frame")?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_OUTER_FRAME_BYTES,
+        "encoded relay frame exceeds {MAX_OUTER_FRAME_BYTES} bytes: {}",
+        bytes.len()
+    );
+    Ok(bytes)
 }
 
 pub(crate) fn collect_cli_status(pid: Option<u32>, process_name: &str) -> CliStatus {
@@ -150,7 +153,11 @@ pub(crate) fn total_process_usage(
 }
 
 #[cfg(any(unix, windows))]
-pub(crate) fn process_is_or_descends_from(pid: u32, root_pid: u32, rows: &[ProcessUsageRow]) -> bool {
+pub(crate) fn process_is_or_descends_from(
+    pid: u32,
+    root_pid: u32,
+    rows: &[ProcessUsageRow],
+) -> bool {
     if pid == root_pid {
         return true;
     }
@@ -171,4 +178,3 @@ pub(crate) fn process_is_or_descends_from(pid: u32, root_pid: u32, rows: &[Proce
 
     false
 }
-

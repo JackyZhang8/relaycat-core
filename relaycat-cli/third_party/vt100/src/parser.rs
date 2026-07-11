@@ -12,11 +12,7 @@ impl Parser {
     pub fn new(rows: u16, cols: u16, scrollback_len: usize) -> Self {
         Self {
             parser: vte::Parser::new(),
-            screen: crate::perform::WrappedScreen::new(
-                rows,
-                cols,
-                scrollback_len,
-            ),
+            screen: crate::perform::WrappedScreen::new(rows, cols, scrollback_len),
         }
     }
 }
@@ -26,12 +22,7 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
     /// amount of scrollback. Terminal events will be reported via method
     /// calls on the provided [`Callbacks`](crate::callbacks::Callbacks)
     /// implementation.
-    pub fn new_with_callbacks(
-        rows: u16,
-        cols: u16,
-        scrollback_len: usize,
-        callbacks: CB,
-    ) -> Self {
+    pub fn new_with_callbacks(rows: u16, cols: u16, scrollback_len: usize, callbacks: CB) -> Self {
         Self {
             parser: vte::Parser::new(),
             screen: crate::perform::WrappedScreen::new_with_callbacks(

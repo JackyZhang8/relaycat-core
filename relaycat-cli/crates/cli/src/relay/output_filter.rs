@@ -43,7 +43,10 @@ pub(crate) struct LocalOutputFilterResult {
 
 impl LocalOutputFilter {
     #[cfg(test)]
-    pub(crate) fn new_with_color_query_policy(palette: PaletteState, answer_color_queries: bool) -> Self {
+    pub(crate) fn new_with_color_query_policy(
+        palette: PaletteState,
+        answer_color_queries: bool,
+    ) -> Self {
         Self::new_with_color_query_palette(answer_color_queries.then_some(palette))
     }
 
@@ -125,9 +128,7 @@ impl LocalOutputFilter {
                     // modes (1004) with non-filtered modes (e.g. 1049, 2004),
                     // pass the non-filtered sub-sequence through to both outputs
                     // so legitimate mode changes are not silently dropped.
-                    if let Some(passthrough) =
-                        split_filtered_dec_private_modes(sequence)
-                    {
+                    if let Some(passthrough) = split_filtered_dec_private_modes(sequence) {
                         result.local_output.extend_from_slice(&passthrough);
                         result.remote_output.extend_from_slice(&passthrough);
                     }
@@ -140,11 +141,13 @@ impl LocalOutputFilter {
                     // taller host terminal a bottom-anchored region would trap
                     // later output above the visible prompt, so expand it to the
                     // host height for `local_output` only.
-                    result.local_output.extend_from_slice(&host_scroll_region_sequence(
-                        sequence,
-                        self.pty_rows,
-                        self.host_rows,
-                    ));
+                    result
+                        .local_output
+                        .extend_from_slice(&host_scroll_region_sequence(
+                            sequence,
+                            self.pty_rows,
+                            self.host_rows,
+                        ));
                     result.remote_output.extend_from_slice(sequence);
                     index += final_offset + 1;
                     continue;
@@ -367,7 +370,11 @@ pub(crate) fn is_set_scroll_region_sequence(sequence: &[u8]) -> bool {
 /// (`\x1b[r`, which the host already treats as its full screen). The app-facing
 /// stream always keeps the original sequence — its grid is exactly `pty_rows`
 /// tall, so the child's region is already correct there.
-pub(crate) fn host_scroll_region_sequence(sequence: &[u8], pty_rows: u16, host_rows: u16) -> Vec<u8> {
+pub(crate) fn host_scroll_region_sequence(
+    sequence: &[u8],
+    pty_rows: u16,
+    host_rows: u16,
+) -> Vec<u8> {
     if pty_rows == 0 || host_rows <= pty_rows {
         return sequence.to_vec();
     }
@@ -429,7 +436,10 @@ pub(crate) fn local_output_string_control_action(
     }
 }
 
-pub(crate) fn deterministic_terminal_color_response(sequence: &[u8], palette: &PaletteState) -> Vec<u8> {
+pub(crate) fn deterministic_terminal_color_response(
+    sequence: &[u8],
+    palette: &PaletteState,
+) -> Vec<u8> {
     let Some(body) = sequence.strip_prefix(b"\x1b]") else {
         return Vec::new();
     };
@@ -469,7 +479,11 @@ pub(crate) fn deterministic_osc4_color_responses(body: &[u8], palette: &PaletteS
     response
 }
 
-pub(crate) fn osc_color_response(kind: &[u8], color: &TerminalColor, palette: &PaletteState) -> Vec<u8> {
+pub(crate) fn osc_color_response(
+    kind: &[u8],
+    color: &TerminalColor,
+    palette: &PaletteState,
+) -> Vec<u8> {
     let mut response = Vec::new();
     response.extend_from_slice(b"\x1b]");
     response.extend_from_slice(kind);
@@ -525,4 +539,3 @@ pub(crate) fn ascii_u16(bytes: &[u8]) -> Option<u16> {
     }
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
-

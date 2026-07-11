@@ -8,7 +8,9 @@ pub(crate) struct TerminalPatchOpCounts {
     switch_alt_screen: Option<bool>,
 }
 
-pub(crate) fn terminal_patch_op_counts(patch: &relaycat_protocol::TerminalPatchV2) -> TerminalPatchOpCounts {
+pub(crate) fn terminal_patch_op_counts(
+    patch: &relaycat_protocol::TerminalPatchV2,
+) -> TerminalPatchOpCounts {
     let mut counts = TerminalPatchOpCounts::default();
     for op in &patch.ops {
         match op {
@@ -33,7 +35,7 @@ pub(crate) fn terminal_patch_diagnostic_line(
     let core = terminal_core.debug_snapshot();
     let patch_plain_bytes = terminal_patch_plain_bytes(patch);
     format!(
-        "terminal_patch_diag kind={session_kind} bytes={} patch_plain_bytes={} seq={} ops={} append_rows={} replace_rows={} scroll_region_ops={} switch_alt={:?} attrs={} core_history={} core_seen={} vt_scrollback={} frozen={} alt={} size={}x{} raw_csi_r={} raw_csi_scroll={} raw_alt={} raw_preview={}",
+        "terminal_patch_diag kind={session_kind} bytes={} patch_plain_bytes={} seq={} ops={} append_rows={} replace_rows={} scroll_region_ops={} switch_alt={:?} attrs={} core_history={} vt_scrollback={} frozen={} alt={} size={}x{} raw_csi_r={} raw_csi_scroll={} raw_alt={} raw_preview={}",
         bytes.len(),
         patch_plain_bytes,
         patch.to_state_seq,
@@ -44,7 +46,6 @@ pub(crate) fn terminal_patch_diagnostic_line(
         counts.switch_alt_screen,
         patch.attrs.len(),
         core.history_len,
-        core.scrollback_seen,
         core.vt_scrollback_len,
         core.history_frozen,
         core.alt_screen,
@@ -97,7 +98,9 @@ pub(crate) struct TerminalOutputControlDiagnostics {
     pub(crate) alternate_screen: bool,
 }
 
-pub(crate) fn terminal_output_control_diagnostics(bytes: &[u8]) -> TerminalOutputControlDiagnostics {
+pub(crate) fn terminal_output_control_diagnostics(
+    bytes: &[u8],
+) -> TerminalOutputControlDiagnostics {
     let mut diagnostics = TerminalOutputControlDiagnostics::default();
     let mut index = 0;
     while index < bytes.len() {
@@ -126,4 +129,3 @@ pub(crate) fn terminal_output_control_diagnostics(bytes: &[u8]) -> TerminalOutpu
     }
     diagnostics
 }
-

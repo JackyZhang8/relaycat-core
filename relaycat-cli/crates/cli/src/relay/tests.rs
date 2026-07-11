@@ -1,8 +1,6 @@
 use super::*;
 use crate::i18n::CliLanguage;
-use relaycat_crypto::{
-    KeyPair, PairingRole, SessionKeys, pairing_token_hash, pairing_token_proof,
-};
+use relaycat_crypto::{KeyPair, PairingRole, SessionKeys, pairing_token_hash, pairing_token_proof};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -93,6 +91,245 @@ fn terminal_patch_diagnostic_line_includes_encoded_patch_size() {
         line.contains(&format!("patch_plain_bytes={encoded_len}")),
         "diagnostic line must include encoded patch byte size, got {line}"
     );
+}
+
+#[test]
+fn flush_pending_output_keeps_reset_snapshot_and_all_post_ris_patches() {
+    let mut core = TerminalCore::new(TerminalCoreConfig {
+        terminal_run_id: "run-1".to_string(),
+        cols: 240,
+        rows: 2,
+        patch_retention: 64,
+    });
+    core.snapshot();
+    for index in 0..4 {
+        core.feed_vt_bytes(format!("old-{index}\r\n").as_bytes());
+    }
+
+    let mut pending_output = b"\x1bc".to_vec();
+    for index in 0..400 {
+        pending_output
+            .extend_from_slice(format!("new-{index:04}-{}\r\n", "x".repeat(220)).as_bytes());
+    }
+    let mut flush_deadline = Some(Instant::now());
+    let msgs = flush_pending_output(&mut pending_output, &mut flush_deadline, &mut core, None)
+        .expect("flush RIS transaction");
+
+    let [PlainMsg::TerminalSnapshotV2(snapshot), tail @ ..] = msgs.as_slice() else {
+        panic!("RIS flush must start with a terminal snapshot, got {msgs:?}");
+    };
+    assert!(snapshot.reset_app_cache);
+    assert!(snapshot.scrollback_window.is_empty());
+    let patches = tail
+        .iter()
+        .map(|message| match message {
+            PlainMsg::TerminalPatchV2(patch) => patch,
+            other => panic!("unexpected RIS transaction message: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert!(!patches.is_empty());
+    let mut expected_seq = snapshot.state_seq.saturating_add(1);
+    for patch in &patches {
+        assert_eq!(patch.base_snapshot_id, snapshot.snapshot_id);
+        assert_eq!(patch.from_state_seq, expected_seq);
+        assert_eq!(patch.to_state_seq, expected_seq);
+        expected_seq = expected_seq.saturating_add(1);
+    }
+    let appended = patches
+        .iter()
+        .flat_map(|patch| {
+            patch.ops.iter().flat_map(|op| match op {
+                PatchOp::AppendScrollback { rows } => {
+                    rows.iter().map(terminal_row_text).collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let expected = (0..399)
+        .map(|index| format!("new-{index:04}-{}", "x".repeat(220)))
+        .collect::<Vec<_>>();
+    assert_eq!(appended, expected);
+    assert!(appended.iter().all(|row| !row.starts_with("old-")));
+    assert!(pending_output.is_empty());
+    assert!(flush_deadline.is_none());
+}
+
+#[test]
+fn resume_gate_recovers_full_post_ris_history_after_dropping_reset_transaction() {
+    let mut core = TerminalCore::new(TerminalCoreConfig {
+        terminal_run_id: "run-1".to_string(),
+        cols: 240,
+        rows: 2,
+        patch_retention: 64,
+    });
+    core.snapshot();
+    for index in 0..8 {
+        core.feed_vt_bytes(format!("old-{index}\r\n").as_bytes());
+    }
+
+    let mut pending_output = b"\x1bc".to_vec();
+    for index in 0..400 {
+        pending_output
+            .extend_from_slice(format!("new-{index:04}-{}\r\n", "x".repeat(220)).as_bytes());
+    }
+    let dropped = flush_pending_output(
+        &mut pending_output,
+        &mut Some(Instant::now()),
+        &mut core,
+        None,
+    )
+    .expect("build reset transaction before resume");
+
+    let mut gate = AppResumeGate::default();
+    gate.mark_app_rejoined();
+    let mut pending_reset_before_resume = false;
+    for message in &dropped {
+        if !gate.can_send_terminal_state(true) && !can_send_without_terminal_resume(message) {
+            note_unsent_terminal_reset(message, &mut pending_reset_before_resume);
+        }
+    }
+    assert!(pending_reset_before_resume);
+
+    let recovered = take_deferred_reset_messages(&mut core, &mut pending_reset_before_resume)
+        .expect("build full-history recovery transaction")
+        .expect("gate-dropped RIS must require recovery");
+    assert!(!pending_reset_before_resume);
+    assert!(matches!(
+        recovered.first(),
+        Some(PlainMsg::TerminalSnapshotV2(snapshot)) if snapshot.reset_app_cache
+    ));
+    assert!(
+        recovered.iter().all(|message| {
+            encode_plain_msg(message).is_ok_and(|bytes| bytes.len() <= 960 * 1024)
+        })
+    );
+
+    let history = recovered
+        .iter()
+        .flat_map(|message| match message {
+            PlainMsg::TerminalSnapshotV2(snapshot) => snapshot
+                .scrollback_window
+                .iter()
+                .map(terminal_row_text)
+                .collect::<Vec<_>>(),
+            PlainMsg::TerminalPatchV2(patch) => patch
+                .ops
+                .iter()
+                .flat_map(|op| match op {
+                    PatchOp::AppendScrollback { rows } => {
+                        rows.iter().map(terminal_row_text).collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let expected = (0..399)
+        .map(|index| format!("new-{index:04}-{}", "x".repeat(220)))
+        .collect::<Vec<_>>();
+    assert_eq!(history, expected);
+}
+
+#[test]
+fn flush_pending_output_consumes_ris_reset_requirement_once() {
+    let mut core = TerminalCore::new(TerminalCoreConfig {
+        terminal_run_id: "run-1".to_string(),
+        cols: 16,
+        rows: 2,
+        patch_retention: 8,
+    });
+    core.snapshot();
+    let mut flush_deadline = None;
+
+    let first = flush_pending_output(
+        &mut b"\x1bcfirst".to_vec(),
+        &mut flush_deadline,
+        &mut core,
+        None,
+    )
+    .expect("flush first RIS transaction");
+    let [PlainMsg::TerminalSnapshotV2(snapshot)] = first.as_slice() else {
+        panic!("RIS flush must emit a reset snapshot, got {first:?}");
+    };
+    assert!(snapshot.reset_app_cache);
+
+    let second = flush_pending_output(
+        &mut b" second".to_vec(),
+        &mut flush_deadline,
+        &mut core,
+        None,
+    )
+    .expect("flush post-RIS output");
+    assert!(matches!(second.as_slice(), [PlainMsg::TerminalPatchV2(_)]));
+}
+
+#[test]
+fn flush_pending_output_keeps_non_ris_output_as_patch() {
+    let mut core = TerminalCore::new(TerminalCoreConfig {
+        terminal_run_id: "run-1".to_string(),
+        cols: 16,
+        rows: 2,
+        patch_retention: 8,
+    });
+    core.snapshot();
+
+    let msgs = flush_pending_output(
+        &mut b"hello".to_vec(),
+        &mut Some(Instant::now()),
+        &mut core,
+        None,
+    )
+    .expect("flush terminal output");
+
+    assert!(matches!(msgs.as_slice(), [PlainMsg::TerminalPatchV2(_)]));
+}
+
+#[test]
+fn flush_pending_output_keeps_large_scrollback_as_patch_batch() {
+    let mut core = TerminalCore::new(TerminalCoreConfig {
+        terminal_run_id: "run-1".to_string(),
+        cols: 240,
+        rows: 2,
+        patch_retention: 64,
+    });
+    core.snapshot();
+    let mut pending_output = Vec::new();
+    for index in 0..400 {
+        pending_output
+            .extend_from_slice(format!("line-{index:04}-{}\r\n", "x".repeat(220)).as_bytes());
+    }
+
+    let msgs = flush_pending_output(
+        &mut pending_output,
+        &mut Some(Instant::now()),
+        &mut core,
+        None,
+    )
+    .expect("flush large scrollback batch");
+
+    assert!(msgs.len() > 1);
+    assert!(msgs.iter().all(|message| {
+        matches!(message, PlainMsg::TerminalPatchV2(_))
+            && encode_plain_msg(message).is_ok_and(|bytes| bytes.len() <= 960 * 1024)
+    }));
+}
+
+#[test]
+fn local_mode_dirty_detection_treats_snapshot_as_terminal_state() {
+    let mut core = TerminalCore::new(TerminalCoreConfig {
+        terminal_run_id: "run-1".to_string(),
+        cols: 16,
+        rows: 2,
+        patch_retention: 8,
+    });
+    let msgs = vec![PlainMsg::TerminalSnapshotV2(core.snapshot())];
+    let mut local_mode_dirty = false;
+
+    mark_local_mode_dirty_from_msgs(&msgs, true, &mut local_mode_dirty);
+
+    assert!(local_mode_dirty);
 }
 
 #[test]
@@ -249,6 +486,19 @@ fn effective_remote_size_clamps_app_to_host() {
 }
 
 #[test]
+fn effective_remote_size_bounds_headless_app_dimensions() {
+    assert_eq!(effective_remote_size(u16::MAX, u16::MAX, None), (4_096, 64));
+}
+
+#[test]
+fn effective_remote_size_applies_cell_budget_after_host_clamp() {
+    assert_eq!(
+        effective_remote_size(u16::MAX, u16::MAX, host(80, 4_096)),
+        (80, 3_276)
+    );
+}
+
+#[test]
 fn log_archive_names_match_rotated_files_only() {
     assert!(is_log_archive_name("cli-2026-07-03-134500.log.gz"));
     assert!(is_log_archive_name("cli-2026-07-03-134500.log"));
@@ -286,11 +536,7 @@ fn prune_log_archives_keeps_at_most_max_and_spares_live_log() {
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("cli.log"), b"live").unwrap();
     for n in 1..=12 {
-        fs::write(
-            dir.join(format!("cli-2026-06-{n:02}-000000.log.gz")),
-            b"x",
-        )
-        .unwrap();
+        fs::write(dir.join(format!("cli-2026-06-{n:02}-000000.log.gz")), b"x").unwrap();
     }
     prune_log_archives(&dir, u64::MAX / (24 * 60 * 60) - 1, 10);
     let archives = fs::read_dir(&dir)
@@ -377,18 +623,57 @@ fn process_exit_msg_uses_real_exit_code() {
 }
 
 #[test]
-fn relay_output_budget_rejects_plain_messages_that_could_exceed_relay_frame_limit() {
-    assert_eq!(RELAY_SAFE_PLAIN_MSG_BYTES, 960 * 1024);
-    assert!(plain_msg_fits_relay_budget(&PlainMsg::ProcessExit { code: Some(0) }).unwrap());
-    assert!(
-        !plain_msg_fits_relay_budget(&PlainMsg::InputEventV2(
-            relaycat_protocol::InputEventV2 {
-                input_stream_id: "stream-1".to_string(),
-                input_seq: 1,
-                bytes: vec![b'x'; RELAY_SAFE_PLAIN_MSG_BYTES + 1],
-            }
-        ))
-        .unwrap()
+fn relay_wire_guard_checks_final_outer_frame_bytes() {
+    let small = OuterFrame::Data {
+        room_id: "room-1".to_string(),
+        direction: Direction::CliToApp,
+        seq: 1,
+        nonce: [0; 12],
+        ciphertext: vec![0; 16],
+    };
+    assert!(encode_relay_frame_bytes(&small).is_ok());
+
+    let oversized = OuterFrame::Data {
+        room_id: "room-1".to_string(),
+        direction: Direction::CliToApp,
+        seq: 1,
+        nonce: [0; 12],
+        ciphertext: vec![0; relaycat_protocol::MAX_OUTER_FRAME_BYTES],
+    };
+    let error = encode_relay_frame_bytes(&oversized).expect_err("frame should exceed wire limit");
+    assert!(error.to_string().contains("exceeds"));
+}
+
+#[test]
+fn relay_websocket_config_caps_inbound_message_and_frame_bytes() {
+    let config = relay_websocket_config();
+
+    assert_eq!(config.max_message_size, Some(MAX_OUTER_FRAME_BYTES));
+    assert_eq!(config.max_frame_size, Some(MAX_OUTER_FRAME_BYTES));
+}
+
+#[test]
+fn relay_binary_decode_rejects_oversized_input_before_messagepack() {
+    let oversized = vec![0_u8; MAX_OUTER_FRAME_BYTES + 1];
+
+    assert!(decode_relay_binary_frame(&oversized).is_err());
+}
+
+#[test]
+fn relay_outbound_byte_pacer_spreads_frames_beyond_default_burst() {
+    let start = Instant::now();
+    let mut pacer = RelayOutboundBytePacer::new(start);
+    let one_mib = 1024 * 1024;
+
+    assert_eq!(pacer.delay_for(one_mib, start), None);
+    assert_eq!(pacer.delay_for(one_mib, start), None);
+    assert_eq!(
+        pacer.delay_for(one_mib, start),
+        Some(Duration::from_millis(500))
+    );
+    assert_eq!(
+        pacer.delay_for(one_mib, start + Duration::from_millis(500)),
+        None
     );
 }
 
@@ -720,6 +1005,31 @@ fn terminal_control_can_request_local_mode_transport_disconnect() {
 }
 
 #[test]
+fn terminal_resize_control_carries_pty_and_model_size_together() {
+    let event = ResizeEventV2 {
+        resize_seq: 7,
+        cols: 80,
+        rows: 24,
+        input_stream_id: "stream-1".to_string(),
+        last_input_ack: 0,
+    };
+    let pty_size = PtySize {
+        cols: 80,
+        rows: 24,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+
+    assert_eq!(
+        TerminalV2Control::Resize {
+            event: event.clone(),
+            pty_size,
+        },
+        TerminalV2Control::Resize { event, pty_size }
+    );
+}
+
+#[test]
 fn local_content_pty_size_uses_full_host_size() {
     assert_eq!(
         local_content_pty_size(PtySize {
@@ -735,6 +1045,37 @@ fn local_content_pty_size_uses_full_host_size() {
             pixel_height: 0,
         }
     );
+}
+
+#[test]
+fn local_content_pty_size_bounds_oversized_host_dimensions() {
+    assert_eq!(
+        local_content_pty_size(PtySize {
+            rows: u16::MAX,
+            cols: u16::MAX,
+            pixel_width: 640,
+            pixel_height: 480,
+        }),
+        PtySize {
+            rows: 64,
+            cols: 4_096,
+            pixel_width: 640,
+            pixel_height: 480,
+        }
+    );
+}
+
+#[test]
+fn initial_relay_terminal_size_keeps_pty_and_model_dimensions_identical() {
+    let (pty, model_cols, model_rows) = initial_relay_terminal_size(PtySize {
+        rows: u16::MAX,
+        cols: u16::MAX,
+        pixel_width: 640,
+        pixel_height: 480,
+    });
+
+    assert_eq!((pty.cols, pty.rows), (4_096, 64));
+    assert_eq!((model_cols, model_rows), (pty.cols, pty.rows));
 }
 
 #[test]
@@ -757,10 +1098,7 @@ fn local_input_filter_passes_decxcpr_response() {
     let mut filter = LocalInputFilter::default();
 
     // DECXCPR response (\x1b[?46;1R) passes through to PTY
-    assert_eq!(
-        pty_input(filter.filter(b"a\x1b[?46;1Rb")),
-        b"a\x1b[?46;1Rb"
-    );
+    assert_eq!(pty_input(filter.filter(b"a\x1b[?46;1Rb")), b"a\x1b[?46;1Rb");
 }
 
 #[test]
@@ -929,23 +1267,44 @@ fn host_scroll_region_expands_bottom_anchored_region_to_host_height() {
     // Full-screen app on a 24-row PTY hosted in a 50-row terminal: the
     // region is expanded to the host's last row so later output is not
     // trapped above row 24.
-    assert_eq!(host_scroll_region_sequence(b"\x1b[1;24r", 24, 50), b"\x1b[1;50r");
+    assert_eq!(
+        host_scroll_region_sequence(b"\x1b[1;24r", 24, 50),
+        b"\x1b[1;50r"
+    );
     // Top margin is preserved.
-    assert_eq!(host_scroll_region_sequence(b"\x1b[3;24r", 24, 50), b"\x1b[3;50r");
+    assert_eq!(
+        host_scroll_region_sequence(b"\x1b[3;24r", 24, 50),
+        b"\x1b[3;50r"
+    );
     // Omitted bottom margin defaults to the last row -> bottom-anchored.
-    assert_eq!(host_scroll_region_sequence(b"\x1b[1r", 24, 50), b"\x1b[1;50r");
-    assert_eq!(host_scroll_region_sequence(b"\x1b[1;r", 24, 50), b"\x1b[1;50r");
+    assert_eq!(
+        host_scroll_region_sequence(b"\x1b[1r", 24, 50),
+        b"\x1b[1;50r"
+    );
+    assert_eq!(
+        host_scroll_region_sequence(b"\x1b[1;r", 24, 50),
+        b"\x1b[1;50r"
+    );
 }
 
 #[test]
 fn host_scroll_region_leaves_partial_and_safe_regions_untouched() {
     // Status-line app reserving the last row (bottom < pty_rows): untouched.
-    assert_eq!(host_scroll_region_sequence(b"\x1b[1;23r", 24, 50), b"\x1b[1;23r");
+    assert_eq!(
+        host_scroll_region_sequence(b"\x1b[1;23r", 24, 50),
+        b"\x1b[1;23r"
+    );
     // Bare reset already means full screen on the host.
     assert_eq!(host_scroll_region_sequence(b"\x1b[r", 24, 50), b"\x1b[r");
     // Host not taller than the PTY (or sizes unknown): never rewrite.
-    assert_eq!(host_scroll_region_sequence(b"\x1b[1;24r", 24, 24), b"\x1b[1;24r");
-    assert_eq!(host_scroll_region_sequence(b"\x1b[1;24r", 0, 50), b"\x1b[1;24r");
+    assert_eq!(
+        host_scroll_region_sequence(b"\x1b[1;24r", 24, 24),
+        b"\x1b[1;24r"
+    );
+    assert_eq!(
+        host_scroll_region_sequence(b"\x1b[1;24r", 0, 50),
+        b"\x1b[1;24r"
+    );
     // DEC private \x1b[?...r (XTRESTORE) is not a DECSTBM and is untouched.
     assert!(!is_set_scroll_region_sequence(b"\x1b[?1049r"));
 }
@@ -1295,10 +1654,7 @@ fn pairing_control_keys_route_escape_and_ctrl_c_for_launcher() {
         Some(PairingControlAction::BackOneLevel)
     );
     assert_eq!(
-        pairing_control_action_for_key(KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL
-        )),
+        pairing_control_action_for_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
         Some(PairingControlAction::BackToTools)
     );
     assert_eq!(
@@ -1640,7 +1996,10 @@ fn strip_windows_verbatim_prefix_simplifies_disk_and_unc_paths() {
         r"\\server\share\proj"
     );
     // Already-clean Windows and POSIX paths are left untouched.
-    assert_eq!(strip_windows_verbatim_prefix(r"C:\relaycat"), r"C:\relaycat");
+    assert_eq!(
+        strip_windows_verbatim_prefix(r"C:\relaycat"),
+        r"C:\relaycat"
+    );
     assert_eq!(
         strip_windows_verbatim_prefix("/home/user/relaycat"),
         "/home/user/relaycat"
@@ -1688,10 +2047,19 @@ fn negotiate_capabilities_intersects_with_peer() {
         ],
     });
     assert_eq!(ack.selected_protocol_version, 2);
-    assert!(ack.capabilities.contains(&ProtocolCapabilityV2::Compression));
-    assert!(ack.capabilities.contains(&ProtocolCapabilityV2::TerminalState));
+    assert!(
+        ack.capabilities
+            .contains(&ProtocolCapabilityV2::Compression)
+    );
+    assert!(
+        ack.capabilities
+            .contains(&ProtocolCapabilityV2::TerminalState)
+    );
     // A capability the peer did not advertise is not negotiated.
-    assert!(!ack.capabilities.contains(&ProtocolCapabilityV2::CliMetadata));
+    assert!(
+        !ack.capabilities
+            .contains(&ProtocolCapabilityV2::CliMetadata)
+    );
 }
 
 #[test]
@@ -1704,6 +2072,28 @@ fn negotiate_capabilities_empty_peer_yields_no_compression() {
     });
     assert_eq!(ack.selected_protocol_version, TERMINAL_STATE_PROTOCOL_V2);
     assert!(ack.capabilities.is_empty());
+}
+
+#[test]
+fn incremental_attrs_capability_tracks_the_latest_app_hello() {
+    let negotiated = AtomicBool::new(false);
+    update_incremental_attrs_capability(
+        &negotiated,
+        &HelloV2 {
+            protocol_versions: vec![TERMINAL_STATE_PROTOCOL_V2],
+            capabilities: vec![ProtocolCapabilityV2::IncrementalAttrs],
+        },
+    );
+    assert!(negotiated.load(Ordering::Acquire));
+
+    update_incremental_attrs_capability(
+        &negotiated,
+        &HelloV2 {
+            protocol_versions: vec![TERMINAL_STATE_PROTOCOL_V2],
+            capabilities: Vec::new(),
+        },
+    );
+    assert!(!negotiated.load(Ordering::Acquire));
 }
 
 #[test]
@@ -2103,7 +2493,13 @@ fn wheel_rewrite_passes_sgr_through_and_reencodes_x10() {
     let x10 = rewrite_app_wheel_reports(input, WheelEncoding::X10);
     assert_eq!(
         x10.bytes,
-        [b"\x1b[M".as_slice(), &[32 + 64, 32 + 40, 32 + 12], b"\x1b[M", &[32 + 65, 32 + 40, 32 + 12]].concat()
+        [
+            b"\x1b[M".as_slice(),
+            &[32 + 64, 32 + 40, 32 + 12],
+            b"\x1b[M",
+            &[32 + 65, 32 + 40, 32 + 12]
+        ]
+        .concat()
     );
     assert_eq!(x10.reports, 2);
 

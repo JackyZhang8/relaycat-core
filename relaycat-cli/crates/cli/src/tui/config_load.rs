@@ -139,7 +139,10 @@ pub(crate) fn project_index_for_launch(choices: &[ProjectChoice], project: Optio
     }
 }
 
-pub(crate) fn selected_project<'a>(choices: &'a [ProjectChoice], state: &ListState) -> &'a ProjectChoice {
+pub(crate) fn selected_project<'a>(
+    choices: &'a [ProjectChoice],
+    state: &ListState,
+) -> &'a ProjectChoice {
     let index = state
         .selected()
         .unwrap_or(0)

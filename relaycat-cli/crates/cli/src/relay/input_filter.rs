@@ -218,4 +218,3 @@ pub(crate) fn csi_body_is_report_params(bytes: &[u8]) -> bool {
 pub(crate) fn csi_body_starts_with_any(bytes: &[u8], prefixes: &[u8]) -> bool {
     prefixes.iter().any(|prefix| bytes.first() == Some(prefix))
 }
-

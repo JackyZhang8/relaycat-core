@@ -175,7 +175,10 @@ fn run_update_command_blocking(
         Err(err) if manifest_url == DEFAULT_CLI_MANIFEST_URL => {
             println!(
                 "{} {}",
-                language.t("Primary manifest unreachable, trying:", "主升级清单不可达，改用："),
+                language.t(
+                    "Primary manifest unreachable, trying:",
+                    "主升级清单不可达，改用："
+                ),
                 FALLBACK_CLI_MANIFEST_URL
             );
             fetch_url_to_string(FALLBACK_CLI_MANIFEST_URL).map_err(|_| err)?

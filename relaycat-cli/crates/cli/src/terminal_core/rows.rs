@@ -110,74 +110,27 @@ pub(crate) fn changed_rows(
         .collect()
 }
 
-/// Probe the actual cell width of the currently visible row 0. vt100 stores
-/// each scrollback row at its original width; `Row::get(col)` returns `None`
-/// for columns beyond that width. Starting from `min_cols`, we probe
-/// successive columns until `cell()` returns `None`.
-pub(crate) fn scrollback_row_actual_cols(screen: &vt100::Screen, min_cols: u16) -> u16 {
-    let mut cols = min_cols;
-    while cols < u16::MAX && screen.cell(0, cols).is_some() {
-        cols = cols.saturating_add(1);
-    }
-    cols
-}
-
-/// Like [`read_recent_scrollback`] but reads each row at the wider of
-/// `min_cols` and the row's own stored width. This prevents truncation when
-/// the terminal was recently narrowed but the scrollback still holds wider
-/// rows from before the resize.
-pub(crate) fn read_recent_scrollback_faithful(
-    screen: &mut vt100::Screen,
-    count: usize,
-    min_cols: u16,
-    line_id_counter: &mut u64,
+pub(crate) fn row_from_vt_scrollback(
+    row: &vt100::ScrollbackRow,
+    line_id: u64,
     attrs: &mut Vec<CellAttr>,
     attr_index: &mut HashMap<CellAttr, u32>,
-) -> Vec<TerminalRow> {
-    let take = count.min(screen.scrollback());
-    let mut rows = Vec::with_capacity(take);
-    for offset in (1..=take).rev() {
-        screen.set_scrollback(offset);
-        let row_cols = scrollback_row_actual_cols(screen, min_cols);
-        rows.push(row_from_vt_screen(
-            screen,
-            0,
-            row_cols,
-            next_line_id(line_id_counter),
-            attrs,
-            attr_index,
-        ));
+) -> TerminalRow {
+    let mut cells = Vec::with_capacity(usize::from(row.cols()));
+    for col in 0..row.cols() {
+        let Some(cell) = row.cell(col) else {
+            cells.push((0, blank_cell()));
+            continue;
+        };
+        let attr_id = attr_id_for(attrs, attr_index, cell_attr_from_vt_cell(cell));
+        cells.push((attr_id, terminal_cell_from_vt_cell(cell)));
     }
-    rows
-}
 
-/// Read the most-recent `count` rows from the vt100 parser's own scrollback,
-/// oldest first, assigning each a fresh `line_id`. `screen` must already have
-/// its scrollback offset set to the maximum so `scrollback()` reports the total
-/// length. The newest scrolled-off row is at offset 1, the next at offset 2,
-/// and so on, so the requested tail is offsets `count..=1`.
-pub(crate) fn read_recent_scrollback(
-    screen: &mut vt100::Screen,
-    count: usize,
-    cols: u16,
-    line_id_counter: &mut u64,
-    attrs: &mut Vec<CellAttr>,
-    attr_index: &mut HashMap<CellAttr, u32>,
-) -> Vec<TerminalRow> {
-    let take = count.min(screen.scrollback());
-    let mut rows = Vec::with_capacity(take);
-    for offset in (1..=take).rev() {
-        screen.set_scrollback(offset);
-        rows.push(row_from_vt_screen(
-            screen,
-            0,
-            cols,
-            next_line_id(line_id_counter),
-            attrs,
-            attr_index,
-        ));
+    TerminalRow {
+        line_id,
+        wrapped: row.wrapped(),
+        cells: compress_cells(cells),
     }
-    rows
 }
 
 pub(crate) fn row_from_vt_screen(

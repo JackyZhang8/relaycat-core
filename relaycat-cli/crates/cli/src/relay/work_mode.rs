@@ -103,4 +103,3 @@ impl PtyWorkMode {
 pub(crate) fn pty_work_mode_observe_app_resize(mode: &mut PtyWorkMode, size: (u16, u16)) -> bool {
     mode.observe_remote_size(size)
 }
-

@@ -50,8 +50,66 @@ pub enum MouseProtocolEncoding {
     // Urxvt,
 }
 
-/// Represents the overall terminal state.
+/// A read-only row that scrolled off the top of the primary grid.
 #[derive(Clone, Debug)]
+pub struct ScrollbackRow {
+    cols: u16,
+    cells: Vec<(u16, crate::Cell)>,
+    wrapped: bool,
+}
+
+impl ScrollbackRow {
+    pub(crate) fn from_row(row: &crate::row::Row) -> Self {
+        Self {
+            cols: row.cols(),
+            cells: (0..row.cols())
+                .zip(row.cells_slice())
+                .filter(|(_, cell)| !cell.is_default_blank())
+                .map(|(col, cell)| (col, cell.clone()))
+                .collect(),
+            wrapped: row.wrapped(),
+        }
+    }
+
+    /// Returns the original number of columns in the row.
+    #[must_use]
+    pub fn cols(&self) -> u16 {
+        self.cols
+    }
+
+    /// Returns the [`Cell`](crate::Cell) stored at the given column.
+    ///
+    /// Default blank cells are omitted from this sparse row and return `None`,
+    /// even when the column is less than [`cols`](Self::cols).
+    #[must_use]
+    pub fn cell(&self, col: u16) -> Option<&crate::Cell> {
+        self.cells
+            .binary_search_by_key(&col, |(cell_col, _)| *cell_col)
+            .ok()
+            .map(|index| &self.cells[index].1)
+    }
+
+    /// Returns whether the row should wrap to the following row.
+    #[must_use]
+    pub fn wrapped(&self) -> bool {
+        self.wrapped
+    }
+}
+
+/// A transient update to rows scrolled off the primary grid.
+#[derive(Clone, Debug, Default)]
+pub struct ScrollbackUpdate {
+    /// Whether a terminal reset cleared the previous scrollback state.
+    pub cleared: bool,
+    /// Rows scrolled off the primary grid since the previous update was taken.
+    pub rows: Vec<ScrollbackRow>,
+}
+
+/// Represents the overall terminal state.
+///
+/// Cloning a screen copies its terminal state and scrollback-capture setting,
+/// but intentionally does not copy pending transient scrollback updates.
+#[derive(Debug)]
 pub struct Screen {
     grid: crate::grid::Grid,
     alternate_grid: crate::grid::Grid,
@@ -62,13 +120,26 @@ pub struct Screen {
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
+    scrollback_cleared: bool,
+}
+
+impl Clone for Screen {
+    fn clone(&self) -> Self {
+        Self {
+            grid: self.grid.clone(),
+            alternate_grid: self.alternate_grid.clone(),
+            attrs: self.attrs,
+            saved_attrs: self.saved_attrs,
+            modes: self.modes,
+            mouse_protocol_mode: self.mouse_protocol_mode,
+            mouse_protocol_encoding: self.mouse_protocol_encoding,
+            scrollback_cleared: false,
+        }
+    }
 }
 
 impl Screen {
-    pub(crate) fn new(
-        size: crate::grid::Size,
-        scrollback_len: usize,
-    ) -> Self {
+    pub(crate) fn new(size: crate::grid::Size, scrollback_len: usize) -> Self {
         let mut grid = crate::grid::Grid::new(size, scrollback_len);
         grid.allocate_rows();
         Self {
@@ -81,6 +152,7 @@ impl Screen {
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
             mouse_protocol_encoding: MouseProtocolEncoding::default(),
+            scrollback_cleared: false,
         }
     }
 
@@ -123,6 +195,48 @@ impl Screen {
         self.grid().scrollback()
     }
 
+    /// Returns the maximum number of rows retained by the primary scrollback.
+    #[must_use]
+    pub fn scrollback_len(&self) -> usize {
+        self.grid.scrollback_len()
+    }
+
+    /// Changes the primary scrollback row limit and immediately trims older
+    /// rows when the new limit is smaller.
+    pub fn set_scrollback_len(&mut self, rows: usize) {
+        self.grid.set_scrollback_len(rows);
+    }
+
+    /// Enables or disables transient primary-screen scrollback updates.
+    ///
+    /// Updates are disabled by default. Disabling them discards any update
+    /// waiting to be returned by [`take_scrollback_update`](Self::take_scrollback_update).
+    /// While enabled, callers should drain updates regularly so pending rows do
+    /// not accumulate without bound.
+    pub fn set_scrollback_updates_enabled(&mut self, enabled: bool) {
+        self.grid.set_scrollback_updates_enabled(enabled);
+        if !enabled {
+            self.scrollback_cleared = false;
+        }
+    }
+
+    /// Returns whether transient primary-screen scrollback updates are enabled.
+    #[must_use]
+    pub fn scrollback_updates_enabled(&self) -> bool {
+        self.grid.scrollback_updates_enabled()
+    }
+
+    /// Takes rows scrolled off the primary grid since the previous call.
+    ///
+    /// A terminal reset discards any rows staged before the reset and sets
+    /// [`ScrollbackUpdate::cleared`] in the next returned update.
+    pub fn take_scrollback_update(&mut self) -> ScrollbackUpdate {
+        ScrollbackUpdate {
+            cleared: std::mem::take(&mut self.scrollback_cleared),
+            rows: self.grid.take_scrollback_rows(),
+        }
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain
@@ -145,11 +259,7 @@ impl Screen {
     /// text format.
     ///
     /// Newlines will not be included.
-    pub fn rows(
-        &self,
-        start: u16,
-        width: u16,
-    ) -> impl Iterator<Item = String> + '_ {
+    pub fn rows(&self, start: u16, width: u16) -> impl Iterator<Item = String> + '_ {
         self.grid().visible_rows().map(move |row| {
             let mut contents = String::new();
             row.write_contents(&mut contents, start, width, false);
@@ -183,12 +293,7 @@ impl Screen {
                     .take(usize::from(end_row) - usize::from(start_row) + 1)
                 {
                     if i == usize::from(start_row) {
-                        row.write_contents(
-                            &mut contents,
-                            start_col,
-                            cols - start_col,
-                            false,
-                        );
+                        row.write_contents(&mut contents, start_col, cols - start_col, false);
                         if !row.wrapped() {
                             contents.push('\n');
                         }
@@ -270,26 +375,14 @@ impl Screen {
     /// unspecified.
     // the unwraps in this method shouldn't be reachable
     #[allow(clippy::missing_panics_doc)]
-    pub fn rows_formatted(
-        &self,
-        start: u16,
-        width: u16,
-    ) -> impl Iterator<Item = Vec<u8>> + '_ {
+    pub fn rows_formatted(&self, start: u16, width: u16) -> impl Iterator<Item = Vec<u8>> + '_ {
         let mut wrapping = false;
         self.grid().visible_rows().enumerate().map(move |(i, row)| {
             // number of rows in a grid is stored in a u16 (see Size), so
             // visible_rows can never return enough rows to overflow here
             let i = i.try_into().unwrap();
             let mut contents = vec![];
-            row.write_contents_formatted(
-                &mut contents,
-                start,
-                width,
-                i,
-                wrapping,
-                None,
-                None,
-            );
+            row.write_contents_formatted(&mut contents, start, width, i, wrapping, None, None);
             if start == 0 && width == self.grid.size().cols {
                 wrapping = row.wrapped();
             }
@@ -316,14 +409,11 @@ impl Screen {
 
     fn write_contents_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
         if self.hide_cursor() != prev.hide_cursor() {
-            crate::term::HideCursor::new(self.hide_cursor())
-                .write_buf(contents);
+            crate::term::HideCursor::new(self.hide_cursor()).write_buf(contents);
         }
-        let prev_attrs = self.grid().write_contents_diff(
-            contents,
-            prev.grid(),
-            prev.attrs,
-        );
+        let prev_attrs = self
+            .grid()
+            .write_contents_diff(contents, prev.grid(), prev.attrs);
         self.attrs.write_escape_code_diff(contents, &prev_attrs);
     }
 
@@ -383,21 +473,11 @@ impl Screen {
     }
 
     fn write_input_mode_formatted(&self, contents: &mut Vec<u8>) {
-        crate::term::ApplicationKeypad::new(
-            self.mode(MODE_APPLICATION_KEYPAD),
-        )
-        .write_buf(contents);
-        crate::term::ApplicationCursor::new(
-            self.mode(MODE_APPLICATION_CURSOR),
-        )
-        .write_buf(contents);
-        crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE))
+        crate::term::ApplicationKeypad::new(self.mode(MODE_APPLICATION_KEYPAD)).write_buf(contents);
+        crate::term::ApplicationCursor::new(self.mode(MODE_APPLICATION_CURSOR)).write_buf(contents);
+        crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE)).write_buf(contents);
+        crate::term::MouseProtocolMode::new(self.mouse_protocol_mode, MouseProtocolMode::None)
             .write_buf(contents);
-        crate::term::MouseProtocolMode::new(
-            self.mouse_protocol_mode,
-            MouseProtocolMode::None,
-        )
-        .write_buf(contents);
         crate::term::MouseProtocolEncoding::new(
             self.mouse_protocol_encoding,
             MouseProtocolEncoding::Default,
@@ -416,32 +496,19 @@ impl Screen {
     }
 
     fn write_input_mode_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
-        if self.mode(MODE_APPLICATION_KEYPAD)
-            != prev.mode(MODE_APPLICATION_KEYPAD)
-        {
-            crate::term::ApplicationKeypad::new(
-                self.mode(MODE_APPLICATION_KEYPAD),
-            )
-            .write_buf(contents);
-        }
-        if self.mode(MODE_APPLICATION_CURSOR)
-            != prev.mode(MODE_APPLICATION_CURSOR)
-        {
-            crate::term::ApplicationCursor::new(
-                self.mode(MODE_APPLICATION_CURSOR),
-            )
-            .write_buf(contents);
-        }
-        if self.mode(MODE_BRACKETED_PASTE) != prev.mode(MODE_BRACKETED_PASTE)
-        {
-            crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE))
+        if self.mode(MODE_APPLICATION_KEYPAD) != prev.mode(MODE_APPLICATION_KEYPAD) {
+            crate::term::ApplicationKeypad::new(self.mode(MODE_APPLICATION_KEYPAD))
                 .write_buf(contents);
         }
-        crate::term::MouseProtocolMode::new(
-            self.mouse_protocol_mode,
-            prev.mouse_protocol_mode,
-        )
-        .write_buf(contents);
+        if self.mode(MODE_APPLICATION_CURSOR) != prev.mode(MODE_APPLICATION_CURSOR) {
+            crate::term::ApplicationCursor::new(self.mode(MODE_APPLICATION_CURSOR))
+                .write_buf(contents);
+        }
+        if self.mode(MODE_BRACKETED_PASTE) != prev.mode(MODE_BRACKETED_PASTE) {
+            crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE)).write_buf(contents);
+        }
+        crate::term::MouseProtocolMode::new(self.mouse_protocol_mode, prev.mouse_protocol_mode)
+            .write_buf(contents);
         crate::term::MouseProtocolEncoding::new(
             self.mouse_protocol_encoding,
             prev.mouse_protocol_encoding,
@@ -476,10 +543,8 @@ impl Screen {
 
     fn write_attributes_formatted(&self, contents: &mut Vec<u8>) {
         crate::term::ClearAttrs.write_buf(contents);
-        self.attrs.write_escape_code_diff(
-            contents,
-            &crate::attrs::Attrs::default(),
-        );
+        self.attrs
+            .write_escape_code_diff(contents, &crate::attrs::Attrs::default());
     }
 
     /// Returns the current cursor position of the terminal.
@@ -996,7 +1061,11 @@ impl Screen {
 
     // ESC c
     pub(crate) fn ris(&mut self) {
+        let scrollback_updates_enabled = self.grid.scrollback_updates_enabled();
         *self = Self::new(self.grid.size(), self.grid.scrollback_len());
+        self.grid
+            .set_scrollback_updates_enabled(scrollback_updates_enabled);
+        self.scrollback_cleared = scrollback_updates_enabled;
     }
 
     // csi codes
@@ -1052,11 +1121,7 @@ impl Screen {
     }
 
     // CSI J
-    pub(crate) fn ed(
-        &mut self,
-        mode: u16,
-        mut unhandled: impl FnMut(&mut Self),
-    ) {
+    pub(crate) fn ed(&mut self, mode: u16, mut unhandled: impl FnMut(&mut Self)) {
         let attrs = self.attrs;
         match mode {
             0 => self.grid_mut().erase_all_forward(attrs),
@@ -1067,20 +1132,12 @@ impl Screen {
     }
 
     // CSI ? J
-    pub(crate) fn decsed(
-        &mut self,
-        mode: u16,
-        unhandled: impl FnMut(&mut Self),
-    ) {
+    pub(crate) fn decsed(&mut self, mode: u16, unhandled: impl FnMut(&mut Self)) {
         self.ed(mode, unhandled);
     }
 
     // CSI K
-    pub(crate) fn el(
-        &mut self,
-        mode: u16,
-        mut unhandled: impl FnMut(&mut Self),
-    ) {
+    pub(crate) fn el(&mut self, mode: u16, mut unhandled: impl FnMut(&mut Self)) {
         let attrs = self.attrs;
         match mode {
             0 => self.grid_mut().erase_row_forward(attrs),
@@ -1091,11 +1148,7 @@ impl Screen {
     }
 
     // CSI ? K
-    pub(crate) fn decsel(
-        &mut self,
-        mode: u16,
-        unhandled: impl FnMut(&mut Self),
-    ) {
+    pub(crate) fn decsel(&mut self, mode: u16, unhandled: impl FnMut(&mut Self)) {
         self.el(mode, unhandled);
     }
 
@@ -1136,11 +1189,7 @@ impl Screen {
     }
 
     // CSI ? h
-    pub(crate) fn decset(
-        &mut self,
-        params: &vte::Params,
-        mut unhandled: impl FnMut(&mut Self),
-    ) {
+    pub(crate) fn decset(&mut self, params: &vte::Params, mut unhandled: impl FnMut(&mut Self)) {
         for param in params {
             match param {
                 [1] => self.set_mode(MODE_APPLICATION_CURSOR),
@@ -1173,11 +1222,7 @@ impl Screen {
     }
 
     // CSI ? l
-    pub(crate) fn decrst(
-        &mut self,
-        params: &vte::Params,
-        mut unhandled: impl FnMut(&mut Self),
-    ) {
+    pub(crate) fn decrst(&mut self, params: &vte::Params, mut unhandled: impl FnMut(&mut Self)) {
         for param in params {
             match param {
                 [1] => self.clear_mode(MODE_APPLICATION_CURSOR),
@@ -1213,11 +1258,7 @@ impl Screen {
     }
 
     // CSI m
-    pub(crate) fn sgr(
-        &mut self,
-        params: &vte::Params,
-        mut unhandled: impl FnMut(&mut Self),
-    ) {
+    pub(crate) fn sgr(&mut self, params: &vte::Params, mut unhandled: impl FnMut(&mut Self)) {
         // XXX really i want to just be able to pass in a default Params
         // instance with a 0 in it, but vte doesn't allow creating new Params
         // instances
@@ -1273,8 +1314,7 @@ impl Screen {
                     self.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 30);
                 }
                 [38, 2, r, g, b] => {
-                    self.attrs.fgcolor =
-                        crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
+                    self.attrs.fgcolor = crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
                 }
                 [38, 5, i] => {
                     self.attrs.fgcolor = crate::Color::Idx(to_u8!(*i));
@@ -1287,8 +1327,7 @@ impl Screen {
                         self.attrs.fgcolor = crate::Color::Rgb(r, g, b);
                     }
                     [5] => {
-                        self.attrs.fgcolor =
-                            crate::Color::Idx(next_param_u8!());
+                        self.attrs.fgcolor = crate::Color::Idx(next_param_u8!());
                     }
                     _ => {
                         unhandled(self);
@@ -1302,8 +1341,7 @@ impl Screen {
                     self.attrs.bgcolor = crate::Color::Idx(to_u8!(*n) - 40);
                 }
                 [48, 2, r, g, b] => {
-                    self.attrs.bgcolor =
-                        crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
+                    self.attrs.bgcolor = crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
                 }
                 [48, 5, i] => {
                     self.attrs.bgcolor = crate::Color::Idx(to_u8!(*i));
@@ -1316,8 +1354,7 @@ impl Screen {
                         self.attrs.bgcolor = crate::Color::Rgb(r, g, b);
                     }
                     [5] => {
-                        self.attrs.bgcolor =
-                            crate::Color::Idx(next_param_u8!());
+                        self.attrs.bgcolor = crate::Color::Idx(next_param_u8!());
                     }
                     _ => {
                         unhandled(self);
@@ -1350,5 +1387,300 @@ fn u16_to_u8(i: u16) -> Option<u8> {
     } else {
         // safe because we just ensured that the value fits in a u8
         Some(i.try_into().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn row_text(row: &crate::ScrollbackRow) -> String {
+        let mut text = String::new();
+        for col in 0..row.cols() {
+            if let Some(cell) = row.cell(col) {
+                text.push_str(cell.contents());
+            }
+        }
+        text.trim_end().to_string()
+    }
+
+    #[test]
+    fn scrollback_updates_are_disabled_by_default() {
+        let mut parser = crate::Parser::new(2, 12, 2);
+        parser.process(b"line-0\r\nline-1\r\nline-2");
+
+        assert!(!parser.screen().scrollback_updates_enabled());
+        let update = parser.screen_mut().take_scrollback_update();
+        assert!(!update.cleared);
+        assert!(update.rows.is_empty());
+    }
+
+    #[test]
+    fn disabling_scrollback_updates_discards_pending_rows() {
+        let mut parser = crate::Parser::new(2, 12, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+        parser.process(b"old-0\r\nold-1\r\nold-2");
+
+        parser.screen_mut().set_scrollback_updates_enabled(false);
+        parser.process(b"old-3\r\nold-4");
+
+        let update = parser.screen_mut().take_scrollback_update();
+        assert!(!update.cleared);
+        assert!(update.rows.is_empty());
+    }
+
+    #[test]
+    fn disabling_scrollback_updates_discards_pending_reset_marker() {
+        let mut parser = crate::Parser::new(2, 12, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+        parser.process(b"\x1bc");
+
+        parser.screen_mut().set_scrollback_updates_enabled(false);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+
+        let update = parser.screen_mut().take_scrollback_update();
+        assert!(!update.cleared);
+        assert!(update.rows.is_empty());
+    }
+
+    #[test]
+    fn drains_every_enabled_row_after_one_process_call_wraps_the_ring() {
+        let mut parser = crate::Parser::new(2, 12, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+
+        parser.process(
+            b"line-0\r\nline-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5\r\nline-6\r\nline-7\r\n",
+        );
+        let update = parser.screen_mut().take_scrollback_update();
+
+        assert!(!update.cleared);
+        assert_eq!(
+            update.rows.iter().map(row_text).collect::<Vec<_>>(),
+            (0..7)
+                .map(|index| format!("line-{index}"))
+                .collect::<Vec<_>>()
+        );
+
+        let drained = parser.screen_mut().take_scrollback_update();
+        assert!(!drained.cleared);
+        assert!(drained.rows.is_empty());
+    }
+
+    #[test]
+    fn captures_top_anchored_scroll_region_rows_without_native_scrollback() {
+        let mut parser = crate::Parser::new(3, 4, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+
+        parser.process(b"\x1b[1;2r\x1b[1;1Ha\x1b[2;1Hb\r\nc");
+        let update = parser.screen_mut().take_scrollback_update();
+
+        assert!(!update.cleared);
+        assert_eq!(update.rows.iter().map(row_text).collect::<Vec<_>>(), ["a"]);
+        parser.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn captures_rows_deleted_from_top_of_primary_scroll_region() {
+        let mut parser = crate::Parser::new(3, 4, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+
+        parser.process(b"\x1b[1;2r\x1b[1;1Ha\x1b[2;1Hb\x1b[1;1H\x1b[M");
+        let update = parser.screen_mut().take_scrollback_update();
+
+        assert!(!update.cleared);
+        assert_eq!(update.rows.iter().map(row_text).collect::<Vec<_>>(), ["a"]);
+    }
+
+    #[test]
+    fn full_screen_delete_line_does_not_create_scrollback_update() {
+        let mut parser = crate::Parser::new(3, 4, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+
+        parser.process(b"\x1b[1;1Ha\x1b[2;1Hb\x1b[3;1Hc\x1b[1;1H\x1b[M");
+        let update = parser.screen_mut().take_scrollback_update();
+
+        assert!(!update.cleared);
+        assert!(update.rows.is_empty());
+    }
+
+    #[test]
+    fn partial_region_scroll_count_is_clamped_to_region_height() {
+        let mut parser = crate::Parser::new(3, 4, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+
+        parser.process(b"\x1b[1;2r\x1b[1;1Ha\x1b[2;1Hb\x1b[3S");
+        let update = parser.screen_mut().take_scrollback_update();
+
+        assert_eq!(
+            update.rows.iter().map(row_text).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn partial_region_delete_count_is_clamped_to_region_height() {
+        let mut parser = crate::Parser::new(3, 4, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+
+        parser.process(b"\x1b[1;2r\x1b[1;1Ha\x1b[2;1Hb\x1b[1;1H\x1b[3M");
+        let update = parser.screen_mut().take_scrollback_update();
+
+        assert_eq!(
+            update.rows.iter().map(row_text).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn delete_line_outside_scroll_region_is_ignored() {
+        let mut parser = crate::Parser::new(4, 4, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+
+        parser.process(b"\x1b[1;1Ha\x1b[2;3r\x1b[1;1H\x1b[M");
+        let update = parser.screen_mut().take_scrollback_update();
+
+        assert!(update.rows.is_empty());
+        assert_eq!(
+            parser.screen().cell(0, 0).map(crate::Cell::contents),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn alternate_screen_output_does_not_enter_primary_scrollback_updates() {
+        let mut parser = crate::Parser::new(2, 8, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+
+        parser.process(b"p0\r\np1\r\n\x1b[?1049ha0\r\na1\r\n\x1b[?1049l");
+        let update = parser.screen_mut().take_scrollback_update();
+
+        assert!(!update.cleared);
+        assert_eq!(update.rows.iter().map(row_text).collect::<Vec<_>>(), ["p0"]);
+    }
+
+    #[test]
+    fn reset_in_alternate_screen_discards_pending_primary_rows() {
+        let mut parser = crate::Parser::new(2, 8, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+
+        parser.process(b"p0\r\np1\r\n\x1b[?1049h\x1bc");
+        let update = parser.screen_mut().take_scrollback_update();
+
+        assert!(update.cleared);
+        assert!(update.rows.is_empty());
+    }
+
+    #[test]
+    fn compact_scrollback_row_omits_trailing_default_blank_cells() {
+        let mut parser = crate::Parser::new(2, 4096, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+        parser.process(b"\r\n\r\n");
+
+        let update = parser.screen_mut().take_scrollback_update();
+
+        assert_eq!(update.rows.len(), 1);
+        assert_eq!(update.rows[0].cols(), 4096);
+        assert!(update.rows[0].cell(0).is_none());
+        assert!(update.rows[0].cells.is_empty());
+    }
+
+    #[test]
+    fn compact_scrollback_row_keeps_trailing_styled_blank_cells() {
+        let mut parser = crate::Parser::new(2, 8, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+        parser.process(b"\x1b[41m\x1b[8G\x1b[X\x1b[m\r\n\r\n");
+
+        let update = parser.screen_mut().take_scrollback_update();
+
+        assert_eq!(update.rows.len(), 1);
+        assert_eq!(update.rows[0].cols(), 8);
+        assert_eq!(
+            update.rows[0].cell(7).map(crate::Cell::bgcolor),
+            Some(crate::Color::Idx(1))
+        );
+        assert_eq!(update.rows[0].cells.len(), 1);
+    }
+
+    #[test]
+    fn sparse_scrollback_row_omits_default_blank_gaps() {
+        let mut parser = crate::Parser::new(2, 8, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+        parser.process(b"x\x1b[41m\x1b[8G\x1b[X\x1b[m\r\n\r\n");
+
+        let update = parser.screen_mut().take_scrollback_update();
+        let row = &update.rows[0];
+
+        assert_eq!(row.cols(), 8);
+        assert_eq!(row.cell(0).map(crate::Cell::contents), Some("x"));
+        assert!(row.cell(1).is_none());
+        assert_eq!(
+            row.cell(7).map(crate::Cell::bgcolor),
+            Some(crate::Color::Idx(1))
+        );
+        assert_eq!(row.cells.len(), 2);
+    }
+
+    #[test]
+    fn cloned_screen_preserves_capture_configuration_without_pending_rows() {
+        let mut parser = crate::Parser::new(2, 12, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+        parser.process(b"line-0\r\nline-1\r\nline-2");
+
+        let mut cloned = parser.screen().clone();
+
+        assert!(cloned.scrollback_updates_enabled());
+        let cloned_update = cloned.take_scrollback_update();
+        assert!(!cloned_update.cleared);
+        assert!(cloned_update.rows.is_empty());
+        assert_eq!(
+            parser
+                .screen_mut()
+                .take_scrollback_update()
+                .rows
+                .iter()
+                .map(row_text)
+                .collect::<Vec<_>>(),
+            ["line-0"]
+        );
+    }
+
+    #[test]
+    fn cloned_screen_does_not_replay_a_pending_reset_marker() {
+        let mut parser = crate::Parser::new(2, 12, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+        parser.process(b"\x1bc");
+
+        let mut cloned = parser.screen().clone();
+
+        assert!(!cloned.take_scrollback_update().cleared);
+        assert!(parser.screen_mut().take_scrollback_update().cleared);
+    }
+
+    #[test]
+    fn reset_preserves_enabled_capture_and_discards_pre_reset_rows() {
+        let mut parser = crate::Parser::new(2, 12, 2);
+        parser.screen_mut().set_scrollback_updates_enabled(true);
+        parser.process(b"old-0\r\nold-1\r\nold-2\r\n\x1bcnew-0\r\nnew-1\r\nnew-2");
+
+        assert!(parser.screen().scrollback_updates_enabled());
+        let update = parser.screen_mut().take_scrollback_update();
+        assert!(update.cleared);
+        assert_eq!(
+            update.rows.iter().map(row_text).collect::<Vec<_>>(),
+            ["new-0"]
+        );
+
+        let drained = parser.screen_mut().take_scrollback_update();
+        assert!(!drained.cleared);
+        assert!(drained.rows.is_empty());
+    }
+
+    #[test]
+    fn reset_does_not_mark_disabled_updates_as_cleared() {
+        let mut parser = crate::Parser::new(2, 12, 2);
+        parser.process(b"old-0\r\nold-1\r\nold-2\r\n\x1bc");
+
+        let update = parser.screen_mut().take_scrollback_update();
+        assert!(!update.cleared);
+        assert!(update.rows.is_empty());
     }
 }

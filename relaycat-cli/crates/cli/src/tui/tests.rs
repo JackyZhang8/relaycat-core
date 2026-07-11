@@ -71,24 +71,18 @@ fn project_choices_lists_favorites_then_recents() {
     // The favorite appears (starred) before the recent projects.
     let fav_pos = choices
         .iter()
-        .position(
-            |c| matches!(&c.kind, ProjectChoiceKind::Path(p) if p == Path::new("/work/fav")),
-        )
+        .position(|c| matches!(&c.kind, ProjectChoiceKind::Path(p) if p == Path::new("/work/fav")))
         .unwrap();
     let beta_pos = choices
         .iter()
-        .position(
-            |c| matches!(&c.kind, ProjectChoiceKind::Path(p) if p == Path::new("/work/beta")),
-        )
+        .position(|c| matches!(&c.kind, ProjectChoiceKind::Path(p) if p == Path::new("/work/beta")))
         .unwrap();
     assert!(fav_pos < beta_pos);
     assert!(choices[fav_pos].label.starts_with('★'));
     // /work/alpha appears once even though it has two records.
     let alpha = choices
         .iter()
-        .filter(
-            |c| matches!(&c.kind, ProjectChoiceKind::Path(p) if p == Path::new("/work/alpha")),
-        )
+        .filter(|c| matches!(&c.kind, ProjectChoiceKind::Path(p) if p == Path::new("/work/alpha")))
         .count();
     assert_eq!(alpha, 1);
 }
@@ -176,8 +170,7 @@ fn pairing_controls_choose_next_launcher_screen() {
 #[test]
 fn launcher_relay_error_prompt_points_to_escape_edit() {
     assert!(
-        relay_error_prompt_for_language(CliLanguage::ZhHans)
-            .contains("按 Esc 返回修改 relay 地址")
+        relay_error_prompt_for_language(CliLanguage::ZhHans).contains("按 Esc 返回修改 relay 地址")
     );
     assert!(
         relay_error_prompt_for_language(CliLanguage::En)

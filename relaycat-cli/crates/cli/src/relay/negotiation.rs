@@ -38,4 +38,3 @@ pub(crate) fn hello_ack_for(hello: &HelloV2) -> HelloAckV2 {
         capabilities: negotiate_capabilities(&hello.capabilities),
     }
 }
-

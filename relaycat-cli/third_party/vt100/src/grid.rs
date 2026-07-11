@@ -1,6 +1,6 @@
 use crate::term::BufWrite as _;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Grid {
     size: Size,
     pos: Pos,
@@ -11,8 +11,30 @@ pub struct Grid {
     origin_mode: bool,
     saved_origin_mode: bool,
     scrollback: std::collections::VecDeque<crate::row::Row>,
+    pending_scrollback_rows: Vec<crate::screen::ScrollbackRow>,
+    scrollback_updates_enabled: bool,
     scrollback_len: usize,
     scrollback_offset: usize,
+}
+
+impl Clone for Grid {
+    fn clone(&self) -> Self {
+        Self {
+            size: self.size,
+            pos: self.pos,
+            saved_pos: self.saved_pos,
+            rows: self.rows.clone(),
+            scroll_top: self.scroll_top,
+            scroll_bottom: self.scroll_bottom,
+            origin_mode: self.origin_mode,
+            saved_origin_mode: self.saved_origin_mode,
+            scrollback: self.scrollback.clone(),
+            pending_scrollback_rows: vec![],
+            scrollback_updates_enabled: self.scrollback_updates_enabled,
+            scrollback_len: self.scrollback_len,
+            scrollback_offset: self.scrollback_offset,
+        }
+    }
 }
 
 impl Grid {
@@ -27,6 +49,8 @@ impl Grid {
             origin_mode: false,
             saved_origin_mode: false,
             scrollback: std::collections::VecDeque::new(),
+            pending_scrollback_rows: vec![],
+            scrollback_updates_enabled: false,
             scrollback_len,
             scrollback_offset: 0,
         }
@@ -35,10 +59,8 @@ impl Grid {
     pub fn allocate_rows(&mut self) {
         if self.rows.is_empty() {
             self.rows.extend(
-                std::iter::repeat_with(|| {
-                    crate::row::Row::new(self.size.cols)
-                })
-                .take(usize::from(self.size.rows)),
+                std::iter::repeat_with(|| crate::row::Row::new(self.size.cols))
+                    .take(usize::from(self.size.rows)),
             );
         }
     }
@@ -76,6 +98,9 @@ impl Grid {
 
         self.size = size;
         for row in &mut self.rows {
+            row.resize(size.cols, crate::Cell::new());
+        }
+        for row in &mut self.scrollback {
             row.resize(size.cols, crate::Cell::new());
         }
         self.rows.resize(usize::from(size.rows), self.new_row());
@@ -147,9 +172,7 @@ impl Grid {
         self.rows.iter()
     }
 
-    pub fn drawing_rows_mut(
-        &mut self,
-    ) -> impl Iterator<Item = &mut crate::row::Row> {
+    pub fn drawing_rows_mut(&mut self) -> impl Iterator<Item = &mut crate::row::Row> {
         self.rows.iter_mut()
     }
 
@@ -161,10 +184,7 @@ impl Grid {
         self.drawing_rows().nth(usize::from(row))
     }
 
-    pub fn drawing_row_mut(
-        &mut self,
-        row: u16,
-    ) -> Option<&mut crate::row::Row> {
+    pub fn drawing_row_mut(&mut self, row: u16) -> Option<&mut crate::row::Row> {
         self.drawing_rows_mut().nth(usize::from(row))
     }
 
@@ -191,12 +211,42 @@ impl Grid {
         self.scrollback_len
     }
 
+    pub fn set_scrollback_len(&mut self, scrollback_len: usize) {
+        self.scrollback_len = scrollback_len;
+        while self.scrollback.len() > self.scrollback_len {
+            self.scrollback.pop_front();
+        }
+        self.scrollback_offset = self.scrollback_offset.min(self.scrollback.len());
+    }
+
     pub fn scrollback(&self) -> usize {
         self.scrollback_offset
     }
 
     pub fn set_scrollback(&mut self, rows: usize) {
         self.scrollback_offset = rows.min(self.scrollback.len());
+    }
+
+    pub(crate) fn take_scrollback_rows(&mut self) -> Vec<crate::screen::ScrollbackRow> {
+        std::mem::take(&mut self.pending_scrollback_rows)
+    }
+
+    pub(crate) fn set_scrollback_updates_enabled(&mut self, enabled: bool) {
+        self.scrollback_updates_enabled = enabled;
+        if !enabled {
+            self.pending_scrollback_rows = Vec::new();
+        }
+    }
+
+    pub(crate) fn scrollback_updates_enabled(&self) -> bool {
+        self.scrollback_updates_enabled
+    }
+
+    fn push_scrollback_update(&mut self, row: &crate::row::Row) {
+        if self.scrollback_updates_enabled {
+            self.pending_scrollback_rows
+                .push(crate::screen::ScrollbackRow::from_row(row));
+        }
     }
 
     pub fn write_contents(&self, contents: &mut String) {
@@ -214,10 +264,7 @@ impl Grid {
         }
     }
 
-    pub fn write_contents_formatted(
-        &self,
-        contents: &mut Vec<u8>,
-    ) -> crate::attrs::Attrs {
+    pub fn write_contents_formatted(&self, contents: &mut Vec<u8>) -> crate::attrs::Attrs {
         crate::term::ClearAttrs.write_buf(contents);
         crate::term::ClearScreen.write_buf(contents);
 
@@ -242,11 +289,7 @@ impl Grid {
             wrapping = row.wrapped();
         }
 
-        self.write_cursor_position_formatted(
-            contents,
-            Some(prev_pos),
-            Some(prev_attrs),
-        );
+        self.write_cursor_position_formatted(contents, Some(prev_pos), Some(prev_attrs));
 
         prev_attrs
     }
@@ -260,9 +303,7 @@ impl Grid {
         let mut prev_pos = prev.pos;
         let mut wrapping = false;
         let mut prev_wrapping = false;
-        for (i, (row, prev_row)) in
-            self.visible_rows().zip(prev.visible_rows()).enumerate()
-        {
+        for (i, (row, prev_row)) in self.visible_rows().zip(prev.visible_rows()).enumerate() {
             // we limit the number of cols to a u16 (see Size), so
             // visible_rows() can never return more rows than will fit
             let i = i.try_into().unwrap();
@@ -283,11 +324,7 @@ impl Grid {
             prev_wrapping = prev_row.wrapped();
         }
 
-        self.write_cursor_position_formatted(
-            contents,
-            Some(prev_pos),
-            Some(prev_attrs),
-        );
+        self.write_cursor_position_formatted(contents, Some(prev_pos), Some(prev_attrs));
 
         prev_attrs
     }
@@ -328,8 +365,7 @@ impl Grid {
                 self.drawing_cell(pos).unwrap();
             if cell.has_contents() {
                 if let Some(prev_pos) = prev_pos {
-                    crate::term::MoveFromTo::new(prev_pos, pos)
-                        .write_buf(contents);
+                    crate::term::MoveFromTo::new(prev_pos, pos).write_buf(contents);
                 } else {
                     crate::term::MoveTo::new(pos).write_buf(contents);
                 }
@@ -372,37 +408,19 @@ impl Grid {
                         .unwrap();
                     if cell.has_contents() {
                         if let Some(prev_pos) = prev_pos {
-                            if prev_pos.row != i
-                                || prev_pos.col < self.size.cols
-                            {
-                                crate::term::MoveFromTo::new(prev_pos, pos)
-                                    .write_buf(contents);
-                                cell.attrs().write_escape_code_diff(
-                                    contents,
-                                    &prev_attrs,
-                                );
+                            if prev_pos.row != i || prev_pos.col < self.size.cols {
+                                crate::term::MoveFromTo::new(prev_pos, pos).write_buf(contents);
+                                cell.attrs().write_escape_code_diff(contents, &prev_attrs);
                                 contents.extend(cell.contents().as_bytes());
-                                prev_attrs.write_escape_code_diff(
-                                    contents,
-                                    cell.attrs(),
-                                );
+                                prev_attrs.write_escape_code_diff(contents, cell.attrs());
                             }
                         } else {
                             crate::term::MoveTo::new(pos).write_buf(contents);
-                            cell.attrs().write_escape_code_diff(
-                                contents,
-                                &prev_attrs,
-                            );
+                            cell.attrs().write_escape_code_diff(contents, &prev_attrs);
                             contents.extend(cell.contents().as_bytes());
-                            prev_attrs.write_escape_code_diff(
-                                contents,
-                                cell.attrs(),
-                            );
+                            prev_attrs.write_escape_code_diff(contents, cell.attrs());
                         }
-                        contents.extend(
-                            "\n".repeat(usize::from(self.pos.row - i))
-                                .as_bytes(),
-                        );
+                        contents.extend("\n".repeat(usize::from(self.pos.row - i)).as_bytes());
                         found = true;
                         break;
                     }
@@ -420,8 +438,7 @@ impl Grid {
                         col: self.size.cols - 1,
                     };
                     if let Some(prev_pos) = prev_pos {
-                        crate::term::MoveFromTo::new(prev_pos, pos)
-                            .write_buf(contents);
+                        crate::term::MoveFromTo::new(prev_pos, pos).write_buf(contents);
                     } else {
                         crate::term::MoveTo::new(pos).write_buf(contents);
                     }
@@ -440,13 +457,11 @@ impl Grid {
                     crate::term::Backspace.write_buf(contents);
                     crate::term::EraseChar::new(1).write_buf(contents);
                     crate::term::RestoreCursor.write_buf(contents);
-                    prev_attrs
-                        .write_escape_code_diff(contents, end_cell.attrs());
+                    prev_attrs.write_escape_code_diff(contents, end_cell.attrs());
                 }
             }
         } else if let Some(prev_pos) = prev_pos {
-            crate::term::MoveFromTo::new(prev_pos, self.pos)
-                .write_buf(contents);
+            crate::term::MoveFromTo::new(prev_pos, self.pos).write_buf(contents);
         } else {
             crate::term::MoveTo::new(self.pos).write_buf(contents);
         }
@@ -551,26 +566,36 @@ impl Grid {
     }
 
     pub fn delete_lines(&mut self, count: u16) {
-        for _ in 0..(count.min(self.size.rows - self.pos.row)) {
+        if !self.in_scroll_region() {
+            return;
+        }
+        let region_rows = self.scroll_bottom - self.pos.row + 1;
+        for _ in 0..count.min(region_rows) {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
-            self.rows.remove(usize::from(self.pos.row));
+            let removed = self.rows.remove(usize::from(self.pos.row));
+            if self.scroll_region_active() && self.scroll_top == 0 && self.pos.row == 0 {
+                self.push_scrollback_update(&removed);
+            }
         }
     }
 
     pub fn scroll_up(&mut self, count: u16) {
-        for _ in 0..(count.min(self.size.rows - self.scroll_top)) {
+        let region_rows = self.scroll_bottom - self.scroll_top + 1;
+        for _ in 0..count.min(region_rows) {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             let removed = self.rows.remove(usize::from(self.scroll_top));
+            if self.scroll_top == 0 {
+                self.push_scrollback_update(&removed);
+            }
             if self.scrollback_len > 0 && !self.scroll_region_active() {
                 self.scrollback.push_back(removed);
                 while self.scrollback.len() > self.scrollback_len {
                     self.scrollback.pop_front();
                 }
                 if self.scrollback_offset > 0 {
-                    self.scrollback_offset =
-                        self.scrollback.len().min(self.scrollback_offset + 1);
+                    self.scrollback_offset = self.scrollback.len().min(self.scrollback_offset + 1);
                 }
             }
         }
@@ -739,4 +764,28 @@ pub struct Size {
 pub struct Pos {
     pub row: u16,
     pub col: u16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrollback_limit_trims_immediately_and_resize_updates_retained_width() {
+        let mut grid = Grid::new(
+            Size {
+                rows: 2,
+                cols: 4_096,
+            },
+            4,
+        );
+        grid.scrollback
+            .extend((0..4).map(|_| crate::row::Row::new(4_096)));
+
+        grid.set_scrollback_len(2);
+        grid.set_size(Size { rows: 2, cols: 80 });
+
+        assert_eq!(grid.scrollback.len(), 2);
+        assert!(grid.scrollback.iter().all(|row| row.cols() == 80));
+    }
 }

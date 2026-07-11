@@ -1,13 +1,17 @@
 use relaycat_protocol::{
     CellAttr, CellRun, CliMetadata, CliStatus, CursorState, CursorStyle, Direction, HelloAckV2,
-    HelloV2, InputAckV2, InputDecision, InputDedupe, InputEventV2, OuterFrame, PaletteState,
-    PatchOp, PatchRejectReason, PlainMsg, ProtocolCapabilityV2, RenderAckV2, RequestSnapshotV2,
-    RequestTranscriptV2, ResizeAckV2, ResizeEventV2, ResumeV2, Role, SnapshotRequestReason,
-    TerminalCell, TerminalColor, TerminalModes, TerminalPatchV2, TerminalRow, TerminalSnapshotV2,
-    TerminalTranscriptEntryKind, TerminalTranscriptEntryV2, TranscriptChunkV2, decode_frame,
-    decode_plain_msg, encode_frame, encode_plain_msg, plain_msg_encoded_len, plain_msg_type,
-    plain_msg_types, terminal_patch_v2_encoded_len, terminal_snapshot_v2_encoded_len,
+    HelloV2, InputAckV2, InputDecision, InputDedupe, InputEventV2, MAX_OUTER_FRAME_BYTES,
+    OuterFrame, PaletteState, PatchOp, PatchRejectReason, PlainMsg, ProtocolCapabilityV2,
+    RenderAckV2, RequestSnapshotV2, RequestTranscriptV2, ResizeAckV2, ResizeEventV2, ResumeV2,
+    Role, SnapshotRequestReason, TerminalCell, TerminalColor, TerminalModes, TerminalPatchV2,
+    TerminalRow, TerminalSnapshotV2, TerminalTranscriptEntryKind, TerminalTranscriptEntryV2,
+    TerminalTranscriptFrameFragmentV2, TranscriptChunkV2, decode_frame, decode_plain_msg,
+    encode_frame, encode_plain_msg, outer_data_frame_encoded_len, plain_msg_encoded_len,
+    plain_msg_type, plain_msg_types, terminal_patch_v2_encoded_len, terminal_row_v2_encoded_len,
+    terminal_snapshot_v2_encoded_len, terminal_transcript_entry_v2_encoded_len,
+    terminal_transcript_entry_v2_parts_encoded_len, transcript_chunk_v2_parts_encoded_len,
 };
+use serde::Serialize as _;
 
 #[test]
 fn outer_data_frame_round_trips_through_messagepack() {
@@ -23,6 +27,86 @@ fn outer_data_frame_round_trips_through_messagepack() {
     let decoded = decode_frame(&encoded).expect("decode frame");
 
     assert_eq!(decoded, frame);
+}
+
+#[test]
+fn outer_data_frame_encodes_ciphertext_as_messagepack_binary() {
+    let ciphertext = vec![0xa5; 300];
+    let frame = OuterFrame::Data {
+        room_id: "room-1".to_string(),
+        direction: Direction::CliToApp,
+        seq: 42,
+        nonce: [7; 12],
+        ciphertext,
+    };
+
+    let encoded = encode_frame(&frame).expect("encode frame");
+
+    assert!(
+        encoded
+            .windows(5)
+            .any(|window| window == [0xc5, 0x01, 0x2c, 0xa5, 0xa5]),
+        "ciphertext should use MessagePack bin16"
+    );
+}
+
+#[test]
+fn decode_frame_accepts_legacy_ciphertext_integer_array() {
+    let frame = OuterFrame::Data {
+        room_id: "room-1".to_string(),
+        direction: Direction::CliToApp,
+        seq: 42,
+        nonce: [7; 12],
+        ciphertext: vec![0, 127, 128, 255],
+    };
+    let legacy = rmp_serde::to_vec_named(&frame).expect("encode legacy frame");
+
+    assert_eq!(decode_frame(&legacy).expect("decode legacy frame"), frame);
+}
+
+#[test]
+fn relay_sized_ciphertext_outer_frame_stays_below_one_mib() {
+    let frame = OuterFrame::Data {
+        room_id: "r".repeat(256),
+        direction: Direction::CliToApp,
+        seq: u64::MAX,
+        nonce: [0xff; 12],
+        ciphertext: vec![0xff; 960 * 1024 + 16],
+    };
+
+    let encoded = encode_frame(&frame).expect("encode near-limit frame");
+
+    assert!(
+        encoded.len() <= MAX_OUTER_FRAME_BYTES,
+        "encoded frame was {} bytes",
+        encoded.len()
+    );
+}
+
+#[test]
+fn outer_data_frame_encoded_len_matches_full_encoding() {
+    for ciphertext_len in [0, 1, 255, 256, 65_535, 65_536, 960 * 1024 + 16] {
+        let frame = OuterFrame::Data {
+            room_id: "r".repeat(256),
+            direction: Direction::CliToApp,
+            seq: u64::MAX,
+            nonce: [0xff; 12],
+            ciphertext: vec![0x80; ciphertext_len],
+        };
+        let encoded = encode_frame(&frame).expect("encode frame");
+
+        assert_eq!(
+            outer_data_frame_encoded_len(
+                &"r".repeat(256),
+                Direction::CliToApp,
+                u64::MAX,
+                [0xff; 12],
+                ciphertext_len,
+            ),
+            encoded.len(),
+            "ciphertext_len={ciphertext_len}"
+        );
+    }
 }
 
 #[test]
@@ -371,6 +455,25 @@ fn v2_control_messages_round_trip() {
 }
 
 #[test]
+fn input_event_bytes_encode_as_messagepack_binary() {
+    let msg = PlainMsg::InputEventV2(InputEventV2 {
+        input_stream_id: "stream-1".to_string(),
+        input_seq: 9,
+        bytes: vec![0xa5; 300],
+    });
+
+    let encoded = encode_plain_msg(&msg).expect("encode input event");
+
+    assert!(
+        encoded
+            .windows(5)
+            .any(|window| window == [0xc5, 0x01, 0x2c, 0xa5, 0xa5]),
+        "input bytes should use MessagePack bin16"
+    );
+    assert_eq!(decode_plain_msg(&encoded).expect("decode input event"), msg);
+}
+
+#[test]
 fn transcript_v2_messages_round_trip() {
     let request = PlainMsg::RequestTranscriptV2(RequestTranscriptV2 {
         terminal_run_id: "run-1".to_string(),
@@ -398,6 +501,7 @@ fn transcript_v2_messages_round_trip() {
                 }],
             }],
             captured_at_unix_ms: 1234,
+            frame_fragment: None,
         }],
         attrs: vec![CellAttr::default()],
         has_more: false,
@@ -409,6 +513,219 @@ fn transcript_v2_messages_round_trip() {
             msg
         );
     }
+}
+
+#[test]
+fn legacy_transcript_entry_deserializer_ignores_frame_fragment_map() {
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyPlainMsg {
+        TranscriptChunkV2(LegacyTranscriptChunkV2),
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct LegacyTranscriptChunkV2 {
+        terminal_run_id: String,
+        before_entry_id: Option<u64>,
+        entries: Vec<LegacyTerminalTranscriptEntryV2>,
+        attrs: Vec<CellAttr>,
+        has_more: bool,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct LegacyTerminalTranscriptEntryV2 {
+        entry_id: u64,
+        terminal_run_id: String,
+        state_seq: u64,
+        kind: TerminalTranscriptEntryKind,
+        cols: u16,
+        rows: Vec<TerminalRow>,
+        captured_at_unix_ms: u64,
+    }
+
+    let row = TerminalRow {
+        line_id: 7,
+        wrapped: false,
+        cells: vec![CellRun {
+            attr_id: 0,
+            cells: vec![TerminalCell {
+                text: "fragment".to_string(),
+                width: 1,
+            }],
+        }],
+    };
+    let msg = PlainMsg::TranscriptChunkV2(TranscriptChunkV2 {
+        terminal_run_id: "run-fragmented".to_string(),
+        before_entry_id: Some(43),
+        entries: vec![TerminalTranscriptEntryV2 {
+            entry_id: 42,
+            terminal_run_id: "run-fragmented".to_string(),
+            state_seq: 9,
+            kind: TerminalTranscriptEntryKind::AltScreenFrame,
+            cols: 80,
+            rows: vec![row.clone()],
+            captured_at_unix_ms: 1234,
+            frame_fragment: Some(TerminalTranscriptFrameFragmentV2 {
+                frame_id: 41,
+                fragment_index: 1,
+                fragment_count: 3,
+            }),
+        }],
+        attrs: vec![CellAttr::default()],
+        has_more: true,
+    });
+
+    let wire = encode_plain_msg(&msg).expect("encode fragmented transcript");
+    let LegacyPlainMsg::TranscriptChunkV2(chunk) =
+        rmp_serde::from_slice(&wire).expect("legacy decoder should ignore frame_fragment");
+
+    assert_eq!(chunk.terminal_run_id, "run-fragmented");
+    assert_eq!(chunk.before_entry_id, Some(43));
+    assert_eq!(chunk.attrs, vec![CellAttr::default()]);
+    assert!(chunk.has_more);
+    assert_eq!(chunk.entries.len(), 1);
+    let entry = &chunk.entries[0];
+    assert_eq!(entry.entry_id, 42);
+    assert_eq!(entry.terminal_run_id, "run-fragmented");
+    assert_eq!(entry.state_seq, 9);
+    assert_eq!(entry.kind, TerminalTranscriptEntryKind::AltScreenFrame);
+    assert_eq!(entry.cols, 80);
+    assert_eq!(entry.rows, vec![row]);
+    assert_eq!(entry.captured_at_unix_ms, 1234);
+}
+
+#[test]
+fn transcript_entry_encoded_len_matches_wire_serializer() {
+    let entry = TerminalTranscriptEntryV2 {
+        entry_id: 41,
+        terminal_run_id: "run-1".to_string(),
+        state_seq: 9,
+        kind: TerminalTranscriptEntryKind::AltScreenFrame,
+        cols: 4,
+        rows: vec![TerminalRow {
+            line_id: 1,
+            wrapped: false,
+            cells: vec![CellRun {
+                attr_id: 0,
+                cells: vec![TerminalCell {
+                    text: "A".to_string(),
+                    width: 1,
+                }],
+            }],
+        }],
+        captured_at_unix_ms: 1234,
+        frame_fragment: None,
+    };
+    let mut encoded = Vec::new();
+    let mut serializer = rmp_serde::Serializer::new(&mut encoded)
+        .with_struct_map()
+        .with_bytes(rmp_serde::config::BytesMode::ForceIterables);
+    entry.serialize(&mut serializer).expect("encode entry");
+
+    assert_eq!(
+        terminal_transcript_entry_v2_encoded_len(&entry),
+        encoded.len()
+    );
+
+    let attrs = vec![CellAttr::default()];
+    let chunk = TranscriptChunkV2 {
+        terminal_run_id: "run-1".to_string(),
+        before_entry_id: Some(u64::MAX),
+        entries: vec![entry.clone()],
+        attrs: attrs.clone(),
+        has_more: true,
+    };
+    assert_eq!(
+        transcript_chunk_v2_parts_encoded_len(
+            &chunk.terminal_run_id,
+            chunk.before_entry_id,
+            &chunk.entries,
+            &attrs,
+            chunk.has_more,
+        ),
+        encode_plain_msg(&PlainMsg::TranscriptChunkV2(chunk))
+            .expect("encode chunk")
+            .len()
+    );
+}
+
+#[test]
+fn transcript_frame_fragment_metadata_round_trips_and_sizes_exactly() {
+    let frame_fragment = TerminalTranscriptFrameFragmentV2 {
+        frame_id: 41,
+        fragment_index: 1,
+        fragment_count: 3,
+    };
+    let row = TerminalRow {
+        line_id: 7,
+        wrapped: false,
+        cells: vec![CellRun {
+            attr_id: 0,
+            cells: vec![TerminalCell {
+                text: "fragment".to_string(),
+                width: 1,
+            }],
+        }],
+    };
+    let entry = TerminalTranscriptEntryV2 {
+        entry_id: 42,
+        terminal_run_id: "run-fragmented".to_string(),
+        state_seq: 9,
+        kind: TerminalTranscriptEntryKind::AltScreenFrame,
+        cols: 80,
+        rows: vec![row.clone()],
+        captured_at_unix_ms: 1234,
+        frame_fragment: Some(frame_fragment.clone()),
+    };
+    let msg = PlainMsg::TranscriptChunkV2(TranscriptChunkV2 {
+        terminal_run_id: "run-fragmented".to_string(),
+        before_entry_id: None,
+        entries: vec![entry.clone()],
+        attrs: vec![CellAttr::default()],
+        has_more: false,
+    });
+
+    assert_eq!(
+        decode_plain_msg(&encode_plain_msg(&msg).expect("encode fragmented transcript"))
+            .expect("decode fragmented transcript"),
+        msg
+    );
+    assert_eq!(
+        terminal_transcript_entry_v2_parts_encoded_len(
+            entry.entry_id,
+            &entry.terminal_run_id,
+            entry.state_seq,
+            entry.kind,
+            entry.cols,
+            &entry.rows,
+            entry.captured_at_unix_ms,
+            entry.frame_fragment.as_ref(),
+        ),
+        terminal_transcript_entry_v2_encoded_len(&entry)
+    );
+    assert_eq!(
+        terminal_row_v2_encoded_len(&row),
+        terminal_transcript_entry_v2_parts_encoded_len(
+            entry.entry_id,
+            &entry.terminal_run_id,
+            entry.state_seq,
+            entry.kind,
+            entry.cols,
+            std::slice::from_ref(&row),
+            entry.captured_at_unix_ms,
+            Some(&frame_fragment),
+        ) - terminal_transcript_entry_v2_parts_encoded_len(
+            entry.entry_id,
+            &entry.terminal_run_id,
+            entry.state_seq,
+            entry.kind,
+            entry.cols,
+            &[],
+            entry.captured_at_unix_ms,
+            Some(&frame_fragment),
+        ),
+        "one-row entry delta should equal the encoded row because both arrays use fixarray headers"
+    );
 }
 
 #[test]

@@ -9,21 +9,10 @@ impl TerminalCore {
         // grown since the last emission; an empty table means "reuse". When the
         // peer negotiated incremental attrs, send just the appended tail keyed
         // by its base index instead of the whole (only-growing) table.
-        let (attrs, attrs_base_len) = if self.attrs.len() > self.emitted_attrs_len {
-            let base = self.emitted_attrs_len;
-            let emitted = if self.incremental_attrs_enabled() {
-                (
-                    self.attrs[base..].to_vec(),
-                    Some(u32::try_from(base).expect("attr table base index overflow")),
-                )
-            } else {
-                (self.attrs.clone(), None)
-            };
+        let (attrs, attrs_base_len) = self.attrs_for_next_patch();
+        if self.attrs.len() > self.emitted_attrs_len {
             self.emitted_attrs_len = self.attrs.len();
-            emitted
-        } else {
-            (Vec::new(), None)
-        };
+        }
 
         let patch = TerminalPatchV2 {
             terminal_run_id: self.terminal_run_id.clone(),
@@ -36,6 +25,151 @@ impl TerminalCore {
         };
         self.retain_patch(patch.clone());
         patch
+    }
+
+    fn attrs_for_next_patch(&self) -> (Vec<CellAttr>, Option<u32>) {
+        if self.attrs.len() > self.emitted_attrs_len {
+            let base = self.emitted_attrs_len;
+            if self.incremental_attrs_enabled() {
+                (
+                    self.attrs[base..].to_vec(),
+                    Some(u32::try_from(base).expect("attr table base index overflow")),
+                )
+            } else {
+                (self.attrs.clone(), None)
+            }
+        } else {
+            (Vec::new(), None)
+        }
+    }
+
+    fn preview_patch(&self, ops: Vec<PatchOp>) -> TerminalPatchV2 {
+        let next_seq = self.state_seq.saturating_add(1);
+        let (attrs, attrs_base_len) = self.attrs_for_next_patch();
+        TerminalPatchV2 {
+            terminal_run_id: self.terminal_run_id.clone(),
+            base_snapshot_id: self.active_snapshot_id,
+            from_state_seq: next_seq,
+            to_state_seq: next_seq,
+            attrs,
+            attrs_base_len,
+            ops,
+        }
+    }
+
+    fn patch_ops_fit_budget(&self, ops: Vec<PatchOp>) -> bool {
+        terminal_patch_v2_encoded_len(&self.preview_patch(ops))
+            <= TERMINAL_RELAY_SAFE_PLAIN_MSG_BYTES
+    }
+
+    fn max_scrollback_prefix_that_fits(&self, rows: &[TerminalRow]) -> usize {
+        let mut low = 1usize;
+        let mut high = rows.len();
+        let mut best = 0usize;
+        while low <= high {
+            let middle = low + (high - low) / 2;
+            let ops = vec![PatchOp::AppendScrollback {
+                rows: rows[..middle].to_vec(),
+            }];
+            if self.patch_ops_fit_budget(ops) {
+                best = middle;
+                low = middle.saturating_add(1);
+            } else {
+                high = middle.saturating_sub(1);
+            }
+        }
+        best
+    }
+
+    fn max_op_prefix_that_fits(&self, ops: &[PatchOp]) -> usize {
+        let mut low = 1usize;
+        let mut high = ops.len();
+        let mut best = 0usize;
+        while low <= high {
+            let middle = low + (high - low) / 2;
+            if self.patch_ops_fit_budget(ops[..middle].to_vec()) {
+                best = middle;
+                low = middle.saturating_add(1);
+            } else {
+                high = middle.saturating_sub(1);
+            }
+        }
+        best
+    }
+
+    fn emit_budgeted_ops(
+        &mut self,
+        ops: Vec<PatchOp>,
+    ) -> Result<Vec<TerminalPatchV2>, TerminalWireError> {
+        let mut patches = Vec::new();
+        let mut offset = 0usize;
+        while offset < ops.len() {
+            let prefix_len = self.max_op_prefix_that_fits(&ops[offset..]);
+            if prefix_len == 0
+                && self.attrs.len() > self.emitted_attrs_len
+                && self.patch_ops_fit_budget(Vec::new())
+            {
+                patches.push(self.emit_patch(Vec::new()));
+                continue;
+            }
+            if prefix_len == 0 {
+                return Err(TerminalWireError::new(
+                    "single terminal patch operation exceeds relay budget",
+                ));
+            }
+            patches.push(self.emit_patch(ops[offset..offset + prefix_len].to_vec()));
+            offset += prefix_len;
+        }
+        Ok(patches)
+    }
+
+    fn emit_sync_patches(
+        &mut self,
+        appended: Vec<TerminalRow>,
+        tail_ops: Vec<PatchOp>,
+    ) -> Result<Vec<TerminalPatchV2>, TerminalWireError> {
+        if appended.is_empty() {
+            return self.emit_budgeted_ops(tail_ops);
+        }
+
+        let mut patches = Vec::new();
+        let mut offset = 0usize;
+        let mut tail_emitted = false;
+        while offset < appended.len() {
+            let remaining = &appended[offset..];
+            let mut combined_ops = vec![PatchOp::AppendScrollback {
+                rows: remaining.to_vec(),
+            }];
+            combined_ops.extend(tail_ops.iter().cloned());
+            if self.patch_ops_fit_budget(combined_ops.clone()) {
+                patches.push(self.emit_patch(combined_ops));
+                tail_emitted = true;
+                break;
+            }
+
+            let prefix_len = self.max_scrollback_prefix_that_fits(remaining);
+            if prefix_len == 0
+                && self.attrs.len() > self.emitted_attrs_len
+                && self.patch_ops_fit_budget(Vec::new())
+            {
+                patches.push(self.emit_patch(Vec::new()));
+                continue;
+            }
+            if prefix_len == 0 {
+                return Err(TerminalWireError::new(
+                    "single terminal scrollback row exceeds relay budget",
+                ));
+            }
+            patches.push(self.emit_patch(vec![PatchOp::AppendScrollback {
+                rows: remaining[..prefix_len].to_vec(),
+            }]));
+            offset += prefix_len;
+        }
+
+        if !tail_emitted && !tail_ops.is_empty() {
+            patches.extend(self.emit_budgeted_ops(tail_ops)?);
+        }
+        Ok(patches)
     }
 
     pub(crate) fn apply_op(&mut self, op: &PatchOp) {
@@ -71,90 +205,22 @@ impl TerminalCore {
                 for row in rows {
                     self.history.push_back(row.clone());
                 }
-                while self.history.len() > TERMINAL_HISTORY_MAX_ROWS {
-                    self.history.pop_front();
-                }
+                self.trim_history();
             }
             PatchOp::Bell => {}
         }
     }
 
-    pub(crate) fn observe_scroll_region_controls(&mut self, bytes: &[u8]) -> Option<TrackedScrollRegion> {
-        let mut saw_region_control = false;
-        let mut region_for_history = None;
-        let mut index = 0;
-        while index < bytes.len() {
-            let remaining = &bytes[index..];
-            if !remaining.starts_with(b"\x1b[") {
-                index += 1;
-                continue;
-            }
-            let Some(body_final_offset) = remaining[2..]
-                .iter()
-                .position(|byte| (0x40..=0x7e).contains(byte))
-            else {
-                break;
-            };
-            let final_offset = body_final_offset + 2;
-            let sequence = &remaining[..=final_offset];
-            if sequence.last() == Some(&b'r') {
-                saw_region_control = true;
-                self.scroll_region_history = tracked_scroll_region_from_csi_r(sequence, self.rows);
-                if self.scroll_region_history.is_some() {
-                    region_for_history = self.scroll_region_history;
-                }
-            }
-            index += final_offset + 1;
-        }
-
-        if saw_region_control {
-            region_for_history
-        } else {
-            self.scroll_region_history
-        }
-    }
-
-    pub(crate) fn stage_top_anchored_scroll_region_history(
-        &mut self,
-        previous: &PreviousTerminalState,
-        region: Option<TrackedScrollRegion>,
-    ) {
-        if self.history_frozen
-            || self.modes.alt_screen
-            || !self.pending_scrollback_append.is_empty()
-        {
-            return;
-        }
-        let Some(region) = region else {
-            return;
-        };
-        if region.top != 0 || region.bottom >= self.rows {
-            return;
-        }
-        let shifted_out =
-            top_anchored_scroll_region_shifted_out_rows(previous, &self.screen_rows, region);
-        if shifted_out.is_empty() {
-            return;
-        }
-
-        let appended: Vec<TerminalRow> = shifted_out
-            .into_iter()
-            .map(|mut row| {
-                row.line_id = next_line_id(&mut self.next_line_id);
-                row
-            })
-            .collect();
-        self.history.extend(appended.iter().cloned());
-        self.trim_history();
-        self.pending_scrollback_append = appended;
-    }
-
-    pub(crate) fn sync_from_vt_screen(
-        &mut self,
-        scroll_region_for_history: Option<TrackedScrollRegion>,
-    ) -> Option<TerminalPatchV2> {
+    pub(crate) fn sync_from_vt_screen(&mut self) -> Result<TerminalFeedBatch, TerminalWireError> {
         let previous = self.sync_vt_screen_state();
-        self.stage_top_anchored_scroll_region_history(&previous, scroll_region_for_history);
+        let reset_messages = if previous.scrollback_cleared {
+            // The snapshot is the semantic RIS boundary. It deliberately has
+            // no scrollback: every row captured after RIS is streamed below as
+            // a retained patch from this newly committed snapshot base.
+            self.snapshot_messages_with_scrollback(true, Vec::new())?
+        } else {
+            Vec::new()
+        };
         let next_state_seq = self.state_seq.saturating_add(1);
 
         let mut ops = Vec::with_capacity(usize::from(self.rows) + 7);
@@ -167,47 +233,50 @@ impl TerminalCore {
                 &self.terminal_run_id,
                 self.cols,
             );
-            ops.push(PatchOp::AppendScrollback { rows: appended });
         }
-        for (row, line) in changed_rows(&previous.rows, &self.screen_rows) {
-            let Ok(row) = u16::try_from(row) else {
-                break;
-            };
-            ops.push(PatchOp::ReplaceRow { row, line });
-        }
-        if self.cursor != previous.cursor {
-            ops.push(PatchOp::SetCursor(self.cursor.clone()));
-        }
-        if self.title != previous.title {
-            ops.push(PatchOp::SetTitle(self.title.clone()));
-        }
-        if self.modes.alt_screen != previous.modes.alt_screen {
-            ops.push(PatchOp::SwitchAltScreen(self.modes.alt_screen));
-        }
-        if self.modes.bracketed_paste != previous.modes.bracketed_paste {
-            ops.push(PatchOp::SetMode {
-                mode: TerminalMode::BracketedPaste,
-                enabled: self.modes.bracketed_paste,
-            });
-        }
-        if self.modes.application_cursor != previous.modes.application_cursor {
-            ops.push(PatchOp::SetMode {
-                mode: TerminalMode::ApplicationCursor,
-                enabled: self.modes.application_cursor,
-            });
+        if !previous.scrollback_cleared {
+            for (row, line) in changed_rows(&previous.rows, &self.screen_rows) {
+                let Ok(row) = u16::try_from(row) else {
+                    break;
+                };
+                ops.push(PatchOp::ReplaceRow { row, line });
+            }
+            if self.cursor != previous.cursor {
+                ops.push(PatchOp::SetCursor(self.cursor.clone()));
+            }
+            if self.title != previous.title {
+                ops.push(PatchOp::SetTitle(self.title.clone()));
+            }
+            if self.modes.alt_screen != previous.modes.alt_screen {
+                ops.push(PatchOp::SwitchAltScreen(self.modes.alt_screen));
+            }
+            if self.modes.bracketed_paste != previous.modes.bracketed_paste {
+                ops.push(PatchOp::SetMode {
+                    mode: TerminalMode::BracketedPaste,
+                    enabled: self.modes.bracketed_paste,
+                });
+            }
+            if self.modes.application_cursor != previous.modes.application_cursor {
+                ops.push(PatchOp::SetMode {
+                    mode: TerminalMode::ApplicationCursor,
+                    enabled: self.modes.application_cursor,
+                });
+            }
         }
         if self.parser.callbacks().bell {
             ops.push(PatchOp::Bell);
             self.parser.callbacks_mut().bell = false;
         }
-        if ops.is_empty() {
-            return None;
-        }
+        let patches = if ops.is_empty() && appended.is_empty() {
+            Vec::new()
+        } else {
+            self.emit_sync_patches(appended, ops)?
+        };
         if self.modes.alt_screen {
             self.transcript_store.record_screen_frame(
                 TerminalTranscriptEntryKind::AltScreenFrame,
                 &self.screen_rows,
-                next_state_seq,
+                self.state_seq,
                 &self.terminal_run_id,
                 self.cols,
             );
@@ -215,7 +284,7 @@ impl TerminalCore {
             self.transcript_store.record_screen_frame(
                 TerminalTranscriptEntryKind::ScreenFrame,
                 &self.screen_rows,
-                next_state_seq,
+                self.state_seq,
                 &self.terminal_run_id,
                 self.cols,
             );
@@ -223,10 +292,14 @@ impl TerminalCore {
             self.transcript_store.clear_screen_frame_dedupe();
         }
 
-        Some(self.emit_patch(ops))
+        Ok(TerminalFeedBatch {
+            reset_messages,
+            patches,
+        })
     }
 
     pub(crate) fn sync_vt_screen_state(&mut self) -> PreviousTerminalState {
+        let scrollback_update = self.parser.screen_mut().take_scrollback_update();
         let mut screen = self.parser.screen().clone();
         screen.set_scrollback(0);
         let (rows, cols) = screen.size();
@@ -235,6 +308,7 @@ impl TerminalCore {
             cursor: self.cursor.clone(),
             title: self.title.clone(),
             modes: self.modes.clone(),
+            scrollback_cleared: scrollback_update.cleared,
         };
         self.rows = rows;
         self.cols = cols;
@@ -266,9 +340,10 @@ impl TerminalCore {
             }
         }
         self.screen_rows = rows;
-        self.sync_scrollback_history(&screen, &mut attrs, &mut attr_index);
+        self.sync_scrollback_history(scrollback_update, &mut attrs, &mut attr_index);
         self.attrs = attrs;
         self.attr_index = attr_index;
+        self.trim_history();
 
         previous
     }
@@ -276,83 +351,38 @@ impl TerminalCore {
     /// Fold the rows that newly scrolled off the top of the screen into the deep
     /// history and stage them for streaming via `PatchOp::AppendScrollback`.
     ///
-    /// The vt100 parser keeps its own faithful scrollback (sized to the deep
-    /// history): rows are appended at the bottom as the screen scrolls and are
-    /// never reflowed on resize. So the number of rows we have already consumed
-    /// (`scrollback_seen`) deterministically identifies the new tail — we just
-    /// read the most-recent `cur_len - scrollback_seen` scrollback rows. This
-    /// replaces the previous content-alignment heuristic, whose fallback could
-    /// mistake a TUI repaint for a whole fresh window and duplicate history.
+    /// vt100 supplies the exact rows that scrolled off the top of the primary
+    /// grid since the previous sync, including top-anchored scroll regions and
+    /// rows evicted from its bounded native scrollback ring.
     pub(crate) fn sync_scrollback_history(
         &mut self,
-        screen: &vt100::Screen,
+        update: vt100::ScrollbackUpdate,
         attrs: &mut Vec<CellAttr>,
         attr_index: &mut HashMap<CellAttr, u32>,
     ) {
-        self.pending_scrollback_append = Vec::new();
+        self.pending_scrollback_append.clear();
 
-        // While the alternate screen is active the main-screen scrollback is
-        // frozen; leave the consumed count untouched so nothing is duplicated
-        // when the alternate screen exits and the scrollback reappears.
-        if self.modes.alt_screen {
-            return;
+        if update.cleared {
+            self.history.clear();
         }
-
-        let mut scrollback = screen.clone();
-        scrollback.set_scrollback(usize::MAX);
-        let cur_len = scrollback.scrollback();
 
         // History is frozen while the app is disconnected and the PTY was
-        // resized: the running TUI repaints at the new width and that churn
-        // scrolls off here. Advance the consumed counter to the current length
-        // so the churn is discarded (never folded into `history` and never
-        // emitted as an append) — and so that, once thawed, only genuinely new
-        // rows are appended. This is the deterministic, content-agnostic way to
-        // drop the transient resize churn the user agreed to lose.
+        // resized. The update has already been drained, so discarding its rows
+        // prevents repaint churn from surfacing after history is thawed.
         if self.history_frozen {
-            self.scrollback_seen = cur_len;
             return;
         }
 
-        if cur_len < self.scrollback_seen {
-            // The scrollback shrank (e.g. it was explicitly cleared). Rebuild
-            // the deep history from the current faithful scrollback rather than
-            // streaming a spurious append; the app re-syncs from the next
-            // snapshot.
-            //
-            // Use `read_recent_scrollback_faithful` so each row is read at its
-            // original width — surviving rows may have been generated at a
-            // wider terminal size and would be silently truncated if we forced
-            // the current (possibly narrower) `self.cols`.
-            let rebuilt = read_recent_scrollback_faithful(
-                &mut scrollback,
-                cur_len,
-                self.cols,
-                &mut self.next_line_id,
-                attrs,
-                attr_index,
-            );
-            self.history.clear();
-            self.history.extend(rebuilt);
-            self.trim_history();
-            self.scrollback_seen = cur_len;
+        let appended = update
+            .rows
+            .iter()
+            .map(|row| {
+                row_from_vt_scrollback(row, next_line_id(&mut self.next_line_id), attrs, attr_index)
+            })
+            .collect::<Vec<_>>();
+        if appended.is_empty() {
             return;
         }
-
-        let appended_count = cur_len - self.scrollback_seen;
-        self.scrollback_seen = cur_len;
-        if appended_count == 0 {
-            return;
-        }
-
-        let appended = read_recent_scrollback(
-            &mut scrollback,
-            appended_count,
-            self.cols,
-            &mut self.next_line_id,
-            attrs,
-            attr_index,
-        );
         self.history.extend(appended.iter().cloned());
         self.trim_history();
         self.pending_scrollback_append = appended;

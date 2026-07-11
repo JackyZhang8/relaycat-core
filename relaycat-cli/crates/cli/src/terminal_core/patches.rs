@@ -1,32 +1,27 @@
 use super::*;
 
+/// Preserve the original single-patch convenience API for callers that do not
+/// transport its result. A parser drain emits new attributes only on its first
+/// fragment, so the batch can be represented as one semantic patch range.
+pub(crate) fn merge_patch_batch(patches: Vec<TerminalPatchV2>) -> Option<TerminalPatchV2> {
+    let mut patches = patches.into_iter();
+    let mut merged = patches.next()?;
+    for patch in patches {
+        debug_assert_eq!(patch.terminal_run_id, merged.terminal_run_id);
+        debug_assert_eq!(patch.base_snapshot_id, merged.base_snapshot_id);
+        debug_assert_eq!(patch.from_state_seq, merged.to_state_seq.saturating_add(1));
+        debug_assert!(patch.attrs.is_empty());
+        debug_assert!(patch.attrs_base_len.is_none());
+        merged.to_state_seq = patch.to_state_seq;
+        merged.ops.extend(patch.ops);
+    }
+    Some(merged)
+}
+
 pub(crate) fn patches_fit_relay_budget(patches: &[TerminalPatchV2]) -> bool {
     patches
         .iter()
-        .try_fold(0usize, |total, patch| {
-            let len = terminal_patch_v2_encoded_len(patch);
-            let next = total.checked_add(len)?;
-            (next <= TERMINAL_RELAY_SAFE_PLAIN_MSG_BYTES).then_some(next)
-        })
-        .is_some()
-}
-
-pub(crate) fn patches_fit_resume_scrollback_window(patches: &[TerminalPatchV2], rows: u16) -> bool {
-    let max_scrollback_rows = usize::from(rows)
-        .max(1)
-        .saturating_mul(TERMINAL_RESUME_PATCH_REPLAY_MAX_SCREENS);
-    patches
-        .iter()
-        .flat_map(|patch| patch.ops.iter())
-        .map(|op| match op {
-            PatchOp::AppendScrollback { rows } => rows.len(),
-            _ => 0,
-        })
-        .try_fold(0usize, |total, rows| {
-            let next = total.checked_add(rows)?;
-            (next <= max_scrollback_rows).then_some(next)
-        })
-        .is_some()
+        .all(|patch| terminal_patch_v2_encoded_len(patch) <= TERMINAL_RELAY_SAFE_PLAIN_MSG_BYTES)
 }
 
 pub(crate) fn coalesce_resume_patches(patches: Vec<TerminalPatchV2>) -> Vec<TerminalPatchV2> {
@@ -60,7 +55,10 @@ pub(crate) fn coalesce_resume_patches(patches: Vec<TerminalPatchV2>) -> Vec<Term
     merged
 }
 
-pub(crate) fn merged_resume_patch(left: &TerminalPatchV2, right: &TerminalPatchV2) -> Option<TerminalPatchV2> {
+pub(crate) fn merged_resume_patch(
+    left: &TerminalPatchV2,
+    right: &TerminalPatchV2,
+) -> Option<TerminalPatchV2> {
     if left.terminal_run_id != right.terminal_run_id
         || left.base_snapshot_id != right.base_snapshot_id
         || right.from_state_seq != left.to_state_seq.saturating_add(1)
