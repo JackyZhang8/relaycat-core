@@ -21,9 +21,9 @@ RelayCat Core 是本地 AI Coding Agent 的开源桌面控制层与加密中继�
 | --- | --- |
 | ![RelayCat GUI](screenshots/gui.png) | ![RelayCat TUI](screenshots/tui.png) |
 
-| 工作流程 | Mobile App |
+| RelayCat App · Claude Code | RelayCat App · Codex |
 | --- | --- |
-| ![RelayCat 工作流程](screenshots/flow.png) | ![RelayCat Mobile App](screenshots/app.jpg) |
+| <img src="screenshots/app-cc.jpg" width="320" alt="RelayCat App 控制 Claude Code"> | <img src="screenshots/app-codex.jpg" width="320" alt="RelayCat App 控制 Codex"> |
 
 ## RelayCat 能做什么？
 
@@ -163,6 +163,8 @@ relaycat codex --relay ws://192.168.1.12:8787
 E2EE 保护终端 payload，但 TLS 仍然重要：它可以进一步保护 WebSocket 握手、域名访问过程和传输元数据，并降低中间人干扰连接的风险。
 
 ## 工作原理
+
+![RelayCat 工作流程](screenshots/flow.jpg)
 
 ```text
 ┌──────────────────────────┐
