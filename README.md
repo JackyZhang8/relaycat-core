@@ -21,9 +21,9 @@ RelayCat Core 是本地 AI Coding Agent 的开源桌面控制层与加密中继�
 | --- | --- |
 | ![RelayCat GUI](screenshots/gui.png) | ![RelayCat TUI](screenshots/tui.png) |
 
-| RelayCat App · Claude Code | RelayCat App · Codex |
-| --- | --- |
-| <img src="screenshots/app-cc.jpg" width="320" alt="RelayCat App 控制 Claude Code"> | <img src="screenshots/app-codex.jpg" width="320" alt="RelayCat App 控制 Codex"> |
+| RelayCat App · Claude Code | RelayCat App · Codex（一） | RelayCat App · Codex（二） |
+| --- | --- | --- |
+| <img src="screenshots/app-cc.jpg" width="280" alt="RelayCat App 控制 Claude Code"> | <img src="screenshots/app-codex-1.jpg" width="280" alt="RelayCat App 控制 Codex"> | <img src="screenshots/app-codex-2.jpg" width="280" alt="RelayCat App 中的 Codex 会话"> |
 
 ## RelayCat 能做什么？
 
