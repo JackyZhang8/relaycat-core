@@ -639,7 +639,185 @@ async function createTab(tool: string, project: string, relay: string) {
     if (splitOn && tab.id === splitId) selectTab(tab.id);
   });
 
+  // xterm 6.0.0 still defers IME punctuation reported as keydown(229) to a
+  // zero-delay textarea read. Some desktop WebViews commit the punctuation
+  // after that timer, so the first key is held until the next keydown. Keep a
+  // baseline and flush the not-yet-sent textarea delta on keyup. This mirrors
+  // the upstream xterm fix for Chinese IME punctuation (not yet released).
+  let pending229Baseline: string | undefined;
+  let imeComposing = false;
+  let pending229FlushTimer: ReturnType<typeof setTimeout> | undefined;
+  let suppressNext229AfterComposition = false;
+  const modifierCodes = new Set([
+    "ShiftLeft",
+    "ShiftRight",
+    "ControlLeft",
+    "ControlRight",
+    "AltLeft",
+    "AltRight",
+    "MetaLeft",
+    "MetaRight",
+  ]);
+  const modifierKeysDown = new Set<string>();
+  type EarlyImeInput = {
+    data: string;
+    consumed: boolean;
+    awaitingKeydown: boolean;
+  };
+  const earlyImeInputs: EarlyImeInput[] = [];
+  let lastOnData:
+    | { data: string; textareaLength: number; at: number }
+    | undefined;
+  const trackModifier = (ev: KeyboardEvent, pressed: boolean) => {
+    const keyId = ev.code || ev.key;
+    if (!modifierCodes.has(keyId)) return;
+    if (pressed) modifierKeysDown.add(keyId);
+    else modifierKeysDown.delete(keyId);
+  };
+  term.textarea?.addEventListener("keydown", (ev) => trackModifier(ev, true), true);
+  term.textarea?.addEventListener("keyup", (ev) => trackModifier(ev, false), true);
+  const textareaDelta = (oldValue: string, newValue: string): string => {
+    let prefix = 0;
+    while (
+      prefix < oldValue.length &&
+      prefix < newValue.length &&
+      oldValue.charCodeAt(prefix) === newValue.charCodeAt(prefix)
+    ) {
+      prefix++;
+    }
+    const removed = oldValue.length - prefix;
+    return `${"\x7f".repeat(removed)}${newValue.substring(prefix)}`;
+  };
+  const flushPending229 = () => {
+    if (pending229Baseline === undefined || imeComposing) return;
+    const value = term.textarea?.value ?? "";
+    const data = textareaDelta(pending229Baseline, value);
+    if (!data) return;
+    pending229Baseline = undefined;
+    term.input(data, true);
+  };
+  const schedulePending229Flush = () => {
+    if (pending229FlushTimer !== undefined) return;
+    // Run after xterm's own zero-delay check so an xterm send can clear the
+    // baseline before this fallback runs.
+    pending229FlushTimer = setTimeout(() => {
+      pending229FlushTimer = undefined;
+      flushPending229();
+    }, 0);
+  };
+  const queueEarlyImeInput = (data: string) => {
+    const textareaLength = term.textarea?.value.length ?? -1;
+    const now = performance.now();
+    // Depending on WebKit's listener ordering, xterm may fire onData during
+    // the input event before this listener runs. Match both the character and
+    // the committed textarea length so a prior keypress cannot consume the
+    // current candidate, even when the same character is typed repeatedly.
+    const alreadySent =
+      lastOnData !== undefined &&
+      lastOnData.data === data &&
+      lastOnData.textareaLength === textareaLength &&
+      now - lastOnData.at <= 50;
+    const candidate: EarlyImeInput = {
+      data,
+      consumed: alreadySent,
+      awaitingKeydown: true,
+    };
+    earlyImeInputs.push(candidate);
+    window.setTimeout(() => {
+      if (!candidate.consumed) {
+        candidate.consumed = true;
+        term.input(data, true);
+      }
+    }, 16);
+    window.setTimeout(() => {
+      const index = earlyImeInputs.indexOf(candidate);
+      if (index >= 0) earlyImeInputs.splice(index, 1);
+    }, 500);
+  };
+  term.attachCustomKeyEventHandler((ev) => {
+    if (ev.type === "keydown" && ev.keyCode === 229) {
+      if (imeComposing || ev.isComposing) {
+        // Real IME composition is fully owned by xterm's CompositionHelper.
+        // A 229 baseline here would later replay part of the committed text.
+        pending229Baseline = undefined;
+      } else if (suppressNext229AfterComposition) {
+        // WebKit emits the Enter/Space confirmation key after compositionend.
+        // Its text has already been (or is about to be) emitted by xterm.
+        suppressNext229AfterComposition = false;
+        pending229Baseline = undefined;
+      } else {
+        const earlyInput = earlyImeInputs.find((candidate) => candidate.awaitingKeydown);
+        if (earlyInput) {
+          // WebKit delivered input before this printable keydown. Whether xterm
+          // or our delayed fallback sent it, do not create a stale 229 baseline.
+          earlyInput.awaitingKeydown = false;
+        } else if (pending229Baseline === undefined) {
+          pending229Baseline = term.textarea?.value ?? "";
+          // The handler runs before xterm's CompositionHelper. Queue our
+          // fallback after the current event so xterm's own timer gets first
+          // chance to consume the change and clear the baseline.
+          queueMicrotask(schedulePending229Flush);
+        }
+      }
+    } else if (ev.type === "keyup") {
+      schedulePending229Flush();
+    }
+    return true;
+  });
+  term.textarea?.addEventListener("compositionstart", () => {
+    imeComposing = true;
+    pending229Baseline = undefined;
+    suppressNext229AfterComposition = false;
+    if (pending229FlushTimer !== undefined) {
+      clearTimeout(pending229FlushTimer);
+      pending229FlushTimer = undefined;
+    }
+  });
+  term.textarea?.addEventListener("compositionend", () => {
+    imeComposing = false;
+    pending229Baseline = undefined;
+    suppressNext229AfterComposition = true;
+    if (pending229FlushTimer !== undefined) {
+      clearTimeout(pending229FlushTimer);
+      pending229FlushTimer = undefined;
+    }
+    window.setTimeout(() => {
+      suppressNext229AfterComposition = false;
+    }, 100);
+  });
+  term.textarea?.addEventListener("input", (ev) => {
+    const input = ev as InputEvent;
+    if (
+      !imeComposing &&
+      input.inputType === "insertText" &&
+      input.data &&
+      !input.defaultPrevented &&
+      modifierKeysDown.size > 0 &&
+      pending229Baseline === undefined
+    ) {
+      queueEarlyImeInput(input.data);
+    } else if (pending229Baseline !== undefined && !imeComposing) {
+      schedulePending229Flush();
+    }
+  });
+
   term.onData((data) => {
+    lastOnData = {
+      data,
+      textareaLength: term.textarea?.value.length ?? -1,
+      at: performance.now(),
+    };
+    const earlyInput = earlyImeInputs.find(
+      (candidate) => !candidate.consumed && candidate.data === data,
+    );
+    if (earlyInput) {
+      earlyInput.consumed = true;
+    }
+    if (pending229Baseline !== undefined && !imeComposing) {
+      const value = term.textarea?.value ?? "";
+      if (data === textareaDelta(pending229Baseline, value))
+        pending229Baseline = undefined;
+    }
     if (!tab.id.startsWith("failed-"))
       invoke("write_session", { id: tab.id, data }).catch(() => {});
   });
