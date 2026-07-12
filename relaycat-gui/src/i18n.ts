@@ -11,6 +11,8 @@ export const I18N: Record<Lang, Record<string, string>> = {
     nav_split: "分屏",
     nav_split_title: "分屏 (Ctrl+\\)",
     newtab_title: "新建会话 (Ctrl+T)",
+    tab_scroll_left: "向左滚动标签",
+    tab_scroll_right: "向右滚动标签",
     theme_toggle_title: "切换浅色/深色",
 
     // empty state
@@ -325,6 +327,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     // misc dynamic
     proc_exited: "[进程已退出，退出码 {0}]",
     launch_failed: "无法启动会话: {0}",
+    tab_limit_reached: "最多同时打开 {0} 个标签，请先关闭一个标签后再新建。",
     update_banner: "有新版本 {0} 可用 · 点击查看并安装",
     update_banner_required: "有新版本 {0} 可用（必须升级）· 点击查看并安装",
     close_confirm: "该会话仍在运行，确定要关闭吗？",
@@ -343,6 +346,8 @@ export const I18N: Record<Lang, Record<string, string>> = {
     nav_split: "Split",
     nav_split_title: "Split view (Ctrl+\\)",
     newtab_title: "New session (Ctrl+T)",
+    tab_scroll_left: "Scroll tabs left",
+    tab_scroll_right: "Scroll tabs right",
     theme_toggle_title: "Toggle light/dark",
 
     empty_title: "No sessions yet",
@@ -650,6 +655,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
 
     proc_exited: "[process exited, code {0}]",
     launch_failed: "Failed to start session: {0}",
+    tab_limit_reached: "You can open up to {0} tabs at once. Close a tab before creating another.",
     update_banner: "Version {0} is available · click to view & install",
     update_banner_required: "Version {0} is available (mandatory) · click to view & install",
     close_confirm: "This session is still running. Close it anyway?",

@@ -182,20 +182,63 @@ button {
 }
 
 /* ================================ tabs ================================ */
-.tabbar {
+.tabstrip {
   height: 40px;
   flex: none;
   background: var(--bg);
   display: flex;
-  align-items: flex-end;
-  padding: 0 10px;
-  gap: 3px;
+  align-items: center;
+  padding: 0 5px;
   border-bottom: 1px solid var(--border);
+}
+.tabbar {
+  height: 100%;
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  padding: 0 5px;
+  gap: 3px;
   overflow-x: auto;
   scrollbar-width: none;
 }
 .tabbar::-webkit-scrollbar {
   height: 0;
+}
+.tabscroll {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+.tabscroll[hidden] {
+  display: none;
+}
+.tabscroll:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+.tabscroll:disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+.tabscroll svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 /* Chrome-style tabs: small top-only radius, flush bottom that merges into the
    terminal below (the -1px margin overlaps the tabbar's bottom border). */
@@ -303,7 +346,7 @@ button {
   align-items: center;
   justify-content: center;
   align-self: center;
-  margin-bottom: 4px;
+  margin-bottom: 0;
   color: var(--dim);
   cursor: pointer;
   border-radius: 8px;

@@ -15,6 +15,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { I18N, type Lang } from "./i18n";
+import { MAX_TAB_COUNT, canCreateTab } from "./tab-limit";
+import { tabScrollState } from "./tab-scroll";
 import thirdPartyLicenses from "./third-party-licenses.txt?raw";
 
 type Tool = { name: string; label: string; kind: string };
@@ -339,7 +341,14 @@ function confirmDialog(opts: {
 
 let projectRows: { path: string; favorite: boolean; note?: string }[] = [];
 
+function ensureTabCapacity(): boolean {
+  if (canCreateTab(tabs.length)) return true;
+  alert(t("tab_limit_reached", MAX_TAB_COUNT));
+  return false;
+}
+
 async function openNewSession() {
+  if (!ensureTabCapacity()) return;
   config = await invoke<ConfigDto>("get_config");
   tools = await invoke<Tool[]>("list_tools");
   selectedTool = config.default_tool || tools[0]?.name || "shell";
@@ -571,6 +580,7 @@ async function launchSession() {
     ($(!relay ? "#relay-input" : "#proj-input") as HTMLInputElement).focus();
     return;
   }
+  if (!ensureTabCapacity()) return;
   closeOverlays();
   await createTab(selectedTool, project, relay);
 }
@@ -578,6 +588,7 @@ async function launchSession() {
 /* -------------------------------- tabs ----------------------------------- */
 
 async function createTab(tool: string, project: string, relay: string) {
+  if (!canCreateTab(tabs.length)) return;
   const term = new Terminal({
     fontFamily: '"JetBrains Mono", Menlo, Consolas, monospace',
     fontSize: fontSize(),
@@ -915,6 +926,37 @@ function buildTabEl(tab: Tab) {
   wireTabDrag(tab);
   const newtab = $("#btn-newtab");
   $("#tabbar").insertBefore(tabEl, newtab);
+  scheduleTabScrollUpdate();
+}
+
+function updateTabScrollControls() {
+  const tabbar = $("#tabbar");
+  const state = tabScrollState(tabbar);
+  const left = $("#btn-tab-scroll-left") as HTMLButtonElement;
+  const right = $("#btn-tab-scroll-right") as HTMLButtonElement;
+  left.hidden = !state.overflow;
+  right.hidden = !state.overflow;
+  left.disabled = !state.canScrollLeft;
+  right.disabled = !state.canScrollRight;
+}
+
+let tabScrollUpdateQueued = false;
+
+function scheduleTabScrollUpdate() {
+  if (tabScrollUpdateQueued) return;
+  tabScrollUpdateQueued = true;
+  requestAnimationFrame(() => {
+    tabScrollUpdateQueued = false;
+    updateTabScrollControls();
+  });
+}
+
+function scrollTabs(direction: -1 | 1) {
+  const tabbar = $("#tabbar");
+  tabbar.scrollBy({
+    left: direction * Math.max(160, Math.floor(tabbar.clientWidth * 0.7)),
+    behavior: "smooth",
+  });
 }
 
 // The CLI bakes a work-mode hint into the terminal title, e.g.
@@ -1223,6 +1265,7 @@ function moveTab(fromId: string, toId: string) {
   const newtab = $("#btn-newtab");
   const bar = $("#tabbar");
   for (const tb of tabs) bar.insertBefore(tb.tabEl, newtab);
+  scheduleTabScrollUpdate();
 }
 
 /* ------------------------------ layout/split ----------------------------- */
@@ -1282,8 +1325,12 @@ function selectTab(id: string) {
   activeId = id;
   applyLayout();
   const tab = tabs.find((t) => t.id === id);
-  if (tab) tab.term.focus();
+  if (tab) {
+    tab.tabEl.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+    tab.term.focus();
+  }
   renderStatusbar();
+  scheduleTabScrollUpdate();
 }
 
 async function closeTab(id: string, force = false) {
@@ -1331,6 +1378,7 @@ async function closeTab(id: string, force = false) {
   }
   renderEmpty();
   renderStatusbar();
+  scheduleTabScrollUpdate();
 }
 
 function runningTabs(): number {
@@ -2500,6 +2548,11 @@ function positionCoach() {
 function wireUi() {
   $("#btn-new").onclick = openNewSession;
   $("#btn-newtab").onclick = openNewSession;
+  $("#btn-tab-scroll-left").onclick = () => scrollTabs(-1);
+  $("#btn-tab-scroll-right").onclick = () => scrollTabs(1);
+  $("#tabbar").addEventListener("scroll", updateTabScrollControls, { passive: true });
+  new ResizeObserver(scheduleTabScrollUpdate).observe($("#tabbar"));
+  scheduleTabScrollUpdate();
   $("#empty-new").onclick = openNewSession;
   $("#empty-recent-btn").onclick = openRecentOverlay;
   $("#btn-settings").onclick = openSettings;
