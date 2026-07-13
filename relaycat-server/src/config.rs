@@ -20,6 +20,9 @@ pub struct RelayConfig {
 pub struct LimitsConfig {
     /// Maximum simultaneous WebSocket connections across all rooms.
     pub max_concurrent_connections: usize,
+    /// Maximum simultaneous WebSocket connections from one source IP. Values
+    /// below one are clamped to one when the relay admits a connection.
+    pub max_connections_per_ip: usize,
     /// Per-connection inbound message rate (messages/second).
     pub inbound_messages_per_second: u32,
     /// Per-connection inbound byte rate (bytes/second).
@@ -36,6 +39,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_concurrent_connections: crate::server::DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+            max_connections_per_ip: crate::server::DEFAULT_MAX_CONNECTIONS_PER_IP,
             inbound_messages_per_second: crate::server::DEFAULT_INBOUND_MESSAGES_PER_SECOND,
             inbound_bytes_per_second: crate::server::DEFAULT_INBOUND_BYTES_PER_SECOND,
             outbound_channel_capacity: crate::server::DEFAULT_OUTBOUND_CHANNEL_CAPACITY,
@@ -159,6 +163,10 @@ xfyun:
             crate::server::DEFAULT_MAX_CONCURRENT_CONNECTIONS
         );
         assert_eq!(
+            config.limits.max_connections_per_ip,
+            crate::server::DEFAULT_MAX_CONNECTIONS_PER_IP
+        );
+        assert_eq!(
             config.limits.inbound_messages_per_second,
             crate::server::DEFAULT_INBOUND_MESSAGES_PER_SECOND
         );
@@ -173,6 +181,7 @@ xfyun:
         let config: RelayConfig = serde_yaml::from_str(
             r#"
 limits:
+  max_connections_per_ip: 3
   inbound_bytes_per_second: 8000000
   outbound_channel_capacity: 256
 "#,
@@ -180,6 +189,7 @@ limits:
         .expect("parse yaml");
 
         // Overridden fields take the configured value...
+        assert_eq!(config.limits.max_connections_per_ip, 3);
         assert_eq!(config.limits.inbound_bytes_per_second, 8_000_000);
         assert_eq!(config.limits.outbound_channel_capacity, 256);
         // ...while unspecified fields fall back to the shipped defaults.

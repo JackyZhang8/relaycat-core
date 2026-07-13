@@ -4,7 +4,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use relaycat_protocol::{OuterFrame, RelayErrorCode, Role};
+use relaycat_protocol::{AppJoinIntent, OuterFrame, RelayErrorCode, Role};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -49,6 +49,7 @@ pub struct JoinRequest {
     /// The joiner's per-connection salt, forwarded verbatim to the peer in
     /// `PeerJoined` so both ends can derive a unique key for this connection.
     pub connection_salt: Option<[u8; 32]>,
+    pub app_join_intent: AppJoinIntent,
     pub outbound: OutboundTx,
     pub close_signal: Option<CloseSignalTx>,
 }
@@ -70,6 +71,7 @@ impl JoinRequest {
             pairing_token_proof,
             relay_admission: None,
             connection_salt: None,
+            app_join_intent: AppJoinIntent::Takeover,
             outbound,
             close_signal: None,
         }
@@ -82,6 +84,11 @@ impl JoinRequest {
 
     pub fn with_connection_salt(mut self, connection_salt: Option<[u8; 32]>) -> Self {
         self.connection_salt = connection_salt;
+        self
+    }
+
+    pub fn with_app_join_intent(mut self, app_join_intent: AppJoinIntent) -> Self {
+        self.app_join_intent = app_join_intent;
         self
     }
 
@@ -101,6 +108,8 @@ pub enum HubError {
     AdmissionRejected,
     #[error("join notification undeliverable")]
     JoinNotificationFailed,
+    #[error("another app already owns this session")]
+    AppSessionTaken,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +174,12 @@ impl Hub {
         }
         if !room.accepts_admission(request.relay_admission) {
             return Err(HubError::AdmissionRejected);
+        }
+        if request.role == Role::App
+            && request.app_join_intent == AppJoinIntent::Resume
+            && room.app.is_some()
+        {
+            return Err(HubError::AppSessionTaken);
         }
         room.touch();
         room.register_admission(request.role, request.relay_admission);
@@ -239,7 +254,12 @@ impl Hub {
                 connection_salt: request.connection_salt,
             }) {
                 log_control_send_failure(&request.room_id, "PeerJoined", "present peer", &err);
-                self.record_slow_consumer_eviction(&request.room_id, peer_role, 0, control_send_reason(&err));
+                self.record_slow_consumer_eviction(
+                    &request.room_id,
+                    peer_role,
+                    0,
+                    control_send_reason(&err),
+                );
                 signal_close(&peer, CloseSignal::SlowConsumer);
                 room.leave_active(peer_role, peer.conn_id);
                 if let Some(newcomer) = room.peer_for(peer_role) {
@@ -295,10 +315,10 @@ impl Hub {
                 // Silent drops here desync the receiver's SecureSession seq
                 // counter. Evict the slow recipient instead so its websocket
                 // task terminates and the secure stream restarts cleanly.
-                let queue_used = peer
-                    .outbound
-                    .max_capacity()
-                    .saturating_sub(peer.outbound.capacity()) as u64;
+                let queue_used =
+                    peer.outbound
+                        .max_capacity()
+                        .saturating_sub(peer.outbound.capacity()) as u64;
                 self.metrics
                     .outbound_queue_high_water
                     .fetch_max(queue_used, Ordering::Relaxed);
@@ -331,7 +351,9 @@ impl Hub {
                     }
                     eprintln!(
                         "WARN relaycat: relay forward evicted peer room={room_id} from={from_role:?} to={to_role:?} reason={reason} discarded_frame_bytes={frame_bytes} queue_high_water={}",
-                        self.metrics.outbound_queue_high_water.load(Ordering::Relaxed),
+                        self.metrics
+                            .outbound_queue_high_water
+                            .load(Ordering::Relaxed),
                     );
                 }
             }

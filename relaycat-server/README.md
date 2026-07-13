@@ -20,6 +20,15 @@ target/release/relaycat-relay --listen 127.0.0.1:8787
 target/release/relaycat-relay --listen 127.0.0.1:8787 --config /etc/relaycat/config.yaml
 ```
 
+`config.yaml` 可按部署规模覆盖传输限制；未配置时每个源 IP 最多 24 个活跃
+WebSocket 连接：
+
+```yaml
+limits:
+  max_concurrent_connections: 4096
+  max_connections_per_ip: 24
+```
+
 ## 测试
 
 ```bash

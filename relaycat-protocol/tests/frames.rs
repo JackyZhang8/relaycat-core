@@ -1,5 +1,5 @@
 use relaycat_protocol::{
-    CellAttr, CellRun, CliMetadata, CliStatus, CursorState, CursorStyle, Direction, HelloAckV2,
+    AppJoinIntent, CellAttr, CellRun, CliMetadata, CliStatus, CursorState, CursorStyle, Direction, HelloAckV2,
     HelloV2, InputAckV2, InputDecision, InputDedupe, InputEventV2, MAX_OUTER_FRAME_BYTES,
     OuterFrame, PaletteState, PatchOp, PatchRejectReason, PlainMsg, ProtocolCapabilityV2,
     RenderAckV2, RequestSnapshotV2, RequestTranscriptV2, ResizeAckV2, ResizeEventV2, ResumeV2,
@@ -119,6 +119,7 @@ fn join_frame_carries_optional_pairing_proof() {
         relay_admission: None,
         connection_salt: None,
         supports_join_accepted: false,
+        app_join_intent: AppJoinIntent::Takeover,
     };
 
     let encoded = encode_frame(&frame).expect("encode frame");
@@ -158,8 +159,12 @@ fn join_without_supports_join_accepted_decodes_as_false() {
     match decode_frame(&legacy).expect("decode legacy join") {
         OuterFrame::Join {
             supports_join_accepted,
+            app_join_intent,
             ..
-        } => assert!(!supports_join_accepted),
+        } => {
+            assert!(!supports_join_accepted);
+            assert_eq!(app_join_intent, AppJoinIntent::Resume);
+        }
         other => panic!("expected join, got {other:?}"),
     }
 }

@@ -1,4 +1,4 @@
-use relaycat_protocol::{Direction, OuterFrame, RelayErrorCode, Role};
+use relaycat_protocol::{AppJoinIntent, Direction, OuterFrame, RelayErrorCode, Role};
 use relaycat_relay::hub::{AdmissionCheck, CloseSignal, Hub, HubError, JoinRequest};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -665,6 +665,58 @@ async fn app_rejoin_evicts_old_app_and_sends_new_peer_joined_to_cli() {
 
     // Old app receives Evicted so it can surface "另一台设备已连接" and not auto-retry.
     assert_eq!(app_old_rx.recv().await, Some(OuterFrame::Evicted));
+}
+
+#[tokio::test]
+async fn app_resume_does_not_replace_the_active_app() {
+    let hub = Hub::default();
+    let (cli_tx, mut cli_rx) = mpsc::channel(64);
+    let (app_active_tx, mut app_active_rx) = mpsc::channel(64);
+    let (app_resume_tx, _app_resume_rx) = mpsc::channel(64);
+
+    hub.join(JoinRequest::new(
+        "room-1",
+        Role::Cli,
+        1,
+        [1; 32],
+        None,
+        cli_tx,
+    ))
+    .expect("cli joins");
+    hub.join(JoinRequest::new(
+        "room-1",
+        Role::App,
+        2,
+        [2; 32],
+        Some([9; 32]),
+        app_active_tx,
+    ))
+    .expect("active app joins");
+
+    let _ = cli_rx.recv().await;
+    let _ = app_active_rx.recv().await;
+
+    let error = hub
+        .join(
+            JoinRequest::new(
+                "room-1",
+                Role::App,
+                3,
+                [3; 32],
+                Some([8; 32]),
+                app_resume_tx,
+            )
+            .with_app_join_intent(AppJoinIntent::Resume),
+        )
+        .expect_err("automatic resume must not replace the active app");
+
+    assert_eq!(error, HubError::AppSessionTaken);
+    assert_eq!(hub.stats().app_connected_total, 1);
+    assert!(cli_rx.try_recv().is_err(), "resume must not notify the CLI");
+    assert!(
+        app_active_rx.try_recv().is_err(),
+        "resume must not evict the active app"
+    );
 }
 
 #[tokio::test]

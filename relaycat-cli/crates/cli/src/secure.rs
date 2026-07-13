@@ -7,7 +7,7 @@ use relaycat_crypto::{
     verify_pairing_token_proof,
 };
 use relaycat_protocol::{
-    Direction, OuterFrame, PlainMsg, Role, decode_plain_msg, encode_frame, encode_plain_msg,
+    AppJoinIntent, Direction, OuterFrame, PlainMsg, Role, decode_plain_msg, encode_frame, encode_plain_msg,
     frame_payload, outer_data_frame_encoded_len, plain_msg_type, plain_msg_types, unframe_payload,
 };
 
@@ -234,6 +234,7 @@ impl AppSecureHandshake {
             )),
             connection_salt: Some(app_salt),
             supports_join_accepted: false,
+            app_join_intent: AppJoinIntent::Takeover,
         }
     }
 
@@ -318,6 +319,7 @@ pub fn secure_join_frame(handshake: &CliSecureHandshake) -> OuterFrame {
         )),
         connection_salt: Some(cli_salt),
         supports_join_accepted: false,
+        app_join_intent: AppJoinIntent::Takeover,
     }
 }
 

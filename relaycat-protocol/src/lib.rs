@@ -19,6 +19,19 @@ pub enum Role {
     App,
 }
 
+/// Whether an App Join was initiated explicitly by the user or by automatic
+/// transport recovery. The relay only lets an explicit takeover replace an
+/// App that already owns the room's single App slot. A missing field is
+/// intentionally treated as `Resume` so an older client cannot reclaim a slot
+/// merely because it cannot express its intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppJoinIntent {
+    #[default]
+    Resume,
+    Takeover,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
@@ -541,6 +554,12 @@ pub enum OuterFrame {
         /// frame), so they keep using the timing-based rejection probe.
         #[serde(default)]
         supports_join_accepted: bool,
+        /// `takeover` is an explicit user action and may replace the active
+        /// App. `resume` is an automatic retry and is rejected while another
+        /// App owns the room. Missing fields default to `resume` so clients
+        /// released before this arbitration rule cannot take the slot back.
+        #[serde(default)]
+        app_join_intent: AppJoinIntent,
     },
     /// Explicit acknowledgement that the relay admitted this connection's
     /// `Join`. Only sent to joiners that set `supports_join_accepted`; it is
@@ -609,6 +628,7 @@ pub enum RelayErrorCode {
     HeartbeatTimeout,
     RateLimited,
     RoomExpired,
+    AppSessionTaken,
 }
 
 impl RelayErrorCode {
@@ -626,7 +646,8 @@ impl RelayErrorCode {
             | RelayErrorCode::InvalidJoin
             | RelayErrorCode::JoinRoomRoleMismatch
             | RelayErrorCode::AdmissionRejected
-            | RelayErrorCode::RoomExpired => false,
+            | RelayErrorCode::RoomExpired
+            | RelayErrorCode::AppSessionTaken => false,
         }
     }
 
@@ -644,6 +665,7 @@ impl RelayErrorCode {
             RelayErrorCode::HeartbeatTimeout => "heartbeat_timeout",
             RelayErrorCode::RateLimited => "rate_limited",
             RelayErrorCode::RoomExpired => "room_expired",
+            RelayErrorCode::AppSessionTaken => "app_session_taken",
         }
     }
 }
@@ -1172,6 +1194,7 @@ mod capability_decode_tests {
         assert!(!RelayErrorCode::JoinRoomRoleMismatch.is_retryable());
         assert!(!RelayErrorCode::AdmissionRejected.is_retryable());
         assert!(!RelayErrorCode::RoomExpired.is_retryable());
+        assert!(!RelayErrorCode::AppSessionTaken.is_retryable());
     }
 
     #[test]
@@ -1244,11 +1267,13 @@ mod android_wire_compat_tests {
                 relay_admission,
                 connection_salt,
                 supports_join_accepted: _,
+                app_join_intent,
             } => {
                 assert_eq!(room_id, "room-1");
                 assert_eq!(role, Role::App);
                 assert_eq!(device_pubkey, [2u8; 32]);
                 assert_eq!(pairing_token_proof, Some([9u8; 32]));
+                assert_eq!(app_join_intent, AppJoinIntent::Resume);
                 assert_eq!(relay_admission, Some([4u8; 32]));
                 assert_eq!(
                     connection_salt.as_ref().map(|s| s.as_slice()),

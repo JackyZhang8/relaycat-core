@@ -1,13 +1,18 @@
-use futures_util::{SinkExt, StreamExt};
-use relaycat_protocol::{OuterFrame, RelayErrorCode, Role, decode_frame, encode_frame};
+use futures_util::{SinkExt, Stream, StreamExt};
+use relaycat_protocol::{
+    AppJoinIntent, OuterFrame, RelayErrorCode, Role, decode_frame, encode_frame,
+};
 use relaycat_relay::server::MAX_BINARY_FRAME_BYTES;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Error as TungsteniteError, Message},
+};
 use tower::ServiceExt;
 
-type WsReader =
-    futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
-
-async fn next_binary_frame(reader: &mut WsReader) -> OuterFrame {
+async fn next_binary_frame<S>(reader: &mut S) -> OuterFrame
+where
+    S: Stream<Item = Result<Message, TungsteniteError>> + Unpin,
+{
     loop {
         let message = tokio::time::timeout(std::time::Duration::from_secs(2), reader.next())
             .await
@@ -47,6 +52,65 @@ async fn root_returns_running_status_and_version() {
 }
 
 #[tokio::test]
+async fn websocket_rejects_connections_exceeding_per_ip_limit() {
+    if std::env::var_os("RELAYCAT_RUN_NET_TESTS").is_none() {
+        eprintln!("skipping network test; set RELAYCAT_RUN_NET_TESTS=1 to run");
+        return;
+    }
+
+    let state =
+        relaycat_relay::server::AppState::with_config(relaycat_relay::config::RelayConfig {
+            limits: relaycat_relay::config::LimitsConfig {
+                max_connections_per_ip: 1,
+                ..relaycat_relay::config::LimitsConfig::default()
+            },
+            ..relaycat_relay::config::RelayConfig::default()
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let app = relaycat_relay::server::app(state);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server failed");
+    });
+
+    let (first_socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
+        .await
+        .expect("first connection admitted");
+
+    let error = connect_async(format!("ws://{addr}/ws?room_id=room-2&role=app"))
+        .await
+        .expect_err("second connection from the same IP is rejected");
+    let TungsteniteError::Http(response) = error else {
+        panic!("expected HTTP rejection, got {error:?}");
+    };
+    assert_eq!(response.status().as_u16(), 429);
+
+    drop(first_socket);
+    let reopened = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match connect_async(format!("ws://{addr}/ws?room_id=room-2&role=app")).await {
+                Ok((socket, _)) => return socket,
+                Err(TungsteniteError::Http(response)) if response.status().as_u16() == 429 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("unexpected retry failure: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("connection slot is released after the first socket closes");
+    drop(reopened);
+    server.abort();
+}
+
+#[tokio::test]
 async fn websocket_join_notifies_existing_peer_with_peer_joined() {
     if std::env::var_os("RELAYCAT_RUN_NET_TESTS").is_none() {
         eprintln!("skipping network test; set RELAYCAT_RUN_NET_TESTS=1 to run");
@@ -59,7 +123,12 @@ async fn websocket_join_notifies_existing_peer_with_peer_joined() {
     let addr = listener.local_addr().expect("listener addr");
     let app = relaycat_relay::server::app(relaycat_relay::server::AppState::default());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server failed");
     });
 
     let (cli_socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
@@ -75,6 +144,7 @@ async fn websocket_join_notifies_existing_peer_with_peer_joined() {
                 pairing_token_proof: None,
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })
@@ -97,6 +167,7 @@ async fn websocket_join_notifies_existing_peer_with_peer_joined() {
                 pairing_token_proof: Some([9; 32]),
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })
@@ -106,17 +177,8 @@ async fn websocket_join_notifies_existing_peer_with_peer_joined() {
         .await
         .expect("send app join");
 
-    let message = cli_reader
-        .next()
-        .await
-        .expect("peer joined message")
-        .expect("peer joined websocket message");
-    let Message::Binary(bytes) = message else {
-        panic!("expected binary PeerJoined, got {message:?}");
-    };
-
     assert_eq!(
-        decode_frame(&bytes).expect("decode peer joined"),
+        next_binary_frame(&mut cli_reader).await,
         OuterFrame::PeerJoined {
             role: Role::App,
             device_pubkey: [2; 32],
@@ -142,7 +204,12 @@ async fn websocket_join_accepted_sent_when_advertised() {
     let addr = listener.local_addr().expect("listener addr");
     let app = relaycat_relay::server::app(relaycat_relay::server::AppState::default());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server failed");
     });
 
     let (cli_socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
@@ -159,6 +226,7 @@ async fn websocket_join_accepted_sent_when_advertised() {
                 relay_admission: None,
                 connection_salt: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
             })
             .expect("encode cli join")
             .into(),
@@ -180,6 +248,7 @@ async fn websocket_join_accepted_sent_when_advertised() {
                 relay_admission: None,
                 connection_salt: None,
                 supports_join_accepted: true,
+                app_join_intent: AppJoinIntent::Takeover,
             })
             .expect("encode app join")
             .into(),
@@ -212,7 +281,10 @@ async fn websocket_join_accepted_sent_when_advertised() {
     };
     assert!(matches!(
         decode_frame(&bytes).expect("decode peer joined"),
-        OuterFrame::PeerJoined { role: Role::Cli, .. }
+        OuterFrame::PeerJoined {
+            role: Role::Cli,
+            ..
+        }
     ));
 
     server.abort();
@@ -231,7 +303,12 @@ async fn websocket_forwards_connection_salt_to_both_peers() {
     let addr = listener.local_addr().expect("listener addr");
     let app = relaycat_relay::server::app(relaycat_relay::server::AppState::default());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server failed");
     });
 
     let cli_salt = [0x5a_u8; 32];
@@ -250,6 +327,7 @@ async fn websocket_forwards_connection_salt_to_both_peers() {
                 pairing_token_proof: Some([7; 32]),
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
                 connection_salt: Some(cli_salt),
             })
             .expect("encode cli join")
@@ -271,6 +349,7 @@ async fn websocket_forwards_connection_salt_to_both_peers() {
                 pairing_token_proof: Some([9; 32]),
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
                 connection_salt: Some(app_salt),
             })
             .expect("encode app join")
@@ -316,7 +395,12 @@ async fn websocket_app_disconnect_then_reconnect_only_notifies_cli_on_rejoin() {
     let addr = listener.local_addr().expect("listener addr");
     let app = relaycat_relay::server::app(relaycat_relay::server::AppState::default());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server failed");
     });
 
     let (cli_socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
@@ -332,6 +416,7 @@ async fn websocket_app_disconnect_then_reconnect_only_notifies_cli_on_rejoin() {
                 pairing_token_proof: None,
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })
@@ -354,6 +439,7 @@ async fn websocket_app_disconnect_then_reconnect_only_notifies_cli_on_rejoin() {
                 pairing_token_proof: Some([9; 32]),
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })
@@ -392,6 +478,7 @@ async fn websocket_app_disconnect_then_reconnect_only_notifies_cli_on_rejoin() {
                 pairing_token_proof: Some([8; 32]),
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })
@@ -428,7 +515,12 @@ async fn websocket_allows_repeated_app_reconnects_for_same_room() {
     let addr = listener.local_addr().expect("listener addr");
     let app = relaycat_relay::server::app(relaycat_relay::server::AppState::default());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server failed");
     });
 
     let (cli_socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
@@ -444,6 +536,7 @@ async fn websocket_allows_repeated_app_reconnects_for_same_room() {
                 pairing_token_proof: None,
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })
@@ -467,6 +560,7 @@ async fn websocket_allows_repeated_app_reconnects_for_same_room() {
                     pairing_token_proof: Some([attempt + 10; 32]),
                     relay_admission: None,
                     supports_join_accepted: false,
+                    app_join_intent: AppJoinIntent::Takeover,
 
                     connection_salt: None,
                 })
@@ -509,7 +603,12 @@ async fn websocket_cli_reconnect_notifies_app_with_peer_joined_without_peer_left
     let addr = listener.local_addr().expect("listener addr");
     let app = relaycat_relay::server::app(relaycat_relay::server::AppState::default());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server failed");
     });
 
     let (cli_socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
@@ -525,6 +624,7 @@ async fn websocket_cli_reconnect_notifies_app_with_peer_joined_without_peer_left
                 pairing_token_proof: None,
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })
@@ -547,6 +647,7 @@ async fn websocket_cli_reconnect_notifies_app_with_peer_joined_without_peer_left
                 pairing_token_proof: Some([9; 32]),
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })
@@ -555,6 +656,16 @@ async fn websocket_cli_reconnect_notifies_app_with_peer_joined_without_peer_left
         ))
         .await
         .expect("send app join");
+
+    assert_eq!(
+        next_binary_frame(&mut app_reader).await,
+        OuterFrame::PeerJoined {
+            role: Role::Cli,
+            device_pubkey: [1; 32],
+            pairing_token_proof: None,
+            connection_salt: None,
+        }
+    );
 
     let (second_cli_socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
         .await
@@ -569,6 +680,7 @@ async fn websocket_cli_reconnect_notifies_app_with_peer_joined_without_peer_left
                 pairing_token_proof: None,
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })
@@ -605,7 +717,12 @@ async fn websocket_rejects_oversized_initial_binary_frame_with_error() {
     let addr = listener.local_addr().expect("listener addr");
     let app = relaycat_relay::server::app(relaycat_relay::server::AppState::default());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server failed");
     });
 
     let (mut socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
@@ -616,15 +733,7 @@ async fn websocket_rejects_oversized_initial_binary_frame_with_error() {
         .await
         .expect("send oversized frame");
 
-    let message = socket
-        .next()
-        .await
-        .expect("error message")
-        .expect("error websocket message");
-    let Message::Binary(bytes) = message else {
-        panic!("expected binary Error, got {message:?}");
-    };
-    let OuterFrame::Error { message, code } = decode_frame(&bytes).expect("decode error") else {
+    let OuterFrame::Error { message, code } = next_binary_frame(&mut socket).await else {
         panic!("expected protocol Error");
     };
     assert!(message.contains("size limit"));
@@ -646,7 +755,12 @@ async fn websocket_rejects_oversized_binary_frame_after_join_with_error() {
     let addr = listener.local_addr().expect("listener addr");
     let app = relaycat_relay::server::app(relaycat_relay::server::AppState::default());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server failed");
     });
 
     let (mut socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
@@ -661,6 +775,7 @@ async fn websocket_rejects_oversized_binary_frame_after_join_with_error() {
                 pairing_token_proof: None,
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })
@@ -674,15 +789,7 @@ async fn websocket_rejects_oversized_binary_frame_after_join_with_error() {
         .await
         .expect("send oversized frame");
 
-    let message = socket
-        .next()
-        .await
-        .expect("error message")
-        .expect("error websocket message");
-    let Message::Binary(bytes) = message else {
-        panic!("expected binary Error, got {message:?}");
-    };
-    let OuterFrame::Error { message, code } = decode_frame(&bytes).expect("decode error") else {
+    let OuterFrame::Error { message, code } = next_binary_frame(&mut socket).await else {
         panic!("expected protocol Error");
     };
     assert!(message.contains("size limit"));
@@ -704,7 +811,12 @@ async fn websocket_replies_to_protocol_ping_with_pong() {
     let addr = listener.local_addr().expect("listener addr");
     let app = relaycat_relay::server::app(relaycat_relay::server::AppState::default());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server failed");
     });
 
     let (mut socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
@@ -719,6 +831,7 @@ async fn websocket_replies_to_protocol_ping_with_pong() {
                 pairing_token_proof: None,
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })
@@ -761,7 +874,12 @@ async fn websocket_rejects_inbound_message_rate_burst_with_error() {
     let addr = listener.local_addr().expect("listener addr");
     let app = relaycat_relay::server::app(relaycat_relay::server::AppState::default());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("server failed");
     });
 
     let (mut socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
@@ -776,6 +894,7 @@ async fn websocket_rejects_inbound_message_rate_burst_with_error() {
                 pairing_token_proof: None,
                 relay_admission: None,
                 supports_join_accepted: false,
+                app_join_intent: AppJoinIntent::Takeover,
 
                 connection_salt: None,
             })

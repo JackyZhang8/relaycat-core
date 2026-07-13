@@ -1,19 +1,20 @@
-#[cfg(unix)]
-use std::{ffi::CStr, mem::MaybeUninit};
 use std::{
-    net::SocketAddr,
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(unix)]
+use std::{ffi::CStr, mem::MaybeUninit};
 
 use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{
-        Query, State,
+        ConnectInfo, Query, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
@@ -36,6 +37,11 @@ use crate::{
 };
 
 pub const MAX_BINARY_FRAME_BYTES: usize = relaycat_protocol::MAX_OUTER_FRAME_BYTES;
+// Keep Axum's transport limit one byte above the protocol limit so a frame
+// that is just over the limit can receive a structured FrameTooLarge error.
+// Larger frames are still rejected by the WebSocket implementation before
+// they can consume unbounded application memory.
+const MAX_WEBSOCKET_FRAME_BYTES: usize = MAX_BINARY_FRAME_BYTES + 1;
 /// Default transport limits. These are the values the relay shipped with before
 /// they became configurable; `config::LimitsConfig` falls back to them when a
 /// field is absent from the config file.
@@ -51,6 +57,8 @@ const CLIENT_PONG_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_OUTBOUND_CHANNEL_CAPACITY: usize = 64;
 /// Maximum number of simultaneous WebSocket connections across all rooms.
 pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 4096;
+/// Maximum number of simultaneous WebSocket connections from one source IP.
+pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 24;
 /// How long to wait for the initial Join frame after the WebSocket is upgraded.
 /// Without a timeout, a client that connects but never speaks holds a file
 /// descriptor and a tokio task indefinitely.
@@ -75,6 +83,7 @@ pub struct AppState {
     next_conn_id: Arc<AtomicU64>,
     rooms_expired_since_stats: Arc<AtomicU64>,
     active_connections: Arc<AtomicUsize>,
+    active_connections_by_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
     rtasr_limiter: Arc<RtasrRateLimiter>,
 }
 
@@ -86,6 +95,7 @@ impl Default for AppState {
             next_conn_id: Arc::new(AtomicU64::new(1)),
             rooms_expired_since_stats: Arc::new(AtomicU64::new(0)),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            active_connections_by_ip: Arc::new(Mutex::new(HashMap::new())),
             rtasr_limiter: Arc::new(RtasrRateLimiter::new(
                 RTASR_GLOBAL_REQUESTS_PER_MINUTE,
                 RTASR_PER_ROOM_REQUESTS_PER_MINUTE,
@@ -94,15 +104,35 @@ impl Default for AppState {
     }
 }
 
-/// RAII guard that decrements the active-connection counter when dropped,
-/// ensuring every handle_socket exit path (early return or normal) releases
-/// its slot.
-struct ConnectionGuard(Arc<AtomicUsize>);
+/// RAII guard that releases both the global and source-IP connection slots on
+/// every websocket exit path, including an unfinished Join handshake.
+struct ConnectionGuard {
+    total: Arc<AtomicUsize>,
+    by_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.total.fetch_sub(1, Ordering::Relaxed);
+        let mut by_ip = self
+            .by_ip
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(active) = by_ip.get_mut(&self.ip) else {
+            return;
+        };
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            by_ip.remove(&self.ip);
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionAdmissionError {
+    GlobalLimit,
+    PerIpLimit,
 }
 
 impl AppState {
@@ -124,6 +154,38 @@ impl AppState {
 
     fn take_expired_rooms_since_stats(&self) -> u64 {
         self.rooms_expired_since_stats.swap(0, Ordering::Relaxed)
+    }
+
+    /// Reserves a global and source-IP connection slot before upgrading the
+    /// HTTP request to WebSocket. The IP map is protected by one short mutex
+    /// so increment/check and removal-on-drop stay race-free.
+    fn try_acquire_connection(
+        &self,
+        ip: IpAddr,
+    ) -> Result<ConnectionGuard, ConnectionAdmissionError> {
+        let limits = &self.config.limits;
+        let previous_total = self.active_connections.fetch_add(1, Ordering::Relaxed);
+        if previous_total >= limits.max_concurrent_connections {
+            self.active_connections.fetch_sub(1, Ordering::Relaxed);
+            return Err(ConnectionAdmissionError::GlobalLimit);
+        }
+
+        let mut by_ip = self
+            .active_connections_by_ip
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active = by_ip.entry(ip).or_insert(0);
+        if *active >= limits.max_connections_per_ip.max(1) {
+            self.active_connections.fetch_sub(1, Ordering::Relaxed);
+            return Err(ConnectionAdmissionError::PerIpLimit);
+        }
+        *active += 1;
+
+        Ok(ConnectionGuard {
+            total: Arc::clone(&self.active_connections),
+            by_ip: Arc::clone(&self.active_connections_by_ip),
+            ip,
+        })
     }
 }
 
@@ -259,6 +321,38 @@ mod tests {
         };
 
         assert!(encode_outbound_frame(&oversized).is_err());
+    }
+
+    #[test]
+    fn per_ip_connection_limit_is_enforced_and_released_on_drop() {
+        let state = AppState::with_config(RelayConfig {
+            limits: crate::config::LimitsConfig {
+                max_connections_per_ip: 2,
+                ..crate::config::LimitsConfig::default()
+            },
+            ..RelayConfig::default()
+        });
+        let ip = "203.0.113.7".parse().expect("test IP");
+        let other_ip = "203.0.113.8".parse().expect("test IP");
+
+        let first = state
+            .try_acquire_connection(ip)
+            .expect("first connection admitted");
+        let second = state
+            .try_acquire_connection(ip)
+            .expect("second connection admitted");
+        assert!(matches!(
+            state.try_acquire_connection(ip),
+            Err(ConnectionAdmissionError::PerIpLimit)
+        ));
+        let other = state
+            .try_acquire_connection(other_ip)
+            .expect("a different IP has its own limit");
+
+        drop(second);
+        assert!(state.try_acquire_connection(ip).is_ok());
+        drop(other);
+        drop(first);
     }
 
     #[test]
@@ -618,8 +712,8 @@ mod tests {
         }
 
         // The next request from the same room is rejected with 429.
-        let err = issue_xfyun_rtasr_url(&state, request())
-            .expect_err("over per-room budget is rejected");
+        let err =
+            issue_xfyun_rtasr_url(&state, request()).expect_err("over per-room budget is rejected");
         assert_eq!(err, (StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
     }
 }
@@ -645,9 +739,12 @@ pub async fn serve_with_state(addr: SocketAddr, state: AppState) -> anyhow::Resu
     tokio::spawn(cleanup_rooms_loop(state.clone()));
     tokio::spawn(relay_stats_loop(state.clone()));
 
-    axum::serve(listener, app(state))
-        .await
-        .context("relay server failed")
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("relay server failed")
 }
 
 async fn cleanup_rooms_loop(state: AppState) {
@@ -681,11 +778,31 @@ async fn relay_stats_loop(state: AppState) {
 async fn ws_handler(
     State(state): State<AppState>,
     Query(query): Query<WsQuery>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.max_message_size(MAX_BINARY_FRAME_BYTES)
-        .max_frame_size(MAX_BINARY_FRAME_BYTES)
-        .on_upgrade(move |socket| handle_socket(state, query, socket))
+    let ip = peer_addr.ip();
+    let connection_guard = match state.try_acquire_connection(ip) {
+        Ok(guard) => guard,
+        Err(ConnectionAdmissionError::GlobalLimit) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server at connection limit",
+            )
+                .into_response();
+        }
+        Err(ConnectionAdmissionError::PerIpLimit) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many active websocket connections from this IP",
+            )
+                .into_response();
+        }
+    };
+    ws.max_message_size(MAX_WEBSOCKET_FRAME_BYTES)
+        .max_frame_size(MAX_WEBSOCKET_FRAME_BYTES)
+        .on_upgrade(move |socket| handle_socket(state, query, socket, connection_guard))
+        .into_response()
 }
 
 async fn root_handler() -> impl IntoResponse {
@@ -764,22 +881,21 @@ fn room_id_is_valid(room_id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
 }
 
-async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
+async fn handle_socket(
+    state: AppState,
+    query: WsQuery,
+    socket: WebSocket,
+    _connection_guard: ConnectionGuard,
+) {
     let limits = &state.config.limits;
     let conn_id = state.next_conn_id();
-    let (outbound_tx, outbound_rx) =
-        mpsc::channel(limits.outbound_channel_capacity.max(1));
+    let (outbound_tx, outbound_rx) = mpsc::channel(limits.outbound_channel_capacity.max(1));
     // Dedicated eviction channel: never shares capacity with the ordinary
     // outbound queue, so a close reason can still be delivered when that
     // queue is full.
     let (close_signal_tx, close_signal_rx) = mpsc::channel(1);
     let mut socket = socket;
     let connected_at = Instant::now();
-
-    // Increment connection counter immediately; the guard ensures it is
-    // decremented on every exit path (early return or normal completion).
-    let prev_connections = state.active_connections.fetch_add(1, Ordering::Relaxed);
-    let _conn_guard = ConnectionGuard(Arc::clone(&state.active_connections));
 
     // Validate room_id before it reaches any log line. The query value is
     // percent-decoded by axum, so an unvalidated room_id can carry newlines or
@@ -795,24 +911,10 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
                 "invalid room_id",
             ),
         );
-        let _ = send_error(&mut socket, RelayErrorCode::InvalidRoomId, "invalid room_id").await;
-        return;
-    }
-
-    if prev_connections >= limits.max_concurrent_connections {
-        relaycat_log(
-            "WARN",
-            rejected_log(
-                &query.room_id,
-                query.role,
-                conn_id,
-                "server at connection limit",
-            ),
-        );
         let _ = send_error(
             &mut socket,
-            RelayErrorCode::ServerAtCapacity,
-            "server at connection limit",
+            RelayErrorCode::InvalidRoomId,
+            "invalid room_id",
         )
         .await;
         return;
@@ -898,6 +1000,7 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
         relay_admission,
         connection_salt,
         supports_join_accepted,
+        app_join_intent,
     }) = join
     else {
         relaycat_log(
@@ -973,6 +1076,7 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
     }
     request = request
         .with_connection_salt(connection_salt)
+        .with_app_join_intent(app_join_intent)
         .with_close_signal(close_signal_tx);
     let join_result = state.hub.join(request);
     match join_result {
@@ -1328,7 +1432,10 @@ struct RtasrRateLimiter {
 impl RtasrRateLimiter {
     fn new(global_per_minute: f64, per_room_per_minute: f64) -> Self {
         Self {
-            global: Mutex::new(TokenBucket::new(global_per_minute, global_per_minute / 60.0)),
+            global: Mutex::new(TokenBucket::new(
+                global_per_minute,
+                global_per_minute / 60.0,
+            )),
             per_room: DashMap::new(),
             per_room_capacity: per_room_per_minute,
             per_room_refill_per_sec: per_room_per_minute / 60.0,
@@ -1449,6 +1556,7 @@ fn join_error_code(error: &HubError) -> RelayErrorCode {
         HubError::PeerMissing { .. } => RelayErrorCode::PeerNotRegistered,
         HubError::AdmissionRejected => RelayErrorCode::AdmissionRejected,
         HubError::JoinNotificationFailed => RelayErrorCode::JoinNotificationFailed,
+        HubError::AppSessionTaken => RelayErrorCode::AppSessionTaken,
     }
 }
 
@@ -1501,7 +1609,11 @@ fn format_relaycat_log_line(timestamp: &str, level: &str, message: &str) -> Stri
 /// is capped so an oversized value cannot flood the log.
 fn escape_log_value(value: &str) -> String {
     const MAX_CHARS: usize = 128;
-    let mut escaped: String = value.chars().take(MAX_CHARS).flat_map(char::escape_debug).collect();
+    let mut escaped: String = value
+        .chars()
+        .take(MAX_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
     if value.chars().nth(MAX_CHARS).is_some() {
         escaped.push('…');
     }

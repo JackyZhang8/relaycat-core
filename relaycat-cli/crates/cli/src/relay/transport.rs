@@ -166,6 +166,7 @@ impl RelayTransportReconnect {
                     // there is no key derivation to salt.
                     connection_salt: None,
                     supports_join_accepted: false,
+                    app_join_intent: relaycat_protocol::AppJoinIntent::Takeover,
                 };
                 ws_send(&mut ws_writer, Message::Binary(encode_frame(&join)?.into()))
                     .await
