@@ -163,8 +163,17 @@ struct PairingEvent {
 #[derive(Clone, Serialize)]
 struct RelayEvent {
     id: String,
-    /// `paired`
+    /// `paired` | `syncing` | `wait` | `error`
     state: String,
+    /// For `error`: the relay's stable error code (or `unknown`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    /// For `error`: whether the failure is retryable per the stable code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
+    /// For `error`: the relay's free-text reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 impl SessionManager {
@@ -422,8 +431,10 @@ impl SessionManager {
     }
 }
 
-/// Tails the relay CLI log file and emits `session://relay {state:"paired"}`
-/// once the mobile app establishes a secure session. Starts from the current
+/// Tails the relay CLI log file and emits `session://relay` state transitions
+/// derived from the CLI's terminal-sync markers: `syncing` once the mobile app
+/// has a secure session or rejoins, `paired` only once the terminal stream is
+/// actually live, and `wait` when the app disconnects. Starts from the current
 /// end of the file so stale lines from earlier runs are ignored.
 fn spawn_log_tail(
     app: AppHandle,
@@ -433,8 +444,12 @@ fn spawn_log_tail(
     alive: Arc<AtomicBool>,
 ) {
     // The log file is shared by every relay session in the project, so only
-    // react to the pairing line tagged with this tab's session id.
+    // react to the lines tagged with this tab's session id.
     let pairing_marker = format!("secure session established gui_session={gui_session_id}");
+    let live_marker = format!("app terminal live gui_session={gui_session_id}");
+    let syncing_marker = format!("app terminal syncing gui_session={gui_session_id}");
+    let disconnected_marker = format!("app terminal disconnected gui_session={gui_session_id}");
+    let error_marker = format!("relay error gui_session={gui_session_id} ");
     thread::spawn(move || {
         // Wait for the CLI to create the log file.
         let mut waited = 0u32;
@@ -451,7 +466,7 @@ fn spawn_log_tail(
         let mut reader = BufReader::new(file);
         // Skip whatever is already there (previous sessions in this project).
         let _ = reader.seek(SeekFrom::End(0));
-        let mut paired = false;
+        let mut last_state = String::new();
         let mut line = String::new();
         while alive.load(Ordering::Acquire) {
             line.clear();
@@ -460,13 +475,42 @@ fn spawn_log_tail(
                     thread::sleep(Duration::from_millis(250));
                 }
                 Ok(_) => {
-                    if !paired && line.contains(&pairing_marker) {
-                        paired = true;
+                    if let Some(rest) = line
+                        .find(&error_marker)
+                        .map(|at| &line[at + error_marker.len()..])
+                    {
+                        let (code, retryable, message) = parse_relay_error_fields(rest);
                         let _ = app.emit(
                             "session://relay",
                             RelayEvent {
                                 id: id.clone(),
-                                state: "paired".to_string(),
+                                state: "error".to_string(),
+                                code: Some(code),
+                                retryable: Some(retryable),
+                                message: Some(message),
+                            },
+                        );
+                        continue;
+                    }
+                    let state = if line.contains(&live_marker) {
+                        "paired"
+                    } else if line.contains(&pairing_marker) || line.contains(&syncing_marker) {
+                        "syncing"
+                    } else if line.contains(&disconnected_marker) {
+                        "wait"
+                    } else {
+                        continue;
+                    };
+                    if state != last_state {
+                        last_state = state.to_string();
+                        let _ = app.emit(
+                            "session://relay",
+                            RelayEvent {
+                                id: id.clone(),
+                                state: state.to_string(),
+                                code: None,
+                                retryable: None,
+                                message: None,
                             },
                         );
                     }
@@ -475,6 +519,26 @@ fn spawn_log_tail(
             }
         }
     });
+}
+
+/// Parses the tail of a CLI `relay error gui_session=<id> ...` log line:
+/// `code=<code> retryable=<bool> message=<free text>`.
+fn parse_relay_error_fields(rest: &str) -> (String, bool, String) {
+    let rest = rest.trim_end();
+    let code = rest
+        .strip_prefix("code=")
+        .and_then(|s| s.split_whitespace().next())
+        .unwrap_or("unknown")
+        .to_string();
+    let retryable = rest
+        .find("retryable=")
+        .map(|at| rest[at + "retryable=".len()..].starts_with("true"))
+        .unwrap_or(false);
+    let message = rest
+        .find("message=")
+        .map(|at| rest[at + "message=".len()..].to_string())
+        .unwrap_or_default();
+    (code, retryable, message)
 }
 
 /// Polls the relay child's pairing-URL fallback file and emits

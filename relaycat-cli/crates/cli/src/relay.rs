@@ -28,9 +28,9 @@ use relaycat_crypto::KeyPair;
 use relaycat_protocol::{
     CliMetadata, CliStatus, Direction, HelloAckV2, HelloV2, InputAckV2, InputDecision, InputDedupe,
     InputEventV2, MAX_OUTER_FRAME_BYTES, OuterFrame, PaletteState, PatchOp, PlainMsg,
-    ProtocolCapabilityV2, RenderAckV2, RequestSnapshotV2, RequestTranscriptV2, ResizeEventV2,
-    ResumeV2, Role, TERMINAL_STATE_PROTOCOL_V2, TerminalColor, decode_frame, encode_frame,
-    encode_plain_msg,
+    ProtocolCapabilityV2, ProtocolRejectV2, RelayErrorCode, RenderAckV2, RequestSnapshotV2,
+    RequestTranscriptV2, ResizeEventV2, ResumeAcceptMode, ResumeAcceptedV2, ResumeV2, Role,
+    TERMINAL_STATE_PROTOCOL_V2, TerminalColor, decode_frame, encode_frame, encode_plain_msg,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
@@ -284,6 +284,28 @@ fn terminal_msgs_contain_state(msgs: &[PlainMsg]) -> bool {
     })
 }
 
+/// Classify how a resume reply brings the app up to date, so the app can hold
+/// its reconnect overlay until `target_state_seq` has actually been applied.
+fn resume_accepted_for(msgs: &[PlainMsg], target_state_seq: u64) -> ResumeAcceptedV2 {
+    let mode = if msgs
+        .iter()
+        .any(|msg| matches!(msg, PlainMsg::TerminalSnapshotV2(_)))
+    {
+        ResumeAcceptMode::SendingSnapshot
+    } else if msgs
+        .iter()
+        .any(|msg| matches!(msg, PlainMsg::TerminalPatchV2(_)))
+    {
+        ResumeAcceptMode::ReplayingPatches
+    } else {
+        ResumeAcceptMode::UpToDate
+    };
+    ResumeAcceptedV2 {
+        mode,
+        target_state_seq,
+    }
+}
+
 fn relay_input_action(msg: PlainMsg) -> RelayInputAction {
     match msg {
         PlainMsg::InputEventV2(InputEventV2 {
@@ -343,6 +365,45 @@ fn normalized_title_part(value: Option<&str>) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Log marker the GUI host's log tail watches to derive the tab's paired /
+/// syncing / disconnected presentation state. Tagged with the GUI session id
+/// so sibling tabs sharing the same log file never react to each other.
+fn gui_terminal_state_log(state: &str) -> String {
+    match crate::gui_bridge::gui_session_id() {
+        Some(id) => format!("app terminal {state} gui_session={id}"),
+        None => format!("app terminal {state}"),
+    }
+}
+
+/// Log marker the GUI host's log tail watches to surface a relay `Error`
+/// frame with its stable code and retryability, so the GUI can present the
+/// same reason/retryability the mobile apps derive from the code.
+fn gui_relay_error_log(message: &str, code: Option<RelayErrorCode>) -> String {
+    let code_str = code.map(RelayErrorCode::as_str).unwrap_or("unknown");
+    let retryable = code.map(RelayErrorCode::is_retryable).unwrap_or(false);
+    let sanitized: String = message.chars().filter(|ch| !ch.is_control()).collect();
+    match crate::gui_bridge::gui_session_id() {
+        Some(id) => format!(
+            "relay error gui_session={id} code={code_str} retryable={retryable} message={sanitized}"
+        ),
+        None => format!("relay error code={code_str} retryable={retryable} message={sanitized}"),
+    }
+}
+
+/// User-facing description for a relay `Error` frame. The stable `code` (when
+/// the relay is new enough to send one) drives retryability wording; the
+/// free-text message is kept for context and for older relays.
+pub(crate) fn relay_error_description(message: &str, code: Option<RelayErrorCode>) -> String {
+    match code {
+        Some(code) if code.is_retryable() => format!(
+            "relay rejected connection ({} retryable): {message}",
+            code.as_str()
+        ),
+        Some(code) => format!("relay rejected connection ({}): {message}", code.as_str()),
+        None => format!("relay rejected connection: {message}"),
+    }
+}
+
 fn can_send_without_terminal_resume(msg: &PlainMsg) -> bool {
     matches!(
         msg,
@@ -352,9 +413,11 @@ fn can_send_without_terminal_resume(msg: &PlainMsg) -> bool {
             | PlainMsg::InputAckV2(_)
             | PlainMsg::ResizeAckV2(_)
             | PlainMsg::ProcessExit { .. }
-            // The capability handshake reply must reach the app before any
-            // terminal resume, so it is never gated by the resume window.
+            // The capability handshake replies must reach the app before any
+            // terminal resume, so they are never gated by the resume window.
             | PlainMsg::HelloAckV2(_)
+            | PlainMsg::ProtocolRejectV2(_)
+            | PlainMsg::ResumeAcceptedV2(_)
     )
 }
 
@@ -551,11 +614,16 @@ async fn run_secure_pty_relay(
                 .encode_wire(Direction::CliToApp, msg, MAX_OUTER_FRAME_BYTES)
         },
         move |frame| {
+            if let OuterFrame::Error { message, code } = &frame {
+                relaycat_log("WARN", gui_relay_error_log(message, *code));
+                return Ok(None);
+            }
             if matches!(&frame, OuterFrame::PeerLeft { role: Role::App }) {
                 mark_app_disconnected(&app_connected_for_decode);
                 if let Ok(mut gate) = resume_gate_for_decode.lock() {
                     gate.mark_app_disconnected();
                 }
+                relaycat_log("INFO", gui_terminal_state_log("disconnected"));
                 return Ok(None);
             }
             match accept_secure_peer_joined_and_reset_sessions(
@@ -573,6 +641,7 @@ async fn run_secure_pty_relay(
                     if let Ok(mut gate) = resume_gate_for_decode.lock() {
                         gate.mark_app_rejoined();
                     }
+                    relaycat_log("INFO", gui_terminal_state_log("syncing"));
                     return Ok(None);
                 }
                 SecurePeerJoined::SessionPreserved => {
@@ -584,6 +653,7 @@ async fn run_secure_pty_relay(
                     if let Ok(mut gate) = resume_gate_for_decode.lock() {
                         gate.mark_resume_processed();
                     }
+                    relaycat_log("INFO", gui_terminal_state_log("live"));
                     return Ok(None);
                 }
                 SecurePeerJoined::NotPeerJoined => {}
@@ -1602,7 +1672,18 @@ where
                             if let Ok(mut gate) = resume_gate.lock() {
                                 gate.mark_resume_processed();
                             }
-                            msgs
+                            relaycat_log("INFO", gui_terminal_state_log("live"));
+                            // Announce how the backlog will arrive before it
+                            // does, so the app keeps its reconnect overlay up
+                            // until `target_state_seq` is applied instead of
+                            // relying on a fixed fallback timer.
+                            let mut announced = Vec::with_capacity(msgs.len() + 1);
+                            announced.push(PlainMsg::ResumeAcceptedV2(resume_accepted_for(
+                                &msgs,
+                                terminal_core.current_state_seq(),
+                            )));
+                            announced.extend(msgs);
+                            announced
                         }
                         TerminalV2Control::RenderAck(ack) => {
                             // A render ack only arrives while the app is
@@ -2425,9 +2506,22 @@ where
                     // Outbound (CLI->App) compression is enabled in the decode
                     // path the moment the Hello is read; here we just answer
                     // with the negotiated capability set so the app can enable
-                    // its own uplink compression.
-                    let _ = heartbeat_output_tx_for_input
-                        .try_send(PtyEvent::Plain(PlainMsg::HelloAckV2(hello_ack_for(&hello))));
+                    // its own uplink compression. Incompatible peers get an
+                    // explicit ProtocolRejectV2 instead of a fallback ack.
+                    match hello_ack_for(&hello) {
+                        Ok(ack) => {
+                            let _ = heartbeat_output_tx_for_input
+                                .try_send(PtyEvent::Plain(PlainMsg::HelloAckV2(ack)));
+                        }
+                        Err(reject) => {
+                            relaycat_log(
+                                "WARN",
+                                format!("protocol negotiation rejected: {}", reject.reason),
+                            );
+                            let _ = heartbeat_output_tx_for_input
+                                .try_send(PtyEvent::Plain(PlainMsg::ProtocolRejectV2(reject)));
+                        }
+                    }
                 }
                 Some(RelayInputAction::EchoHeartbeat) => {
                     let _ = heartbeat_output_tx_for_input

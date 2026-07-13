@@ -97,6 +97,37 @@ where
         .collect())
 }
 
+/// How the CLI will bring the app up to date after accepting a `ResumeV2`.
+/// Lets the app keep its reconnect overlay visible until the replayed backlog
+/// has actually arrived instead of guessing with a fixed fallback delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeAcceptMode {
+    /// The app's last applied state is already current; nothing to replay.
+    UpToDate,
+    /// Retained patches after the app's last applied seq will be replayed.
+    ReplayingPatches,
+    /// The retained range is unusable; a full snapshot follows.
+    SendingSnapshot,
+}
+
+/// CLI reply to `ResumeV2`, sent before the replayed patches / snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeAcceptedV2 {
+    pub mode: ResumeAcceptMode,
+    /// The CLI-side state seq the app will have applied once caught up.
+    pub target_state_seq: u64,
+}
+
+/// CLI reply to `HelloV2` when the peers share no protocol version or a
+/// mandatory capability is missing. The receiver should surface a
+/// "protocol incompatible" state instead of retrying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolRejectV2 {
+    pub reason: String,
+    pub supported_versions: Vec<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeV2 {
     pub terminal_run_id: Option<String>,
@@ -503,7 +534,19 @@ pub enum OuterFrame {
         /// legacy (salt-free) derivation so old and new builds still pair.
         #[serde(default)]
         connection_salt: Option<[u8; 32]>,
+        /// Whether the joiner understands the explicit [`OuterFrame::JoinAccepted`]
+        /// acknowledgement. Optional for wire backward compatibility: peers
+        /// that predate the field send `None`/`false` and the relay never
+        /// sends them `JoinAccepted` (their decoders would reject the unknown
+        /// frame), so they keep using the timing-based rejection probe.
+        #[serde(default)]
+        supports_join_accepted: bool,
     },
+    /// Explicit acknowledgement that the relay admitted this connection's
+    /// `Join`. Only sent to joiners that set `supports_join_accepted`; it is
+    /// authoritative and replaces the 200ms "no error frame yet" probe as the
+    /// join-success signal (the probe remains as a fallback for old relays).
+    JoinAccepted,
     PeerJoined {
         role: Role,
         device_pubkey: [u8; 32],
@@ -536,7 +579,96 @@ pub enum OuterFrame {
     Pong,
     Error {
         message: String,
+        /// Stable machine-readable reason. Optional for wire backward
+        /// compatibility: relays that predate it send only `message`, and
+        /// codes unknown to this build decode as `None` so apps fall back to
+        /// message-based classification.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_error_code"
+        )]
+        code: Option<RelayErrorCode>,
     },
+}
+
+/// Stable machine-readable relay error codes, so peers classify failures
+/// without parsing natural-language messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayErrorCode {
+    InvalidRoomId,
+    ServerAtCapacity,
+    JoinTimeout,
+    FrameTooLarge,
+    InvalidJoin,
+    JoinRoomRoleMismatch,
+    PeerNotRegistered,
+    AdmissionRejected,
+    JoinNotificationFailed,
+    HeartbeatTimeout,
+    RateLimited,
+    RoomExpired,
+}
+
+impl RelayErrorCode {
+    /// Whether an app should auto-reconnect after this error.
+    pub fn is_retryable(self) -> bool {
+        match self {
+            RelayErrorCode::ServerAtCapacity
+            | RelayErrorCode::JoinTimeout
+            | RelayErrorCode::PeerNotRegistered
+            | RelayErrorCode::JoinNotificationFailed
+            | RelayErrorCode::HeartbeatTimeout
+            | RelayErrorCode::RateLimited => true,
+            RelayErrorCode::InvalidRoomId
+            | RelayErrorCode::FrameTooLarge
+            | RelayErrorCode::InvalidJoin
+            | RelayErrorCode::JoinRoomRoleMismatch
+            | RelayErrorCode::AdmissionRejected
+            | RelayErrorCode::RoomExpired => false,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelayErrorCode::InvalidRoomId => "invalid_room_id",
+            RelayErrorCode::ServerAtCapacity => "server_at_capacity",
+            RelayErrorCode::JoinTimeout => "join_timeout",
+            RelayErrorCode::FrameTooLarge => "frame_too_large",
+            RelayErrorCode::InvalidJoin => "invalid_join",
+            RelayErrorCode::JoinRoomRoleMismatch => "join_room_role_mismatch",
+            RelayErrorCode::PeerNotRegistered => "peer_not_registered",
+            RelayErrorCode::AdmissionRejected => "admission_rejected",
+            RelayErrorCode::JoinNotificationFailed => "join_notification_failed",
+            RelayErrorCode::HeartbeatTimeout => "heartbeat_timeout",
+            RelayErrorCode::RateLimited => "rate_limited",
+            RelayErrorCode::RoomExpired => "room_expired",
+        }
+    }
+}
+
+/// Decode an error code while mapping values this build does not recognize to
+/// `None`, so newer relays can add codes without breaking older peers.
+fn deserialize_error_code<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<RelayErrorCode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CodeOrUnknown {
+        Known(RelayErrorCode),
+        Unknown(serde::de::IgnoredAny),
+    }
+
+    Ok(
+        match Option::<CodeOrUnknown>::deserialize(deserializer)? {
+            Some(CodeOrUnknown::Known(code)) => Some(code),
+            _ => None,
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,7 +676,9 @@ pub enum OuterFrame {
 pub enum PlainMsg {
     HelloV2(HelloV2),
     HelloAckV2(HelloAckV2),
+    ProtocolRejectV2(ProtocolRejectV2),
     ResumeV2(ResumeV2),
+    ResumeAcceptedV2(ResumeAcceptedV2),
     ProcessExit { code: Option<i32> },
     TerminalSnapshotV2(TerminalSnapshotV2),
     TerminalPatchV2(TerminalPatchV2),
@@ -826,7 +960,9 @@ pub fn plain_msg_type(msg: &PlainMsg) -> &'static [u8] {
     match msg {
         PlainMsg::HelloV2(_) => b"hello_v2",
         PlainMsg::HelloAckV2(_) => b"hello_ack_v2",
+        PlainMsg::ProtocolRejectV2(_) => b"protocol_reject_v2",
         PlainMsg::ResumeV2(_) => b"resume_v2",
+        PlainMsg::ResumeAcceptedV2(_) => b"resume_accepted_v2",
         PlainMsg::ProcessExit { .. } => b"process_exit",
         PlainMsg::TerminalSnapshotV2(_) => b"terminal_snapshot_v2",
         PlainMsg::TerminalPatchV2(_) => b"terminal_patch_v2",
@@ -864,8 +1000,10 @@ pub fn plain_msg_types() -> &'static [&'static [u8]] {
         b"request_transcript_v2",
         b"transcript_chunk_v2",
         b"resume_v2",
+        b"resume_accepted_v2",
         b"hello_ack_v2",
         b"hello_v2",
+        b"protocol_reject_v2",
         b"cli_status",
         b"cli_metadata",
         b"process_exit",
@@ -944,6 +1082,131 @@ mod capability_decode_tests {
             other => panic!("expected hello_ack_v2, got {other:?}"),
         }
     }
+
+    #[derive(Serialize)]
+    struct RawErrorBody {
+        message: &'static str,
+        code: &'static str,
+    }
+
+    #[derive(Serialize)]
+    struct RawError {
+        error: RawErrorBody,
+    }
+
+    #[derive(Serialize)]
+    struct RawLegacyErrorBody {
+        message: &'static str,
+    }
+
+    #[derive(Serialize)]
+    struct RawLegacyError {
+        error: RawLegacyErrorBody,
+    }
+
+    #[test]
+    fn error_frame_round_trips_stable_code() {
+        let wire = encode_frame(&OuterFrame::Error {
+            message: "inbound rate limit exceeded".to_string(),
+            code: Some(RelayErrorCode::RateLimited),
+        })
+        .expect("encode error frame");
+
+        match decode_frame(&wire).expect("decode error frame") {
+            OuterFrame::Error { message, code } => {
+                assert_eq!(message, "inbound rate limit exceeded");
+                assert_eq!(code, Some(RelayErrorCode::RateLimited));
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_frame_without_code_decodes_as_none() {
+        let wire = rmp_serde::to_vec_named(&RawLegacyError {
+            error: RawLegacyErrorBody {
+                message: "room expired",
+            },
+        })
+        .expect("encode legacy error");
+
+        match decode_frame(&wire).expect("decode legacy error") {
+            OuterFrame::Error { message, code } => {
+                assert_eq!(message, "room expired");
+                assert_eq!(code, None);
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_frame_with_unknown_code_decodes_as_none() {
+        let wire = rmp_serde::to_vec_named(&RawError {
+            error: RawErrorBody {
+                message: "something new",
+                code: "future_unknown_code",
+            },
+        })
+        .expect("encode raw error");
+
+        match decode_frame(&wire).expect("decode error with unknown code") {
+            OuterFrame::Error { message, code } => {
+                assert_eq!(message, "something new");
+                assert_eq!(code, None);
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_error_code_retryability_matrix() {
+        assert!(RelayErrorCode::ServerAtCapacity.is_retryable());
+        assert!(RelayErrorCode::JoinTimeout.is_retryable());
+        assert!(RelayErrorCode::PeerNotRegistered.is_retryable());
+        assert!(RelayErrorCode::JoinNotificationFailed.is_retryable());
+        assert!(RelayErrorCode::HeartbeatTimeout.is_retryable());
+        assert!(RelayErrorCode::RateLimited.is_retryable());
+        assert!(!RelayErrorCode::InvalidRoomId.is_retryable());
+        assert!(!RelayErrorCode::FrameTooLarge.is_retryable());
+        assert!(!RelayErrorCode::InvalidJoin.is_retryable());
+        assert!(!RelayErrorCode::JoinRoomRoleMismatch.is_retryable());
+        assert!(!RelayErrorCode::AdmissionRejected.is_retryable());
+        assert!(!RelayErrorCode::RoomExpired.is_retryable());
+    }
+
+    #[test]
+    fn resume_accepted_v2_round_trips() {
+        let wire = rmp_serde::to_vec_named(&PlainMsg::ResumeAcceptedV2(ResumeAcceptedV2 {
+            mode: ResumeAcceptMode::ReplayingPatches,
+            target_state_seq: 42,
+        }))
+        .expect("encode resume accepted");
+
+        match decode_plain_msg(&wire).expect("decode resume accepted") {
+            PlainMsg::ResumeAcceptedV2(accepted) => {
+                assert_eq!(accepted.mode, ResumeAcceptMode::ReplayingPatches);
+                assert_eq!(accepted.target_state_seq, 42);
+            }
+            other => panic!("expected resume_accepted_v2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_reject_v2_round_trips() {
+        let wire = rmp_serde::to_vec_named(&PlainMsg::ProtocolRejectV2(ProtocolRejectV2 {
+            reason: "no shared protocol version".to_string(),
+            supported_versions: vec![2],
+        }))
+        .expect("encode protocol reject");
+
+        match decode_plain_msg(&wire).expect("decode protocol reject") {
+            PlainMsg::ProtocolRejectV2(reject) => {
+                assert_eq!(reject.reason, "no shared protocol version");
+                assert_eq!(reject.supported_versions, vec![2]);
+            }
+            other => panic!("expected protocol_reject_v2, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -980,6 +1243,7 @@ mod android_wire_compat_tests {
                 pairing_token_proof,
                 relay_admission,
                 connection_salt,
+                supports_join_accepted: _,
             } => {
                 assert_eq!(room_id, "room-1");
                 assert_eq!(role, Role::App);

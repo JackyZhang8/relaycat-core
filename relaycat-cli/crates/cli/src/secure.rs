@@ -233,6 +233,7 @@ impl AppSecureHandshake {
                 self.material.room_id.as_bytes(),
             )),
             connection_salt: Some(app_salt),
+            supports_join_accepted: false,
         }
     }
 
@@ -316,6 +317,7 @@ pub fn secure_join_frame(handshake: &CliSecureHandshake) -> OuterFrame {
             handshake.room_id().as_bytes(),
         )),
         connection_salt: Some(cli_salt),
+        supports_join_accepted: false,
     }
 }
 

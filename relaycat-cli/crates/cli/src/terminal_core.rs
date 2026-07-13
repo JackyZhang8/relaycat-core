@@ -1025,6 +1025,12 @@ impl TerminalCore {
         self.history_frozen
     }
 
+    /// The state seq an app will have applied once it has caught up with the
+    /// CLI-side model.
+    pub fn current_state_seq(&self) -> u64 {
+        self.state_seq
+    }
+
     pub(crate) fn debug_snapshot(&self) -> TerminalCoreDebugSnapshot {
         let mut screen = self.parser.screen().clone();
         screen.set_scrollback(usize::MAX);

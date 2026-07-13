@@ -23,14 +23,14 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dashmap::DashMap;
 use futures_util::StreamExt;
-use relaycat_protocol::{OuterFrame, Role, decode_frame, encode_frame};
+use relaycat_protocol::{OuterFrame, RelayErrorCode, Role, decode_frame, encode_frame};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::sync::mpsc;
 
 use crate::{
     config::RelayConfig,
-    hub::{AdmissionCheck, CloseSignal, Hub, HubStats, JoinRequest},
+    hub::{AdmissionCheck, CloseSignal, Hub, HubError, HubStats, JoinRequest},
     room::ConnId,
     xfyun::{RtasrUrlResponse, signed_rtasr_url},
 };
@@ -255,6 +255,7 @@ mod tests {
     fn outbound_frame_guard_returns_error_instead_of_silent_drop() {
         let oversized = OuterFrame::Error {
             message: "x".repeat(MAX_BINARY_FRAME_BYTES),
+            code: None,
         };
 
         assert!(encode_outbound_frame(&oversized).is_err());
@@ -794,7 +795,7 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
                 "invalid room_id",
             ),
         );
-        let _ = send_error(&mut socket, "invalid room_id").await;
+        let _ = send_error(&mut socket, RelayErrorCode::InvalidRoomId, "invalid room_id").await;
         return;
     }
 
@@ -808,7 +809,12 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
                 "server at connection limit",
             ),
         );
-        let _ = send_error(&mut socket, "server at connection limit").await;
+        let _ = send_error(
+            &mut socket,
+            RelayErrorCode::ServerAtCapacity,
+            "server at connection limit",
+        )
+        .await;
         return;
     }
 
@@ -828,7 +834,7 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
                 "WARN",
                 rejected_log(&query.room_id, query.role, conn_id, "join timed out"),
             );
-            let _ = send_error(&mut socket, "join timed out").await;
+            let _ = send_error(&mut socket, RelayErrorCode::JoinTimeout, "join timed out").await;
             return;
         }
         Ok(Some(Ok(Message::Binary(bytes)))) => bytes,
@@ -874,7 +880,12 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
                 "initial binary frame exceeds size limit",
             ),
         );
-        let _ = send_error(&mut socket, "binary frame exceeds size limit").await;
+        let _ = send_error(
+            &mut socket,
+            RelayErrorCode::FrameTooLarge,
+            "binary frame exceeds size limit",
+        )
+        .await;
         return;
     }
 
@@ -886,6 +897,7 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
         pairing_token_proof,
         relay_admission,
         connection_salt,
+        supports_join_accepted,
     }) = join
     else {
         relaycat_log(
@@ -897,7 +909,12 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
                 "initial binary frame was not valid join",
             ),
         );
-        let _ = send_error(&mut socket, "initial binary frame was not valid join").await;
+        let _ = send_error(
+            &mut socket,
+            RelayErrorCode::InvalidJoin,
+            "initial binary frame was not valid join",
+        )
+        .await;
         return;
     };
     if room_id != query.room_id || role != query.role {
@@ -914,7 +931,12 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
                 ),
             ),
         );
-        let _ = send_error(&mut socket, "join room/role mismatch").await;
+        let _ = send_error(
+            &mut socket,
+            RelayErrorCode::JoinRoomRoleMismatch,
+            "join room/role mismatch",
+        )
+        .await;
         return;
     }
 
@@ -964,7 +986,7 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
                     &format!("room join failed: {error}"),
                 ),
             );
-            let _ = send_error(&mut socket, &error.to_string()).await;
+            let _ = send_error(&mut socket, join_error_code(&error), &error.to_string()).await;
             return;
         }
         Ok(true) => {
@@ -977,6 +999,28 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
             );
         }
         Ok(false) => {}
+    }
+
+    // Explicit join acknowledgement (P3-1): joiners that advertise support
+    // treat this frame as the authoritative "admitted" signal instead of the
+    // timing-based rejection probe. Sent directly on the socket before the
+    // outbound queue is drained, so it precedes any PeerJoined notification.
+    if supports_join_accepted {
+        if let Ok(bytes) = encode_frame(&OuterFrame::JoinAccepted) {
+            if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                state.hub.leave(&query.room_id, query.role, conn_id);
+                relaycat_log(
+                    "WARN",
+                    rejected_log(
+                        &query.room_id,
+                        query.role,
+                        conn_id,
+                        "failed to send join_accepted",
+                    ),
+                );
+                return;
+            }
+        }
     }
 
     relaycat_log("INFO", connected_log(&query.room_id, query.role, conn_id));
@@ -1040,7 +1084,12 @@ async fn relay_socket_frames(
             }
             _ = heartbeat.tick() => {
                 if last_client_seen.elapsed() > CLIENT_PONG_TIMEOUT {
-                    let _ = send_error(&mut socket, "client heartbeat timeout").await;
+                    let _ = send_error(
+                        &mut socket,
+                        RelayErrorCode::HeartbeatTimeout,
+                        "client heartbeat timeout",
+                    )
+                    .await;
                     break;
                 }
                 if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
@@ -1082,7 +1131,12 @@ async fn relay_socket_frames(
                     Ok(Message::Binary(bytes)) => {
                         last_client_seen = Instant::now();
                         if !binary_frame_within_limit(bytes.len(), limits.max_binary_frame_bytes) {
-                            let _ = send_error(&mut socket, "binary frame exceeds size limit").await;
+                            let _ = send_error(
+                                &mut socket,
+                                RelayErrorCode::FrameTooLarge,
+                                "binary frame exceeds size limit",
+                            )
+                            .await;
                             relaycat_log(
                                 "WARN",
                                 format!(
@@ -1096,7 +1150,12 @@ async fn relay_socket_frames(
                             break;
                         }
                         if !rate_limiter.allow(bytes.len()) {
-                            let _ = send_error(&mut socket, "inbound rate limit exceeded").await;
+                            let _ = send_error(
+                                &mut socket,
+                                RelayErrorCode::RateLimited,
+                                "inbound rate limit exceeded",
+                            )
+                            .await;
                             relaycat_log(
                                 "WARN",
                                 format!(
@@ -1147,7 +1206,12 @@ async fn relay_socket_frames(
                         if !binary_frame_within_limit(text.len(), limits.max_binary_frame_bytes)
                             || !rate_limiter.allow(text.len())
                         {
-                            let _ = send_error(&mut socket, "inbound rate limit exceeded").await;
+                            let _ = send_error(
+                                &mut socket,
+                                RelayErrorCode::RateLimited,
+                                "inbound rate limit exceeded",
+                            )
+                            .await;
                             relaycat_log(
                                 "WARN",
                                 format!(
@@ -1164,8 +1228,12 @@ async fn relay_socket_frames(
                         last_client_seen = Instant::now();
                         // Charge ping/pong floods against the same budget.
                         if !rate_limiter.allow(payload.len()) {
-                            let _ =
-                                send_error(&mut socket, "inbound rate limit exceeded").await;
+                            let _ = send_error(
+                                &mut socket,
+                                RelayErrorCode::RateLimited,
+                                "inbound rate limit exceeded",
+                            )
+                            .await;
                             relaycat_log(
                                 "WARN",
                                 format!(
@@ -1375,11 +1443,25 @@ async fn send_frame(socket: &mut WebSocket, frame: &OuterFrame) -> anyhow::Resul
     Ok(())
 }
 
-async fn send_error(socket: &mut WebSocket, message: &str) -> anyhow::Result<()> {
+fn join_error_code(error: &HubError) -> RelayErrorCode {
+    match error {
+        HubError::Room(_) => RelayErrorCode::InvalidJoin,
+        HubError::PeerMissing { .. } => RelayErrorCode::PeerNotRegistered,
+        HubError::AdmissionRejected => RelayErrorCode::AdmissionRejected,
+        HubError::JoinNotificationFailed => RelayErrorCode::JoinNotificationFailed,
+    }
+}
+
+async fn send_error(
+    socket: &mut WebSocket,
+    code: RelayErrorCode,
+    message: &str,
+) -> anyhow::Result<()> {
     send_frame(
         socket,
         &OuterFrame::Error {
             message: message.to_string(),
+            code: Some(code),
         },
     )
     .await

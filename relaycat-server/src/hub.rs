@@ -4,7 +4,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use relaycat_protocol::{OuterFrame, Role};
+use relaycat_protocol::{OuterFrame, RelayErrorCode, Role};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -500,6 +500,7 @@ impl Hub {
             }) {
                 room.notify_all(OuterFrame::Error {
                     message: "room expired".to_string(),
+                    code: Some(RelayErrorCode::RoomExpired),
                 });
                 removed += 1;
             }

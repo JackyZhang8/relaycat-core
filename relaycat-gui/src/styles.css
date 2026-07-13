@@ -294,6 +294,10 @@ button {
   background: var(--yellow);
   animation: pulse 1.4s infinite;
 }
+.st.syncing {
+  background: var(--yellow);
+  animation: pulse 1.4s infinite;
+}
 .st.paired {
   background: var(--green);
   box-shadow: 0 0 8px rgba(63, 185, 80, 0.6);

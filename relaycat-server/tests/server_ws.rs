@@ -1,5 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
-use relaycat_protocol::{OuterFrame, Role, decode_frame, encode_frame};
+use relaycat_protocol::{OuterFrame, RelayErrorCode, Role, decode_frame, encode_frame};
 use relaycat_relay::server::MAX_BINARY_FRAME_BYTES;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tower::ServiceExt;
@@ -74,6 +74,7 @@ async fn websocket_join_notifies_existing_peer_with_peer_joined() {
                 device_pubkey: [1; 32],
                 pairing_token_proof: None,
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -95,6 +96,7 @@ async fn websocket_join_notifies_existing_peer_with_peer_joined() {
                 device_pubkey: [2; 32],
                 pairing_token_proof: Some([9; 32]),
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -123,6 +125,95 @@ async fn websocket_join_notifies_existing_peer_with_peer_joined() {
             connection_salt: None,
         }
     );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn websocket_join_accepted_sent_when_advertised() {
+    if std::env::var_os("RELAYCAT_RUN_NET_TESTS").is_none() {
+        eprintln!("skipping network test; set RELAYCAT_RUN_NET_TESTS=1 to run");
+        return;
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let app = relaycat_relay::server::app(relaycat_relay::server::AppState::default());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server failed");
+    });
+
+    let (cli_socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=cli"))
+        .await
+        .expect("cli connect");
+    let (mut cli_writer, _cli_reader) = cli_socket.split();
+    cli_writer
+        .send(Message::Binary(
+            encode_frame(&OuterFrame::Join {
+                room_id: "room-1".to_string(),
+                role: Role::Cli,
+                device_pubkey: [1; 32],
+                pairing_token_proof: None,
+                relay_admission: None,
+                connection_salt: None,
+                supports_join_accepted: false,
+            })
+            .expect("encode cli join")
+            .into(),
+        ))
+        .await
+        .expect("send cli join");
+
+    let (app_socket, _) = connect_async(format!("ws://{addr}/ws?room_id=room-1&role=app"))
+        .await
+        .expect("app connect");
+    let (mut app_writer, mut app_reader) = app_socket.split();
+    app_writer
+        .send(Message::Binary(
+            encode_frame(&OuterFrame::Join {
+                room_id: "room-1".to_string(),
+                role: Role::App,
+                device_pubkey: [2; 32],
+                pairing_token_proof: Some([9; 32]),
+                relay_admission: None,
+                connection_salt: None,
+                supports_join_accepted: true,
+            })
+            .expect("encode app join")
+            .into(),
+        ))
+        .await
+        .expect("send app join");
+
+    // The advertising joiner's very first frame must be JoinAccepted, before
+    // any PeerJoined notification for the already-present CLI.
+    let message = app_reader
+        .next()
+        .await
+        .expect("join accepted message")
+        .expect("join accepted websocket message");
+    let Message::Binary(bytes) = message else {
+        panic!("expected binary JoinAccepted, got {message:?}");
+    };
+    assert_eq!(
+        decode_frame(&bytes).expect("decode join accepted"),
+        OuterFrame::JoinAccepted
+    );
+
+    let message = app_reader
+        .next()
+        .await
+        .expect("peer joined message")
+        .expect("peer joined websocket message");
+    let Message::Binary(bytes) = message else {
+        panic!("expected binary PeerJoined, got {message:?}");
+    };
+    assert!(matches!(
+        decode_frame(&bytes).expect("decode peer joined"),
+        OuterFrame::PeerJoined { role: Role::Cli, .. }
+    ));
 
     server.abort();
 }
@@ -158,6 +249,7 @@ async fn websocket_forwards_connection_salt_to_both_peers() {
                 device_pubkey: [1; 32],
                 pairing_token_proof: Some([7; 32]),
                 relay_admission: None,
+                supports_join_accepted: false,
                 connection_salt: Some(cli_salt),
             })
             .expect("encode cli join")
@@ -178,6 +270,7 @@ async fn websocket_forwards_connection_salt_to_both_peers() {
                 device_pubkey: [2; 32],
                 pairing_token_proof: Some([9; 32]),
                 relay_admission: None,
+                supports_join_accepted: false,
                 connection_salt: Some(app_salt),
             })
             .expect("encode app join")
@@ -238,6 +331,7 @@ async fn websocket_app_disconnect_then_reconnect_only_notifies_cli_on_rejoin() {
                 device_pubkey: [1; 32],
                 pairing_token_proof: None,
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -259,6 +353,7 @@ async fn websocket_app_disconnect_then_reconnect_only_notifies_cli_on_rejoin() {
                 device_pubkey: [2; 32],
                 pairing_token_proof: Some([9; 32]),
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -296,6 +391,7 @@ async fn websocket_app_disconnect_then_reconnect_only_notifies_cli_on_rejoin() {
                 device_pubkey: [3; 32],
                 pairing_token_proof: Some([8; 32]),
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -347,6 +443,7 @@ async fn websocket_allows_repeated_app_reconnects_for_same_room() {
                 device_pubkey: [1; 32],
                 pairing_token_proof: None,
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -369,6 +466,7 @@ async fn websocket_allows_repeated_app_reconnects_for_same_room() {
                     device_pubkey: [attempt; 32],
                     pairing_token_proof: Some([attempt + 10; 32]),
                     relay_admission: None,
+                    supports_join_accepted: false,
 
                     connection_salt: None,
                 })
@@ -426,6 +524,7 @@ async fn websocket_cli_reconnect_notifies_app_with_peer_joined_without_peer_left
                 device_pubkey: [1; 32],
                 pairing_token_proof: None,
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -447,6 +546,7 @@ async fn websocket_cli_reconnect_notifies_app_with_peer_joined_without_peer_left
                 device_pubkey: [2; 32],
                 pairing_token_proof: Some([9; 32]),
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -468,6 +568,7 @@ async fn websocket_cli_reconnect_notifies_app_with_peer_joined_without_peer_left
                 device_pubkey: [3; 32],
                 pairing_token_proof: None,
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -523,10 +624,11 @@ async fn websocket_rejects_oversized_initial_binary_frame_with_error() {
     let Message::Binary(bytes) = message else {
         panic!("expected binary Error, got {message:?}");
     };
-    let OuterFrame::Error { message } = decode_frame(&bytes).expect("decode error") else {
+    let OuterFrame::Error { message, code } = decode_frame(&bytes).expect("decode error") else {
         panic!("expected protocol Error");
     };
     assert!(message.contains("size limit"));
+    assert_eq!(code, Some(RelayErrorCode::FrameTooLarge));
 
     server.abort();
 }
@@ -558,6 +660,7 @@ async fn websocket_rejects_oversized_binary_frame_after_join_with_error() {
                 device_pubkey: [1; 32],
                 pairing_token_proof: None,
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -579,10 +682,11 @@ async fn websocket_rejects_oversized_binary_frame_after_join_with_error() {
     let Message::Binary(bytes) = message else {
         panic!("expected binary Error, got {message:?}");
     };
-    let OuterFrame::Error { message } = decode_frame(&bytes).expect("decode error") else {
+    let OuterFrame::Error { message, code } = decode_frame(&bytes).expect("decode error") else {
         panic!("expected protocol Error");
     };
     assert!(message.contains("size limit"));
+    assert_eq!(code, Some(RelayErrorCode::FrameTooLarge));
 
     server.abort();
 }
@@ -614,6 +718,7 @@ async fn websocket_replies_to_protocol_ping_with_pong() {
                 device_pubkey: [1; 32],
                 pairing_token_proof: None,
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -670,6 +775,7 @@ async fn websocket_rejects_inbound_message_rate_burst_with_error() {
                 device_pubkey: [1; 32],
                 pairing_token_proof: None,
                 relay_admission: None,
+                supports_join_accepted: false,
 
                 connection_salt: None,
             })
@@ -694,8 +800,9 @@ async fn websocket_rejects_inbound_message_rate_burst_with_error() {
         let Message::Binary(bytes) = message else {
             continue;
         };
-        if let OuterFrame::Error { message } = decode_frame(&bytes).expect("decode frame") {
+        if let OuterFrame::Error { message, code } = decode_frame(&bytes).expect("decode frame") {
             assert!(message.contains("rate limit"));
+            assert_eq!(code, Some(RelayErrorCode::RateLimited));
             saw_error = true;
             break;
         }

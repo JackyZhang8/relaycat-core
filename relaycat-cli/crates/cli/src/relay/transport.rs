@@ -165,6 +165,7 @@ impl RelayTransportReconnect {
                     // Plaintext dev relay carries no end-to-end encryption, so
                     // there is no key derivation to salt.
                     connection_salt: None,
+                    supports_join_accepted: false,
                 };
                 ws_send(&mut ws_writer, Message::Binary(encode_frame(&join)?.into()))
                     .await

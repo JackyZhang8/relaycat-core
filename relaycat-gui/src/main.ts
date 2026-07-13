@@ -32,7 +32,13 @@ type SessionInfo = { id: string; title: string; mode: string; log_path?: string 
 type OutputEvent = { id: string; data: number[] };
 type StatusEvent = { id: string; state: string; code?: number };
 type PairingEvent = { id: string; url: string };
-type RelayEvent = { id: string; state: string };
+type RelayEvent = {
+  id: string;
+  state: string;
+  code?: string;
+  retryable?: boolean;
+  message?: string;
+};
 type Diag = {
   relay_engine: string;
   gui_exe: string;
@@ -41,7 +47,7 @@ type Diag = {
   recent_path: string;
 };
 
-type TabState = "local" | "wait" | "paired" | "exited";
+type TabState = "local" | "wait" | "syncing" | "paired" | "exited";
 
 interface Tab {
   id: string;
@@ -985,9 +991,11 @@ function labelForTab(tab: Tab): string {
       ? ` · ${t("st_exited")}`
       : tab.state === "wait"
         ? ` · ${t("st_wait")}`
-        : tab.state === "paired"
-          ? ` · ${t("st_paired")}`
-          : "";
+        : tab.state === "syncing"
+          ? ` · ${t("st_syncing")}`
+          : tab.state === "paired"
+            ? ` · ${t("st_paired")}`
+            : "";
   return `${parseTitle(tab.title).base}${suffix}`;
 }
 
@@ -1496,7 +1504,11 @@ function renderStatusbar() {
     if (tab.state !== "paired") dot.style.background = "var(--yellow)";
     const txt = el("span");
     txt.textContent =
-      tab.state === "paired" ? t("paired_devices", Math.max(1, tab.peers)) : t("st_wait");
+      tab.state === "paired"
+        ? t("paired_devices", Math.max(1, tab.peers))
+        : tab.state === "syncing"
+          ? t("st_syncing")
+          : t("st_wait");
     const qrIcon = el("span", "relaypill-qr");
     qrIcon.innerHTML =
       '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M3 3h8v8H3V3zm2 2v4h4V5H5zm8-2h8v8h-8V3zm2 2v4h4V5h-4zM3 13h8v8H3v-8zm2 2v4h4v-4H5zm13-2h3v2h-3v-2zm-5 0h3v3h-2v-1h-1v-2zm5 5h3v3h-3v-3zm-5 0h3v3h-3v-3z"/></svg>';
@@ -2115,9 +2127,12 @@ function wireEvents() {
   listen<RelayEvent>("session://relay", (event) => {
     const tab = tabs.find((t) => t.id === event.payload.id);
     if (!tab || tab.state === "exited") return;
-    if (event.payload.state === "paired") {
+    const state = event.payload.state;
+    if (state === "paired") {
+      // Green only when the terminal stream is actually live, not merely
+      // when the secure session was accepted.
+      if (tab.state !== "paired") tab.peers = Math.max(1, tab.peers + 1);
       tab.state = "paired";
-      tab.peers = Math.max(1, tab.peers + 1);
       refreshTabEl(tab);
       renderStatusbar();
       // If the QR is on screen for this tab, swap it for the auto-closing
@@ -2125,6 +2140,17 @@ function wireEvents() {
       if (pairingTabId === tab.id && $("#ov-pair").classList.contains("show")) {
         showPairingSuccess(tab);
       }
+    } else if (state === "syncing" || state === "wait") {
+      tab.state = state;
+      refreshTabEl(tab);
+      renderStatusbar();
+    } else if (state === "error") {
+      // Stable relay error propagated from the CLI log: show the same
+      // code-derived reason/retryability the mobile apps present.
+      const code = event.payload.code ?? "unknown";
+      const hint = event.payload.retryable ? t("relay_err_retryable") : t("relay_err_fatal");
+      const detail = event.payload.message ? `: ${event.payload.message}` : "";
+      tab.term.writeln(`\r\n\x1b[33m${t("relay_err_line", code, hint)}${detail}\x1b[0m`);
     }
   });
 }

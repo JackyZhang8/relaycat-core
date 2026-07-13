@@ -117,14 +117,51 @@ fn join_frame_carries_optional_pairing_proof() {
         device_pubkey: [3; 32],
         pairing_token_proof: Some([9; 32]),
         relay_admission: None,
-
         connection_salt: None,
+        supports_join_accepted: false,
     };
 
     let encoded = encode_frame(&frame).expect("encode frame");
     let decoded = decode_frame(&encoded).expect("decode frame");
 
     assert_eq!(decoded, frame);
+}
+
+#[test]
+fn join_accepted_round_trips() {
+    let frame = OuterFrame::JoinAccepted;
+    let encoded = encode_frame(&frame).expect("encode frame");
+    assert_eq!(decode_frame(&encoded).expect("decode frame"), frame);
+}
+
+#[test]
+fn join_without_supports_join_accepted_decodes_as_false() {
+    // Wire back-compat: a Join encoded by a peer that predates the field must
+    // decode with `supports_join_accepted == false`.
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyOuterFrame {
+        Join {
+            room_id: String,
+            role: Role,
+            device_pubkey: [u8; 32],
+            pairing_token_proof: Option<[u8; 32]>,
+        },
+    }
+    let legacy = rmp_serde::to_vec_named(&LegacyOuterFrame::Join {
+        room_id: "room-1".to_string(),
+        role: Role::App,
+        device_pubkey: [3; 32],
+        pairing_token_proof: None,
+    })
+    .expect("encode legacy join");
+    match decode_frame(&legacy).expect("decode legacy join") {
+        OuterFrame::Join {
+            supports_join_accepted,
+            ..
+        } => assert!(!supports_join_accepted),
+        other => panic!("expected join, got {other:?}"),
+    }
 }
 
 #[test]
@@ -174,6 +211,40 @@ fn hello_v2_round_trips_with_capabilities() {
         msg
     );
     assert_eq!(plain_msg_type(&msg), b"hello_v2");
+}
+
+#[test]
+fn hello_v2_drops_unknown_future_capabilities_on_decode() {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum FuturePlainMsg {
+        HelloV2 {
+            protocol_versions: Vec<u16>,
+            capabilities: Vec<String>,
+        },
+    }
+
+    let encoded = rmp_serde::to_vec_named(&FuturePlainMsg::HelloV2 {
+        protocol_versions: vec![2, 3],
+        capabilities: vec![
+            "terminal_state".to_string(),
+            "holographic_output".to_string(),
+            "snapshot_recovery".to_string(),
+        ],
+    })
+    .expect("encode future hello");
+
+    let PlainMsg::HelloV2(hello) = decode_plain_msg(&encoded).expect("decode future hello") else {
+        panic!("expected hello_v2");
+    };
+    assert_eq!(hello.protocol_versions, vec![2, 3]);
+    assert_eq!(
+        hello.capabilities,
+        vec![
+            ProtocolCapabilityV2::TerminalState,
+            ProtocolCapabilityV2::SnapshotRecovery,
+        ]
+    );
 }
 
 #[test]
@@ -843,7 +914,7 @@ fn plain_msg_types_are_unique_and_complete() {
     );
     assert_eq!(
         labels.len(),
-        17,
+        19,
         "label count drifted from PlainMsg variants"
     );
 }

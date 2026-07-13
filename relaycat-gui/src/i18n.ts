@@ -88,10 +88,14 @@ export const I18N: Record<Lang, Record<string, string>> = {
     relay_failed_tool: "工具启动失败，请确认所选工具已正确安装。",
     relay_retry: "重试",
     relay_help: "查看帮助",
+    relay_err_line: "Relay 错误（{0}，{1}）",
+    relay_err_retryable: "可重试",
+    relay_err_fatal: "不可重试",
 
     // status / tabs
     st_exited: "已退出",
     st_wait: "等待配对",
+    st_syncing: "同步中",
     st_paired: "已配对",
     local_mode: "本地模式",
     view_qr: "查看配对二维码",
@@ -420,9 +424,13 @@ export const I18N: Record<Lang, Record<string, string>> = {
     relay_failed_tool: "Couldn't start the tool. Make sure the selected tool is installed.",
     relay_retry: "Retry",
     relay_help: "Get help",
+    relay_err_line: "Relay error ({0}, {1})",
+    relay_err_retryable: "retryable",
+    relay_err_fatal: "not retryable",
 
     st_exited: "exited",
     st_wait: "waiting",
+    st_syncing: "syncing",
     st_paired: "paired",
     local_mode: "Local mode",
     view_qr: "View pairing QR",

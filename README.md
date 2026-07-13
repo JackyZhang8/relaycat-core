@@ -349,7 +349,7 @@ relaycat-relay-v<version>
 .github/workflows/release-relay.yml
 ```
 
-三个产品不要求同步升级版本。
+三个产品不要求同步升级版本：App 与 CLI 通过 Hello/HelloAck 协商取双方版本交集中的最高版本（相邻版本可互通），并校验 `terminal_state`、`snapshot_recovery` 两个 mandatory capabilities；版本无交集或缺少 mandatory capability 时会返回明确的 `ProtocolRejectV2`（提示升级较旧一侧），不会静默降级。未知的 optional capability 会在解码时被忽略，保证向前兼容。
 
 ## 相关文档
 

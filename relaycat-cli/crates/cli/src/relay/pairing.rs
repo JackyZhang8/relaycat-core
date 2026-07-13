@@ -402,8 +402,8 @@ pub async fn run_secure_pairing_prepared(prepared: PreparedSecurePairing) -> Res
             continue;
         };
         let frame = decode_frame(&bytes).context("failed to decode relay frame")?;
-        if let OuterFrame::Error { message } = &frame {
-            anyhow::bail!("relay rejected connection: {message}");
+        if let OuterFrame::Error { message, code } = &frame {
+            anyhow::bail!("{}", relay_error_description(message, *code));
         }
         log_received_peer_joined(&frame);
         if let Some(keys) = handshake.accept_peer_joined(&frame)? {
@@ -472,9 +472,10 @@ pub(crate) async fn run_secure_pairing_prepared_with_launcher_controls(
             Ok(frame) => frame,
             Err(err) => return Ok(PairingRunOutcome::PairingFailed(err)),
         };
-        if let OuterFrame::Error { message } = &frame {
+        if let OuterFrame::Error { message, code } = &frame {
             return Ok(PairingRunOutcome::PairingFailed(anyhow::anyhow!(
-                "relay rejected connection: {message}"
+                "{}",
+                relay_error_description(message, *code)
             )));
         }
         log_received_peer_joined(&frame);

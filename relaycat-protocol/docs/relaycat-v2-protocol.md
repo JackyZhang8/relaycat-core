@@ -1,6 +1,18 @@
-# RelayCat v2 Protocol 数据结构说明
+# RelayCat Protocol 数据结构说明
 
-本文档按当前代码实现整理 v2 协议的数据结构与字段含义。主要来源：
+本文档按当前代码实现整理协议的数据结构与字段含义。
+
+协议中有两个独立的版本号，注意区分：
+
+- **Secure transport protocol**：当前为 `relaycat-v3`（domain separator 常量，见
+  `relaycat-cli/crates/crypto/src/lib.rs` 的 `PROTOCOL_VERSION`）。覆盖
+  pairing proof、relay admission、session key 派生和 AEAD AAD。v3 将双方
+  per-connection salt 设为 mandatory（无 salt 即拒绝，杜绝降级）。v3 与 v2
+  的密钥派生上下文不同，因此 v3 端**无法**与 v2 端互通。
+- **Terminal state protocol**：当前为 `TERMINAL_STATE_PROTOCOL_V2 = 2`，通过
+  加密通道内的 `hello_v2`/`hello_ack_v2` 协商，决定终端状态同步语义。
+
+主要来源：
 
 - `relaycat-protocol/src/lib.rs`
 - `relaycat-cli/crates/crypto/src/lib.rs`
@@ -44,7 +56,28 @@ ProtocolCapabilityV2 =
 | "exactly_once_input"      # input_stream_id + input_seq 输入去重
 | "incremental_scrollback"  # patch 可增量携带滚出屏幕的 scrollback
 | "terminal_transcript"     # 独立 transcript 分页历史
+| "cli_metadata"            # CLI 上报会话元数据（如 project path）
+| "compression"             # PlainMsg 明文在加密前做 raw DEFLATE 压缩
+| "incremental_attrs"       # patch 只携带自上次以来新增的 attr 表尾部
 ```
+
+各 capability 的协商属性：
+
+| capability | mandatory | 对端缺失时的 fallback | 首次可用边界 |
+|---|---|---|---|
+| `terminal_state` | 是 | 无 —— 发送 `protocol_reject_v2` 拒绝 | — |
+| `snapshot_recovery` | 是 | 无 —— 发送 `protocol_reject_v2` 拒绝 | — |
+| `exactly_once_input` | 否 | 输入不做 (stream, seq) 去重，重连重发可能重复执行 | `hello_ack_v2` 之后 |
+| `incremental_scrollback` | 否 | scrollback 只随全量 snapshot 更新 | `hello_ack_v2` 之后 |
+| `terminal_transcript` | 否 | 无 transcript 分页历史 | `hello_ack_v2` 之后 |
+| `cli_metadata` | 否 | 不发送 `cli_metadata` 消息 | `hello_ack_v2` 之后 |
+| `compression` | 否 | 明文不压缩发送 | `hello_ack_v2` 之后 |
+| `incremental_attrs` | 否 | attr 表增长时重发完整表 | `hello_ack_v2` 之后 |
+
+向前兼容：解码 `hello_v2`/`hello_ack_v2` 时，本端不认识的 capability 字符串
+直接丢弃而不报错（Rust `CapabilityOrUnknown`、Android/iOS `mapNotNull`/
+`compactMap`）。因此新版本可以安全地新增 optional capability；协商结果永远
+是双方已知集合的交集。
 
 当前终端状态协议版本常量：
 
@@ -65,7 +98,9 @@ TERMINAL_STATE_PROTOCOL_V2 = 2
     "role": "cli" | "app",              # 当前连接身份
     "device_pubkey": bytes[32],         # X25519 公钥
     "pairing_token_proof": bytes[32]?,  # App 证明自己持有 pairing token；CLI 为空
-    "relay_admission": bytes[32]?       # relay HTTP/WS 侧的 room 准入证明
+    "relay_admission": bytes[32]?,      # relay HTTP/WS 侧的 room 准入证明
+    "connection_salt": bytes[32]?,      # 本连接的随机 salt；v3 下语义上 mandatory
+    "supports_join_accepted": bool      # 缺省 false；见 join_accepted
   }
 }
 ```
@@ -74,6 +109,10 @@ TERMINAL_STATE_PROTOCOL_V2 = 2
 
 - CLI join：`role="cli"`，`pairing_token_proof=null`，`relay_admission` 有值。
 - App join：`role="app"`，`pairing_token_proof` 和 `relay_admission` 都有值。
+- `connection_salt` 每次（重）连接都必须用 CSPRNG 重新生成；v3 对端会拒绝
+  缺失 salt 的 `peer_joined`。字段在 wire 上标为 optional 仅为解码旧帧兼容。
+- `supports_join_accepted=true` 表示该客户端理解显式的 `join_accepted` 确认
+  帧；老客户端不发送该字段，解码缺省为 false，relay 就不会发确认帧。
 
 ### 3.2 peer_joined
 
@@ -84,12 +123,30 @@ relay 通知已有 peer：另一端已经加入。
   "peer_joined": {
     "role": "cli" | "app",              # 新加入 peer 的角色
     "device_pubkey": bytes[32],         # 新 peer 的 X25519 公钥
-    "pairing_token_proof": bytes[32]?   # App 加入时携带，用于 CLI 验证
+    "pairing_token_proof": bytes[32]?,  # App 加入时携带，用于 CLI 验证
+    "connection_salt": bytes[32]?       # relay 原样转发新 peer 的 salt
   }
 }
 ```
 
-CLI 收到 `role="app"` 后会验证 `pairing_token_proof`，再派生会话密钥。
+CLI 收到 `role="app"` 后会验证 `pairing_token_proof`（proof 覆盖 salt，见
+§4.1），再派生会话密钥。v3 下双方都必须校验 `connection_salt` 非空：缺 salt
+的 `peer_joined` 直接按握手失败处理，不允许退回无 salt 派生。
+
+### 3.2b join_accepted
+
+relay 对 `supports_join_accepted=true` 的客户端在准入通过后立即发送的显式
+确认帧，先于任何排队的 `peer_joined` 通知：
+
+```text
+"join_accepted"
+```
+
+- 新客户端在收到 `join_accepted` 前应保持“正在加入”状态；收到即视为准入
+  成功，无需再依赖时间探测。
+- 老 relay 不发送该帧；客户端在探测窗口内未收到任何帧时退回原有的
+  时间探测判定。
+- 老客户端（`supports_join_accepted` 缺省 false）不会收到该帧，行为不变。
 
 ### 3.3 peer_left
 
@@ -146,25 +203,56 @@ direction == "app_to_cli" -> "RCIC" || u64_be(seq)
 "evicted"  # 新 App 连接占用同一房间 App 槽位，旧 App 应提示“另一台设备已连接”，不可自动重试
 "ping"
 "pong"
-{ "error": { "message": string } }
+{ "error": { "message": string, "code": RelayErrorCode? } }
 ```
 
-## 4. 加密与认证
+```text
+RelayErrorCode =
+  "invalid_room_id"          # 不可重试
+| "server_at_capacity"       # 可重试
+| "join_timeout"             # 可重试
+| "frame_too_large"          # 不可重试
+| "invalid_join"             # 不可重试
+| "join_room_role_mismatch"  # 不可重试
+| "peer_not_registered"      # 可重试
+| "admission_rejected"       # 不可重试（token 错误）
+| "join_notification_failed" # 可重试
+| "heartbeat_timeout"        # 可重试
+| "rate_limited"             # 可重试
+| "room_expired"             # 不可重试（需重新扫码配对）
+```
+
+`error.code` 是稳定的机器可读错误码（P2-10），客户端据此分类而不解析
+`message` 文本；旧 relay 不发送 `code`，未知 code 解码为 null 并退回
+message 分类。此外 relay 过载踢出 slow consumer 时使用 WebSocket close
+code `1013`（reason 含 `slow_consumer retryable`），客户端按可重试瞬态失败
+处理。
+
+## 4. 加密与认证（secure transport v3）
+
+以下所有构造中的版本串均为 `"relaycat-v3"`。v3 与 v2 的关键差异：双方的
+per-connection salt 是 mandatory，并同时绑定进 pairing proof 与密钥派生。
+这保证 (a) 恶意 relay 无法剥离/替换 salt（proof 校验会失败），(b) 重连后
+seq 计数器从 1 重置时派生出的方向密钥仍然不同，杜绝 ChaCha20-Poly1305
+nonce 复用。
 
 ### 4.1 pairing_token_proof
 
-App join 时证明自己持有 pairing token。
+join 时证明发送方持有 pairing token，并把本连接的 salt 绑定进 transcript。
 
 ```text
 HMAC-SHA256(
   key = pairing_token,
   msg =
-    "relaycat-v2"
+    "relaycat-v3"
     || u32_be(len(room_id)) || room_id
-    || role                # "app"
+    || role                # "cli" 或 "app"
     || device_pubkey       # bytes[32]
+    || connection_salt     # bytes[32]，本连接的 salt
 )
 ```
+
+接收方用它拿到的 salt 重算 proof；salt 被篡改则 proof 校验失败，握手拒绝。
 
 ### 4.2 relay_admission
 
@@ -174,7 +262,7 @@ relay 准入证明，不绑定设备公钥，只绑定 token 与 room。
 HMAC-SHA256(
   key = pairing_token,
   msg =
-    "relaycat-v2"
+    "relaycat-v3"
     || "relay-admission"
     || u32_be(len(room_id)) || room_id
 )
@@ -182,21 +270,31 @@ HMAC-SHA256(
 
 ### 4.3 session keys
 
-双方用 X25519 得到 shared secret，再用 HKDF-SHA256 派生两个方向密钥。
+双方用 X25519 得到 shared secret，再用 HKDF-SHA256 派生两个方向密钥。双方
+salt 按固定 (cli, app) 顺序拼接，两端派生出相同上下文。
 
 ```text
 pairing_token_hash = SHA256(pairing_token)
 
 salt =
-  "relaycat-v2"
+  "relaycat-v3"
   || u32_be(len(room_id)) || room_id
-  || cli_public_key       # bytes[32]
-  || app_public_key       # bytes[32]
-  || pairing_token_hash   # bytes[32]
+  || cli_public_key                # bytes[32]
+  || app_public_key                # bytes[32]
+  || pairing_token_hash            # bytes[32]
+  || "relaycat-v3-connection-salt"
+  || cli_connection_salt           # bytes[32]
+  || app_connection_salt           # bytes[32]
 
 cli_to_app_key = HKDF-SHA256(shared_secret, salt, "relaycat-v2-session-key cli_to_app", 32)
 app_to_cli_key = HKDF-SHA256(shared_secret, salt, "relaycat-v2-session-key app_to_cli", 32)
 ```
+
+（HKDF expand 的 info 标签沿用历史的 `relaycat-v2-session-key` 前缀；版本
+隔离由 salt 中的 `relaycat-v3` 提供。）
+
+每次（重）连接都必须重新生成 salt（`generate_connection_salt()`，OS
+CSPRNG，32 字节）。
 
 ### 4.4 PlainMsg AEAD
 
@@ -207,7 +305,7 @@ plaintext = MessagePack(PlainMsg)
 key       = direction == cli_to_app ? cli_to_app_key : app_to_cli_key
 nonce     = direction_prefix || u64_be(seq)
 aad       =
-  "relaycat-v2"
+  "relaycat-v3"
   || u32_be(len(room_id)) || room_id
   || direction_raw              # "cli_to_app" 或 "app_to_cli"
   || u64_be(seq)
@@ -242,6 +340,26 @@ ciphertext = ChaCha20-Poly1305-Seal(plaintext, key, nonce, aad)
 }
 ```
 
+协商规则（P2-2）：CLI 取双方版本交集中的最高版本；交集为空或对端缺少
+mandatory capability（`terminal_state`、`snapshot_recovery`）时回复
+`protocol_reject_v2` 而不是静默降级。App 收到 `hello_ack_v2` 后校验
+selected 版本在自己支持列表内且 mandatory capabilities 齐全。Hello/HelloAck
+是屏障：`resume_v2`/`resize_event_v2`/`input_event_v2` 必须等屏障打开后才
+能发送。
+
+### 5.2b protocol_reject_v2
+
+```text
+{
+  "protocol_reject_v2": {
+    "reason": string,             # 面向升级提示的原因
+    "supported_versions": uint16[]
+  }
+}
+```
+
+收到方应呈现“协议不兼容，请升级较旧一侧”的终态错误，不自动重试。
+
 ### 5.3 resume_v2
 
 App 重连后告诉 CLI 自己已有的终端状态和输入 ack 进度。
@@ -259,6 +377,22 @@ App 重连后告诉 CLI 自己已有的终端状态和输入 ack 进度。
 ```
 
 CLI 会尝试从 retained patches 补齐；如果 base 不匹配、补丁不连续、补丁过大，则返回完整 snapshot。
+
+### 5.3b resume_accepted_v2
+
+CLI 对 `resume_v2` 的显式回复，先于随后的补丁/快照发送：
+
+```text
+{
+  "resume_accepted_v2": {
+    "mode": "up_to_date" | "replaying_patches" | "sending_snapshot",
+    "target_state_seq": uint64   # 追平后 App 应达到的 state seq
+  }
+}
+```
+
+App 的 reconnect overlay 以 `target_state_seq` 是否已应用为收敛条件，而不是
+固定时长。
 
 ### 5.4 process_exit
 
@@ -434,6 +568,22 @@ input_seq <= highest_contiguous_input_seq -> duplicate
 input_seq == highest_contiguous_input_seq + 1 -> accept
 否则 -> gap
 ```
+
+**Exactly-once 边界（P2-9）**：该去重能力的准确名字是
+`reconnect_deduplicated_input` —— 它只覆盖**同一 App 进程内、跨 transport
+重连**的场景。pending inputs（stream id、seq、字节、ack 水位）只保存在内存
+中，不做持久化：
+
+- transport 断开重连：App 重发内存中未 ACK 的相同 (stream, seq) 信封，
+  CLI 按序去重，输入恰好执行一次。
+- App 进程被杀 / 重启：新进程生成新的随机 `input_stream_id`，pending 集为
+  空。上一进程未 ACK 的输入要么丢失（CLI 未收到），要么已执行但 App 无
+  记录（ACK 在途中）。无法跨进程去重，因此**不得**将其描述为持久
+  exactly-once。UI 在用户主动断开/删除 session 且仍有 pending 字节时给出
+  警告（`PendingInputWarningPolicy`）。
+- 若未来需要跨进程语义，需实现加密持久化 outbox（持久化 stream id、seq、
+  payload、ack 水位，重启后继续 Resume，并定义 session 删除 / CLI run 变更
+  时的丢弃规则）。
 
 `gap` 不得写入 PTY，也不得推进 `highest_contiguous_input_seq`。CLI 应重建
 relay transport，使 App 在 `PeerJoined(cli)` 后按序重发仍未 ACK 的输入；否则
@@ -696,7 +846,16 @@ CLI -> App:
 - `ResizeEventV2.last_input_ack` 缺省为 `0`。
 - `TerminalSnapshotV2.reset_app_cache` 缺省为 `false`。
 - `Join.relay_admission` 缺省可为 `null`，但受保护 room 会校验。
+- `Join.connection_salt`/`PeerJoined.connection_salt` wire 上 optional（旧帧
+  解码为 null），但 v3 对端在握手时要求非空。
+- `Join.supports_join_accepted` 缺省为 `false`（老客户端不发送该字段）。
+- `Error.code` 缺省为 `null`；未知 code 解码为 `null` 并退回 message 分类。
+- 未知 `ProtocolCapabilityV2` 字符串解码时被忽略。
 - `TerminalPatchV2.attrs=[]` 表示 attr 表未变化，App 应复用当前 attr 表。
+
+跨端一致性由各端 codec 的 wire-hex 测试保证（Rust `tests/frames.rs`、
+Android `ProtocolCodecTest.kt`、iOS `ProtocolCodecTests.swift` 对同一帧断言
+相同的 MessagePack 十六进制），新增字段/帧时三端需同步更新这组向量。
 
 ## 10. 当前方向消息策略
 

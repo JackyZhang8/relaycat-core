@@ -284,6 +284,7 @@ fn secure_join_frame_binds_cli_proof_to_its_connection_salt() {
         pairing_token_proof,
         relay_admission,
         connection_salt,
+        supports_join_accepted: _,
     } = frame
     else {
         panic!("expected join frame");

@@ -1,6 +1,7 @@
 use super::*;
 use crate::i18n::CliLanguage;
 use relaycat_crypto::{KeyPair, PairingRole, SessionKeys, pairing_token_hash, pairing_token_proof};
+use relaycat_protocol::TerminalPatchV2;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -2349,9 +2350,11 @@ fn negotiate_capabilities_intersects_with_peer() {
         protocol_versions: vec![1, 2],
         capabilities: vec![
             ProtocolCapabilityV2::TerminalState,
+            ProtocolCapabilityV2::SnapshotRecovery,
             ProtocolCapabilityV2::Compression,
         ],
-    });
+    })
+    .expect("compatible peer");
     assert_eq!(ack.selected_protocol_version, 2);
     assert!(
         ack.capabilities
@@ -2369,15 +2372,46 @@ fn negotiate_capabilities_intersects_with_peer() {
 }
 
 #[test]
-fn negotiate_capabilities_empty_peer_yields_no_compression() {
-    // A legacy app that sends no capabilities (or never sends Hello at all)
-    // must end up with compression disabled, keeping the link uncompressed.
-    let ack = hello_ack_for(&HelloV2 {
+fn negotiate_rejects_empty_peer_instead_of_falling_back() {
+    // A peer that advertises no shared version is rejected with an explicit
+    // ProtocolRejectV2 rather than silently negotiated down to v2.
+    let rejected = hello_ack_for(&HelloV2 {
         protocol_versions: vec![],
         capabilities: vec![],
-    });
-    assert_eq!(ack.selected_protocol_version, TERMINAL_STATE_PROTOCOL_V2);
-    assert!(ack.capabilities.is_empty());
+    })
+    .expect_err("peer without shared version must be rejected");
+    assert!(rejected.reason.contains("no shared protocol version"));
+    assert_eq!(
+        rejected.supported_versions,
+        vec![TERMINAL_STATE_PROTOCOL_V2]
+    );
+}
+
+#[test]
+fn resume_accepted_reflects_reply_contents() {
+    assert_eq!(
+        resume_accepted_for(&[], 7),
+        ResumeAcceptedV2 {
+            mode: ResumeAcceptMode::UpToDate,
+            target_state_seq: 7,
+        }
+    );
+    assert_eq!(
+        resume_accepted_for(
+            &[PlainMsg::TerminalPatchV2(TerminalPatchV2 {
+                terminal_run_id: "run".to_string(),
+                base_snapshot_id: 1,
+                from_state_seq: 7,
+                to_state_seq: 8,
+                attrs: Vec::new(),
+                attrs_base_len: None,
+                ops: Vec::new(),
+            })],
+            8
+        )
+        .mode,
+        ResumeAcceptMode::ReplayingPatches
+    );
 }
 
 #[test]

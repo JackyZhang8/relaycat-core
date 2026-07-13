@@ -1,4 +1,4 @@
-use relaycat_protocol::{Direction, OuterFrame, Role};
+use relaycat_protocol::{Direction, OuterFrame, RelayErrorCode, Role};
 use relaycat_relay::hub::{AdmissionCheck, CloseSignal, Hub, HubError, JoinRequest};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -601,7 +601,8 @@ async fn cleanup_inactive_rooms_drops_expired_rooms() {
     assert_eq!(
         cli_rx.recv().await,
         Some(OuterFrame::Error {
-            message: "room expired".to_string()
+            message: "room expired".to_string(),
+            code: Some(RelayErrorCode::RoomExpired),
         })
     );
     assert!(cli_rx.recv().await.is_none());
@@ -898,13 +899,15 @@ async fn cleanup_inactive_rooms_notifies_connected_peers_before_removal() {
     assert_eq!(
         cli_rx.recv().await,
         Some(OuterFrame::Error {
-            message: "room expired".to_string()
+            message: "room expired".to_string(),
+            code: Some(RelayErrorCode::RoomExpired),
         })
     );
     assert_eq!(
         app_rx.recv().await,
         Some(OuterFrame::Error {
-            message: "room expired".to_string()
+            message: "room expired".to_string(),
+            code: Some(RelayErrorCode::RoomExpired),
         })
     );
     assert!(cli_rx.recv().await.is_none());
