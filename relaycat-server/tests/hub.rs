@@ -1,5 +1,5 @@
 use relaycat_protocol::{Direction, OuterFrame, Role};
-use relaycat_relay::hub::{AdmissionCheck, Hub, HubError, JoinRequest};
+use relaycat_relay::hub::{AdmissionCheck, CloseSignal, Hub, HubError, JoinRequest};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -146,6 +146,132 @@ async fn forward_to_full_peer_channel_evicts_slow_peer_for_reconnect() {
     )
     .expect("evicted app transport is ignored after congestion");
     assert!(cli_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn slow_consumer_eviction_sends_close_signal_and_records_metrics() {
+    let hub = Hub::default();
+    let (cli_tx, mut cli_rx) = mpsc::channel(64);
+    let (app_tx, mut app_rx) = mpsc::channel(1);
+    let (app_close_tx, mut app_close_rx) = mpsc::channel(1);
+
+    hub.join(JoinRequest::new(
+        "room-1",
+        Role::Cli,
+        1,
+        [1; 32],
+        None,
+        cli_tx,
+    ))
+    .expect("cli joins");
+    hub.join(
+        JoinRequest::new("room-1", Role::App, 2, [2; 32], Some([9; 32]), app_tx)
+            .with_close_signal(app_close_tx),
+    )
+    .expect("app joins");
+
+    let _ = cli_rx.recv().await;
+    let _ = app_rx.recv().await;
+
+    let frame = OuterFrame::Data {
+        room_id: "room-1".to_string(),
+        direction: Direction::CliToApp,
+        seq: 1,
+        nonce: [1; 12],
+        ciphertext: vec![1, 2, 3],
+    };
+    hub.forward("room-1", Role::Cli, 1, frame.clone())
+        .expect("first forward fills app channel");
+    hub.forward("room-1", Role::Cli, 1, frame)
+        .expect("slow app eviction is not fatal");
+
+    // The eviction is delivered out-of-band even though the ordinary
+    // outbound queue is full, so the ws task can close with a reason.
+    assert_eq!(app_close_rx.recv().await, Some(CloseSignal::SlowConsumer));
+    assert_eq!(
+        CloseSignal::SlowConsumer.close_reason(),
+        "slow_consumer retryable"
+    );
+
+    let stats = hub.stats();
+    assert_eq!(stats.slow_consumer_evictions_total, 1);
+    assert_eq!(stats.slow_consumer_evictions_app, 1);
+    assert_eq!(stats.slow_consumer_evictions_cli, 0);
+    assert_eq!(stats.slow_consumer_discarded_bytes, 3);
+    assert_eq!(stats.outbound_queue_high_water, 1);
+}
+
+#[tokio::test]
+async fn app_replacement_sends_evicted_close_signal_even_with_full_queue() {
+    let hub = Hub::default();
+    let (cli_tx, mut cli_rx) = mpsc::channel(64);
+    let (old_app_tx, mut old_app_rx) = mpsc::channel(1);
+    let (old_app_close_tx, mut old_app_close_rx) = mpsc::channel(1);
+    let (new_app_tx, _new_app_rx) = mpsc::channel(64);
+
+    hub.join(JoinRequest::new(
+        "room-1",
+        Role::Cli,
+        1,
+        [1; 32],
+        None,
+        cli_tx,
+    ))
+    .expect("cli joins");
+    hub.join(
+        JoinRequest::new("room-1", Role::App, 2, [2; 32], Some([9; 32]), old_app_tx)
+            .with_close_signal(old_app_close_tx),
+    )
+    .expect("old app joins");
+
+    let _ = cli_rx.recv().await;
+    // Leave the old app's PeerJoined queued so its cap-1 channel is full and
+    // the ordinary Evicted control frame cannot be delivered.
+    assert!(
+        hub.join(JoinRequest::new(
+            "room-1",
+            Role::App,
+            3,
+            [3; 32],
+            Some([9; 32]),
+            new_app_tx,
+        ))
+        .expect("new app evicts old app")
+    );
+
+    assert_eq!(old_app_close_rx.recv().await, Some(CloseSignal::Evicted));
+    assert_eq!(CloseSignal::Evicted.close_reason(), "evicted");
+    // The queued frame is still the original PeerJoined; Evicted never fit.
+    assert!(matches!(
+        old_app_rx.recv().await,
+        Some(OuterFrame::PeerJoined { .. })
+    ));
+}
+
+#[tokio::test]
+async fn cli_replacement_sends_replaced_close_signal() {
+    let hub = Hub::default();
+    let (old_cli_tx, _old_cli_rx) = mpsc::channel(64);
+    let (old_cli_close_tx, mut old_cli_close_rx) = mpsc::channel(1);
+    let (new_cli_tx, _new_cli_rx) = mpsc::channel(64);
+
+    hub.join(
+        JoinRequest::new("room-1", Role::Cli, 1, [1; 32], None, old_cli_tx)
+            .with_close_signal(old_cli_close_tx),
+    )
+    .expect("old cli joins");
+    hub.join(JoinRequest::new(
+        "room-1",
+        Role::Cli,
+        2,
+        [1; 32],
+        None,
+        new_cli_tx,
+    ))
+    .expect("new cli replaces old cli");
+
+    assert_eq!(old_cli_close_rx.recv().await, Some(CloseSignal::Replaced));
+    assert_eq!(CloseSignal::Replaced.close_reason(), "replaced retryable");
 }
 
 #[tokio::test]

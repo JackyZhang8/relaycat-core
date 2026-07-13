@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
     extract::{
         Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::IntoResponse,
@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     config::RelayConfig,
-    hub::{AdmissionCheck, Hub, HubStats, JoinRequest},
+    hub::{AdmissionCheck, CloseSignal, Hub, HubStats, JoinRequest},
     room::ConnId,
     xfyun::{RtasrUrlResponse, signed_rtasr_url},
 };
@@ -55,6 +55,10 @@ pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 4096;
 /// Without a timeout, a client that connects but never speaks holds a file
 /// descriptor and a tokio task indefinitely.
 const JOIN_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// Close code used when the relay evicts a peer (slow consumer or replaced):
+/// 1013 "Try Again Later". Clients treat it as an abnormal close and the
+/// reason text tells them whether the condition is retryable.
+const EVICTION_CLOSE_CODE: u16 = 1013;
 
 /// Rate limits for the xfyun rtasr-url signing endpoint. Each signed URL is
 /// minted with the relay's xfyun credentials, so any party holding a room's
@@ -445,6 +449,11 @@ mod tests {
             cli_idle: 1,
             app_paired: 2,
             app_without_cli: 0,
+            slow_consumer_evictions_total: 5,
+            slow_consumer_evictions_cli: 1,
+            slow_consumer_evictions_app: 4,
+            slow_consumer_discarded_bytes: 2048,
+            outbound_queue_high_water: 64,
         };
         let process = ProcessStats {
             cpu_percent: 1.25,
@@ -453,7 +462,7 @@ mod tests {
 
         assert_eq!(
             relay_stats_log(hub, process, 7),
-            "relay stats: cpu_percent=1.2 memory_rss_mb=42.5 rooms_total=4 cli_connected_total=3 app_connected_total=2 cli_paired=2 cli_idle=1 app_paired=2 app_without_cli=0 rooms_expired_last_interval=7"
+            "relay stats: cpu_percent=1.2 memory_rss_mb=42.5 rooms_total=4 cli_connected_total=3 app_connected_total=2 cli_paired=2 cli_idle=1 app_paired=2 app_without_cli=0 rooms_expired_last_interval=7 slow_consumer_evictions_total=5 slow_consumer_evictions_cli=1 slow_consumer_evictions_app=4 slow_consumer_discarded_bytes=2048 outbound_queue_high_water=64"
         );
     }
 
@@ -759,6 +768,10 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
     let conn_id = state.next_conn_id();
     let (outbound_tx, outbound_rx) =
         mpsc::channel(limits.outbound_channel_capacity.max(1));
+    // Dedicated eviction channel: never shares capacity with the ordinary
+    // outbound queue, so a close reason can still be delivered when that
+    // queue is full.
+    let (close_signal_tx, close_signal_rx) = mpsc::channel(1);
     let mut socket = socket;
     let connected_at = Instant::now();
 
@@ -936,7 +949,9 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
     if let Some(relay_admission) = relay_admission {
         request = request.with_relay_admission(relay_admission);
     }
-    request = request.with_connection_salt(connection_salt);
+    request = request
+        .with_connection_salt(connection_salt)
+        .with_close_signal(close_signal_tx);
     let join_result = state.hub.join(request);
     match join_result {
         Err(error) => {
@@ -965,7 +980,15 @@ async fn handle_socket(state: AppState, query: WsQuery, socket: WebSocket) {
     }
 
     relaycat_log("INFO", connected_log(&query.room_id, query.role, conn_id));
-    relay_socket_frames(state.clone(), query.clone(), conn_id, socket, outbound_rx).await;
+    relay_socket_frames(
+        state.clone(),
+        query.clone(),
+        conn_id,
+        socket,
+        outbound_rx,
+        close_signal_rx,
+    )
+    .await;
     state.hub.leave(&query.room_id, query.role, conn_id);
     relaycat_log(
         "INFO",
@@ -979,6 +1002,7 @@ async fn relay_socket_frames(
     conn_id: ConnId,
     mut socket: WebSocket,
     mut outbound_rx: mpsc::Receiver<OuterFrame>,
+    mut close_signal_rx: mpsc::Receiver<CloseSignal>,
 ) {
     let limits = state.config.limits.clone();
     let mut rate_limiter = InboundRateLimiter::new(
@@ -991,6 +1015,29 @@ async fn relay_socket_frames(
 
     loop {
         tokio::select! {
+            signal = close_signal_rx.recv() => {
+                let Some(signal) = signal else {
+                    break;
+                };
+                let reason = signal.close_reason();
+                relaycat_log(
+                    "WARN",
+                    format!(
+                        "relay: closing evicted connection role={} room={} conn={} reason={}",
+                        role_label(query.role),
+                        query.room_id,
+                        conn_id,
+                        reason
+                    ),
+                );
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: EVICTION_CLOSE_CODE,
+                        reason: reason.into(),
+                    })))
+                    .await;
+                break;
+            }
             _ = heartbeat.tick() => {
                 if last_client_seen.elapsed() > CLIENT_PONG_TIMEOUT {
                     let _ = send_error(&mut socket, "client heartbeat timeout").await;
@@ -1452,7 +1499,7 @@ fn relay_stats_log(
     rooms_expired_last_interval: u64,
 ) -> String {
     format!(
-        "relay stats: cpu_percent={:.1} memory_rss_mb={:.1} rooms_total={} cli_connected_total={} app_connected_total={} cli_paired={} cli_idle={} app_paired={} app_without_cli={} rooms_expired_last_interval={}",
+        "relay stats: cpu_percent={:.1} memory_rss_mb={:.1} rooms_total={} cli_connected_total={} app_connected_total={} cli_paired={} cli_idle={} app_paired={} app_without_cli={} rooms_expired_last_interval={} slow_consumer_evictions_total={} slow_consumer_evictions_cli={} slow_consumer_evictions_app={} slow_consumer_discarded_bytes={} outbound_queue_high_water={}",
         process.cpu_percent,
         process.memory_rss_mb,
         hub.rooms_total,
@@ -1462,7 +1509,12 @@ fn relay_stats_log(
         hub.cli_idle,
         hub.app_paired,
         hub.app_without_cli,
-        rooms_expired_last_interval
+        rooms_expired_last_interval,
+        hub.slow_consumer_evictions_total,
+        hub.slow_consumer_evictions_cli,
+        hub.slow_consumer_evictions_app,
+        hub.slow_consumer_discarded_bytes,
+        hub.outbound_queue_high_water
     )
 }
 
