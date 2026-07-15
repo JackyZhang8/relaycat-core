@@ -856,6 +856,46 @@ async fn reliable_plain_event_waits_for_output_queue_capacity() {
     ));
 }
 
+#[tokio::test]
+async fn relay_output_selector_prioritizes_resume_over_ready_pty_output() {
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let (output_tx, mut output_rx) = mpsc::channel(1);
+    output_tx
+        .send(PtyEvent::Output(vec![1]))
+        .await
+        .expect("queue continuously-ready PTY output");
+    control_tx
+        .send(TerminalV2Control::Resume(ResumeV2 {
+            terminal_run_id: None,
+            last_applied_state_seq: 0,
+            last_snapshot_id: None,
+            input_stream_id: "stream-1".to_string(),
+            last_input_ack: 0,
+        }))
+        .expect("queue resume control");
+
+    let (_writer_tx, mut writer_rx) = mpsc::unbounded_channel::<WsWriter>();
+    let (_status_tx, mut status_rx) = mpsc::channel::<CliStatus>(1);
+    let event = next_relay_output_event(
+        &mut writer_rx,
+        &mut control_rx,
+        &mut status_rx,
+        None,
+        None,
+        &mut output_rx,
+    )
+    .await;
+
+    assert!(matches!(
+        event,
+        Some(RelayOutputEvent::Control(TerminalV2Control::Resume(_)))
+    ));
+    assert!(matches!(
+        output_rx.try_recv(),
+        Ok(PtyEvent::Output(bytes)) if bytes == vec![1]
+    ));
+}
+
 #[test]
 fn local_input_filter_drops_focus_events() {
     let mut filter = LocalInputFilter::default();

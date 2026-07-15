@@ -250,6 +250,47 @@ enum TerminalV2Control {
     FreezeHistory,
 }
 
+enum RelayOutputEvent {
+    Writer(WsWriter),
+    Control(TerminalV2Control),
+    CliStatus(CliStatus),
+    FlushDeadline,
+    HistoryThawDeadline,
+    Output(PtyEvent),
+}
+
+async fn next_relay_output_event(
+    writer_update_rx: &mut mpsc::UnboundedReceiver<WsWriter>,
+    control_rx: &mut mpsc::UnboundedReceiver<TerminalV2Control>,
+    cli_status_rx: &mut mpsc::Receiver<CliStatus>,
+    flush_deadline: Option<Instant>,
+    history_thaw_deadline: Option<Instant>,
+    output_rx: &mut mpsc::Receiver<PtyEvent>,
+) -> Option<RelayOutputEvent> {
+    tokio::select! {
+        biased;
+        Some(writer) = writer_update_rx.recv() => {
+            Some(RelayOutputEvent::Writer(writer))
+        }
+        Some(control) = control_rx.recv() => {
+            Some(RelayOutputEvent::Control(control))
+        }
+        Some(status) = cli_status_rx.recv() => {
+            Some(RelayOutputEvent::CliStatus(status))
+        }
+        _ = sleep_until_opt(flush_deadline), if flush_deadline.is_some() => {
+            Some(RelayOutputEvent::FlushDeadline)
+        }
+        _ = sleep_until_opt(history_thaw_deadline), if history_thaw_deadline.is_some() => {
+            Some(RelayOutputEvent::HistoryThawDeadline)
+        }
+        Some(event) = output_rx.recv() => {
+            Some(RelayOutputEvent::Output(event))
+        }
+        else => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TerminalSnapshotRequestCoalescer {
     pending: Arc<AtomicBool>,
@@ -1526,343 +1567,359 @@ where
         let mut outbound_byte_pacer = RelayOutboundBytePacer::new(Instant::now());
 
         loop {
-            let mut msgs = tokio::select! {
-                Some(next_writer) = writer_update_rx.recv() => {
-                    if current_pty_work_mode(&pty_work_mode_for_relay_output) == PtyWorkModeKind::Remote {
+            // Resume and other terminal controls must not lose the select race
+            // to a continuously-ready PTY output queue. The selector preserves
+            // the intentional priority order: transport replacement, control,
+            // status/deadlines, then ordinary PTY output.
+            let Some(relay_event) = next_relay_output_event(
+                &mut writer_update_rx,
+                &mut terminal_v2_control_rx,
+                &mut cli_status_rx,
+                flush_deadline,
+                deferred_history_thaw.deadline(),
+                &mut output_rx,
+            )
+            .await
+            else {
+                break;
+            };
+            let mut msgs = match relay_event {
+                RelayOutputEvent::Writer(next_writer) => {
+                    if current_pty_work_mode(&pty_work_mode_for_relay_output)
+                        == PtyWorkModeKind::Remote
+                    {
                         ws_writer = Some(next_writer);
                         pending_cli_metadata = true;
                     }
                     continue;
                 }
-                Some(control) = terminal_v2_control_rx.recv() => {
-                    match control {
-                        TerminalV2Control::AppConnected => {
-                            pending_cli_metadata = true;
-                            let resume_ready = resume_gate
-                                .lock()
-                                .map(|gate| gate.can_send_terminal_state(true))
-                                .unwrap_or(false);
-                            if resume_ready {
-                                take_deferred_reset_messages(
-                                    &mut terminal_core,
-                                    &mut pending_reset_before_resume,
-                                )?
-                                .unwrap_or_default()
-                            } else {
-                                Vec::new()
-                            }
-                        }
-                        TerminalV2Control::EnterLocalMode => {
-                            flush_deadline = None;
-                            let mut folded_unsent_output = false;
-                            if !pending_output.is_empty() {
-                                let bytes = std::mem::take(&mut pending_output);
-                                let batch = feed_terminal_vt_bytes(&mut terminal_core, &bytes)?;
-                                if batch.has_reset() {
-                                    pending_reset_before_resume = true;
-                                }
-                                if batch.has_reset() || !batch.patches.is_empty() {
-                                    folded_unsent_output = true;
-                                    if let Some(session_kind) =
-                                        terminal_diagnostic_session_kind.as_deref()
-                                    {
-                                        for patch in &batch.patches {
-                                            relaycat_log(
-                                                "INFO",
-                                                terminal_patch_diagnostic_line(
-                                                    session_kind,
-                                                    &bytes,
-                                                    &terminal_core,
-                                                    patch,
-                                                ),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            local_mode_dirty = folded_unsent_output;
-                            relay_output_in_local_mode = true;
-                            if let Some(mut writer) = ws_writer.take() {
-                                let _ = tokio::time::timeout(
-                                    WS_SEND_TIMEOUT,
-                                    writer.send(Message::Close(None)),
-                                )
-                                .await;
-                            }
-                            mark_app_disconnected(&app_connected);
-                            relaycat_log("INFO", "mode: entered LocalMode; closed relay websocket");
-                            continue;
-                        }
-                        TerminalV2Control::EnterRemoteMode => {
-                            let mut msgs = flush_pending_output(
-                                &mut pending_output,
-                                &mut flush_deadline,
-                                &mut terminal_core,
-                                terminal_diagnostic_session_kind.as_deref(),
-                            )?;
-                            if local_mode_dirty || terminal_msgs_contain_state(&msgs) {
-                                local_mode_dirty = false;
-                                let contains_ris_transaction = msgs.iter().any(|msg| {
-                                    matches!(msg, PlainMsg::TerminalSnapshotV2(snapshot) if snapshot.reset_app_cache)
-                                });
-                                if !contains_ris_transaction {
-                                    msgs.clear();
-                                    if app_connected.load(Ordering::Acquire) {
-                                        msgs = if let Some(messages) = take_deferred_reset_messages(
-                                            &mut terminal_core,
-                                            &mut pending_reset_before_resume,
-                                        )? {
-                                            messages
-                                        } else {
-                                            terminal_core.snapshot_messages(true)?
-                                        };
-                                    }
-                                }
-                            }
-                            relay_output_in_local_mode = false;
-                            msgs
-                        }
-                        TerminalV2Control::Resume(resume) => {
-                            // Fold buffered output into the core so the resume
-                            // reply reflects it, but do not emit it as a
-                            // standalone patch: resume_messages() already
-                            // replays it through the retained patch range.
-                            // Emitting it separately would deliver the same
-                            // patch twice, which the app rejects as a sequence
-                            // gap and recovers from with a full snapshot resync.
-                            flush_deadline = None;
-                            let mut buffered_ris_transaction = None;
-                            if !pending_output.is_empty() {
-                                let bytes = std::mem::take(&mut pending_output);
-                                let batch = feed_terminal_vt_bytes(&mut terminal_core, &bytes)?;
-                                if batch.has_reset() || !batch.patches.is_empty() {
-                                    if relay_output_in_local_mode {
-                                        local_mode_dirty = true;
-                                    }
-                                    if let Some(session_kind) =
-                                        terminal_diagnostic_session_kind.as_deref()
-                                    {
-                                        for patch in &batch.patches {
-                                            relaycat_log(
-                                                "INFO",
-                                                terminal_patch_diagnostic_line(
-                                                    session_kind,
-                                                    &bytes,
-                                                    &terminal_core,
-                                                    patch,
-                                                ),
-                                            );
-                                        }
-                                    }
-                                }
-                                if batch.has_reset() {
-                                    buffered_ris_transaction = Some(batch.into_messages());
-                                }
-                            }
-                            let msgs = if let Some(messages) = take_deferred_reset_messages(
+                RelayOutputEvent::Control(control) => match control {
+                    TerminalV2Control::AppConnected => {
+                        pending_cli_metadata = true;
+                        let resume_ready = resume_gate
+                            .lock()
+                            .map(|gate| gate.can_send_terminal_state(true))
+                            .unwrap_or(false);
+                        if resume_ready {
+                            take_deferred_reset_messages(
                                 &mut terminal_core,
                                 &mut pending_reset_before_resume,
-                            )? {
-                                messages
-                            } else if let Some(transaction) = buffered_ris_transaction {
-                                transaction
-                            } else {
-                                terminal_core.resume_messages(&resume)?
-                            };
-                            if let Ok(mut gate) = resume_gate.lock() {
-                                gate.mark_resume_processed();
-                            }
-                            relaycat_log("INFO", gui_terminal_state_log("live"));
-                            // Announce how the backlog will arrive before it
-                            // does, so the app keeps its reconnect overlay up
-                            // until `target_state_seq` is applied instead of
-                            // relying on a fixed fallback timer.
-                            let mut announced = Vec::with_capacity(msgs.len() + 1);
-                            announced.push(PlainMsg::ResumeAcceptedV2(resume_accepted_for(
-                                &msgs,
-                                terminal_core.current_state_seq(),
-                            )));
-                            announced.extend(msgs);
-                            announced
-                        }
-                        TerminalV2Control::RenderAck(ack) => {
-                            // A render ack only arrives while the app is
-                            // connected. Keep thawing idempotent for old
-                            // reconnect paths.
-                            if deferred_history_thaw.take_render_ack_thaw() {
-                                terminal_core.thaw_history();
-                            }
-                            terminal_core.ack_render(ack);
-                            continue;
-                        }
-                        TerminalV2Control::FreezeHistory => {
-                            deferred_history_thaw.cancel();
-                            terminal_core.freeze_history();
-                            continue;
-                        }
-                        TerminalV2Control::ThawHistory => {
-                            deferred_history_thaw.request(Instant::now());
-                            continue;
-                        }
-                        TerminalV2Control::RequestSnapshot(_) => {
-                            // Fold buffered output into the core so the snapshot
-                            // reflects it, but skip the redundant patch since the
-                            // snapshot it would precede already carries the state.
-                            flush_deadline = None;
-                            let mut buffered_ris_transaction = None;
-                            if !pending_output.is_empty() {
-                                let bytes = std::mem::take(&mut pending_output);
-                                let batch = feed_terminal_vt_bytes(&mut terminal_core, &bytes)?;
-                                if batch.has_reset() || !batch.patches.is_empty() {
-                                    if relay_output_in_local_mode {
-                                        local_mode_dirty = true;
-                                    }
-                                    if let Some(session_kind) =
-                                        terminal_diagnostic_session_kind.as_deref()
-                                    {
-                                        for patch in &batch.patches {
-                                            relaycat_log(
-                                                "INFO",
-                                                terminal_patch_diagnostic_line(
-                                                    session_kind,
-                                                    &bytes,
-                                                    &terminal_core,
-                                                    patch,
-                                                ),
-                                            );
-                                        }
-                                    }
-                                }
-                                if batch.has_reset() {
-                                    buffered_ris_transaction = Some(batch.into_messages());
-                                }
-                            }
-                            let msgs = if let Some(messages) = take_deferred_reset_messages(
-                                &mut terminal_core,
-                                &mut pending_reset_before_resume,
-                            )? {
-                                messages
-                            } else if let Some(transaction) = buffered_ris_transaction {
-                                transaction
-                            } else {
-                                terminal_core.snapshot_messages(false)?
-                            };
-                            if let Some(session_kind) = terminal_diagnostic_session_kind.as_deref() {
-                                if let Some(snapshot) = msgs.iter().find_map(|msg| match msg {
-                                    PlainMsg::TerminalSnapshotV2(snapshot) => Some(snapshot),
-                                    _ => None,
-                                }) {
-                                    let core = terminal_core.debug_snapshot();
-                                    relaycat_log(
-                                        "INFO",
-                                        format!(
-                                            "terminal_snapshot_diag kind={session_kind} snapshot={} seq={} scrollback_window={} screen_rows={} core_history={} vt_scrollback={} frozen={} alt={} size={}x{}",
-                                            snapshot.snapshot_id,
-                                            snapshot.state_seq,
-                                            snapshot.scrollback_window.len(),
-                                            snapshot.screen_rows.len(),
-                                            core.history_len,
-                                            core.vt_scrollback_len,
-                                            core.history_frozen,
-                                            core.alt_screen,
-                                            core.cols,
-                                            core.rows,
-                                        ),
-                                    );
-                                }
-                            }
-                            terminal_snapshot_request_coalescer_for_output.mark_request_finished();
-                            msgs
-                        }
-                        TerminalV2Control::RequestTranscript(request) => {
-                            vec![PlainMsg::TranscriptChunkV2(
-                                terminal_core.transcript_chunk(&request),
-                            )]
-                        }
-                        TerminalV2Control::Resize { event, pty_size } => {
-                            let mut msgs = flush_pending_output(
-                                &mut pending_output,
-                                &mut flush_deadline,
-                                &mut terminal_core,
-                                terminal_diagnostic_session_kind.as_deref(),
-                            )?;
-                            mark_local_mode_dirty_from_msgs(
-                                &msgs,
-                                relay_output_in_local_mode,
-                                &mut local_mode_dirty,
-                            );
-                            let guard = master_for_terminal_control.lock().map_err(|_| {
-                                anyhow::anyhow!("PTY master lock poisoned during resize")
-                            })?;
-                            let master = guard.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!("PTY master unavailable during resize")
-                            })?;
-                            master.resize(pty_size).context("failed to resize PTY")?;
-                            drop(guard);
-                            let resize_msgs = terminal_core.resize_messages(event, false)?;
-                            if let Some(session_kind) = terminal_diagnostic_session_kind.as_deref() {
-                                if let Some(snapshot) = resize_msgs.iter().find_map(|msg| match msg {
-                                    PlainMsg::TerminalSnapshotV2(snapshot) => Some(snapshot),
-                                    _ => None,
-                                }) {
-                                    let core = terminal_core.debug_snapshot();
-                                    relaycat_log(
-                                        "INFO",
-                                        format!(
-                                            "terminal_resize_snapshot_diag kind={session_kind} snapshot={} seq={} scrollback_window={} core_history={} vt_scrollback={} frozen={} alt={} size={}x{}",
-                                            snapshot.snapshot_id,
-                                            snapshot.state_seq,
-                                            snapshot.scrollback_window.len(),
-                                            core.history_len,
-                                            core.vt_scrollback_len,
-                                            core.history_frozen,
-                                            core.alt_screen,
-                                            core.cols,
-                                            core.rows,
-                                        ),
-                                    );
-                                }
-                            }
-                            msgs.extend(resize_msgs);
-                            msgs
-                        }
-                        TerminalV2Control::LocalResize { pty_size } => {
-                            let msgs = flush_pending_output(
-                                &mut pending_output,
-                                &mut flush_deadline,
-                                &mut terminal_core,
-                                terminal_diagnostic_session_kind.as_deref(),
-                            )?;
-                            mark_local_mode_dirty_from_msgs(
-                                &msgs,
-                                relay_output_in_local_mode,
-                                &mut local_mode_dirty,
-                            );
-                            let guard = master_for_terminal_control.lock().map_err(|_| {
-                                anyhow::anyhow!("PTY master lock poisoned during local resize")
-                            })?;
-                            let master = guard.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!("PTY master unavailable during local resize")
-                            })?;
-                            master
-                                .resize(pty_size)
-                                .context("failed to resize PTY for local mode")?;
-                            drop(guard);
-                            let _ = terminal_core.resize(ResizeEventV2 {
-                                resize_seq: 0,
-                                cols: pty_size.cols,
-                                rows: pty_size.rows,
-                                input_stream_id: "local".to_string(),
-                                last_input_ack: 0,
-                            });
-                            msgs
+                            )?
+                            .unwrap_or_default()
+                        } else {
+                            Vec::new()
                         }
                     }
-                }
-                Some(status) = cli_status_rx.recv() => {
+                    TerminalV2Control::EnterLocalMode => {
+                        flush_deadline = None;
+                        let mut folded_unsent_output = false;
+                        if !pending_output.is_empty() {
+                            let bytes = std::mem::take(&mut pending_output);
+                            let batch = feed_terminal_vt_bytes(&mut terminal_core, &bytes)?;
+                            if batch.has_reset() {
+                                pending_reset_before_resume = true;
+                            }
+                            if batch.has_reset() || !batch.patches.is_empty() {
+                                folded_unsent_output = true;
+                                if let Some(session_kind) =
+                                    terminal_diagnostic_session_kind.as_deref()
+                                {
+                                    for patch in &batch.patches {
+                                        relaycat_log(
+                                            "INFO",
+                                            terminal_patch_diagnostic_line(
+                                                session_kind,
+                                                &bytes,
+                                                &terminal_core,
+                                                patch,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        local_mode_dirty = folded_unsent_output;
+                        relay_output_in_local_mode = true;
+                        if let Some(mut writer) = ws_writer.take() {
+                            let _ = tokio::time::timeout(
+                                WS_SEND_TIMEOUT,
+                                writer.send(Message::Close(None)),
+                            )
+                            .await;
+                        }
+                        mark_app_disconnected(&app_connected);
+                        relaycat_log("INFO", "mode: entered LocalMode; closed relay websocket");
+                        continue;
+                    }
+                    TerminalV2Control::EnterRemoteMode => {
+                        let mut msgs = flush_pending_output(
+                            &mut pending_output,
+                            &mut flush_deadline,
+                            &mut terminal_core,
+                            terminal_diagnostic_session_kind.as_deref(),
+                        )?;
+                        if local_mode_dirty || terminal_msgs_contain_state(&msgs) {
+                            local_mode_dirty = false;
+                            let contains_ris_transaction = msgs.iter().any(|msg| {
+                                    matches!(msg, PlainMsg::TerminalSnapshotV2(snapshot) if snapshot.reset_app_cache)
+                                });
+                            if !contains_ris_transaction {
+                                msgs.clear();
+                                if app_connected.load(Ordering::Acquire) {
+                                    msgs = if let Some(messages) = take_deferred_reset_messages(
+                                        &mut terminal_core,
+                                        &mut pending_reset_before_resume,
+                                    )? {
+                                        messages
+                                    } else {
+                                        terminal_core.snapshot_messages(true)?
+                                    };
+                                }
+                            }
+                        }
+                        relay_output_in_local_mode = false;
+                        msgs
+                    }
+                    TerminalV2Control::Resume(resume) => {
+                        // Fold buffered output into the core so the resume
+                        // reply reflects it, but do not emit it as a
+                        // standalone patch: resume_messages() already
+                        // replays it through the retained patch range.
+                        // Emitting it separately would deliver the same
+                        // patch twice, which the app rejects as a sequence
+                        // gap and recovers from with a full snapshot resync.
+                        flush_deadline = None;
+                        let mut buffered_ris_transaction = None;
+                        if !pending_output.is_empty() {
+                            let bytes = std::mem::take(&mut pending_output);
+                            let batch = feed_terminal_vt_bytes(&mut terminal_core, &bytes)?;
+                            if batch.has_reset() || !batch.patches.is_empty() {
+                                if relay_output_in_local_mode {
+                                    local_mode_dirty = true;
+                                }
+                                if let Some(session_kind) =
+                                    terminal_diagnostic_session_kind.as_deref()
+                                {
+                                    for patch in &batch.patches {
+                                        relaycat_log(
+                                            "INFO",
+                                            terminal_patch_diagnostic_line(
+                                                session_kind,
+                                                &bytes,
+                                                &terminal_core,
+                                                patch,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                            if batch.has_reset() {
+                                buffered_ris_transaction = Some(batch.into_messages());
+                            }
+                        }
+                        let msgs = if let Some(messages) = take_deferred_reset_messages(
+                            &mut terminal_core,
+                            &mut pending_reset_before_resume,
+                        )? {
+                            messages
+                        } else if let Some(transaction) = buffered_ris_transaction {
+                            transaction
+                        } else {
+                            terminal_core.resume_messages(&resume)?
+                        };
+                        if let Ok(mut gate) = resume_gate.lock() {
+                            gate.mark_resume_processed();
+                        }
+                        relaycat_log("INFO", gui_terminal_state_log("live"));
+                        // Announce how the backlog will arrive before it
+                        // does, so the app keeps its reconnect overlay up
+                        // until `target_state_seq` is applied instead of
+                        // relying on a fixed fallback timer.
+                        let mut announced = Vec::with_capacity(msgs.len() + 1);
+                        announced.push(PlainMsg::ResumeAcceptedV2(resume_accepted_for(
+                            &msgs,
+                            terminal_core.current_state_seq(),
+                        )));
+                        announced.extend(msgs);
+                        announced
+                    }
+                    TerminalV2Control::RenderAck(ack) => {
+                        // A render ack only arrives while the app is
+                        // connected. Keep thawing idempotent for old
+                        // reconnect paths.
+                        if deferred_history_thaw.take_render_ack_thaw() {
+                            terminal_core.thaw_history();
+                        }
+                        terminal_core.ack_render(ack);
+                        continue;
+                    }
+                    TerminalV2Control::FreezeHistory => {
+                        deferred_history_thaw.cancel();
+                        terminal_core.freeze_history();
+                        continue;
+                    }
+                    TerminalV2Control::ThawHistory => {
+                        deferred_history_thaw.request(Instant::now());
+                        continue;
+                    }
+                    TerminalV2Control::RequestSnapshot(_) => {
+                        // Fold buffered output into the core so the snapshot
+                        // reflects it, but skip the redundant patch since the
+                        // snapshot it would precede already carries the state.
+                        flush_deadline = None;
+                        let mut buffered_ris_transaction = None;
+                        if !pending_output.is_empty() {
+                            let bytes = std::mem::take(&mut pending_output);
+                            let batch = feed_terminal_vt_bytes(&mut terminal_core, &bytes)?;
+                            if batch.has_reset() || !batch.patches.is_empty() {
+                                if relay_output_in_local_mode {
+                                    local_mode_dirty = true;
+                                }
+                                if let Some(session_kind) =
+                                    terminal_diagnostic_session_kind.as_deref()
+                                {
+                                    for patch in &batch.patches {
+                                        relaycat_log(
+                                            "INFO",
+                                            terminal_patch_diagnostic_line(
+                                                session_kind,
+                                                &bytes,
+                                                &terminal_core,
+                                                patch,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                            if batch.has_reset() {
+                                buffered_ris_transaction = Some(batch.into_messages());
+                            }
+                        }
+                        let msgs = if let Some(messages) = take_deferred_reset_messages(
+                            &mut terminal_core,
+                            &mut pending_reset_before_resume,
+                        )? {
+                            messages
+                        } else if let Some(transaction) = buffered_ris_transaction {
+                            transaction
+                        } else {
+                            terminal_core.snapshot_messages(false)?
+                        };
+                        if let Some(session_kind) = terminal_diagnostic_session_kind.as_deref() {
+                            if let Some(snapshot) = msgs.iter().find_map(|msg| match msg {
+                                PlainMsg::TerminalSnapshotV2(snapshot) => Some(snapshot),
+                                _ => None,
+                            }) {
+                                let core = terminal_core.debug_snapshot();
+                                relaycat_log(
+                                    "INFO",
+                                    format!(
+                                        "terminal_snapshot_diag kind={session_kind} snapshot={} seq={} scrollback_window={} screen_rows={} core_history={} vt_scrollback={} frozen={} alt={} size={}x{}",
+                                        snapshot.snapshot_id,
+                                        snapshot.state_seq,
+                                        snapshot.scrollback_window.len(),
+                                        snapshot.screen_rows.len(),
+                                        core.history_len,
+                                        core.vt_scrollback_len,
+                                        core.history_frozen,
+                                        core.alt_screen,
+                                        core.cols,
+                                        core.rows,
+                                    ),
+                                );
+                            }
+                        }
+                        terminal_snapshot_request_coalescer_for_output.mark_request_finished();
+                        msgs
+                    }
+                    TerminalV2Control::RequestTranscript(request) => {
+                        vec![PlainMsg::TranscriptChunkV2(
+                            terminal_core.transcript_chunk(&request),
+                        )]
+                    }
+                    TerminalV2Control::Resize { event, pty_size } => {
+                        let mut msgs = flush_pending_output(
+                            &mut pending_output,
+                            &mut flush_deadline,
+                            &mut terminal_core,
+                            terminal_diagnostic_session_kind.as_deref(),
+                        )?;
+                        mark_local_mode_dirty_from_msgs(
+                            &msgs,
+                            relay_output_in_local_mode,
+                            &mut local_mode_dirty,
+                        );
+                        let guard = master_for_terminal_control.lock().map_err(|_| {
+                            anyhow::anyhow!("PTY master lock poisoned during resize")
+                        })?;
+                        let master = guard.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("PTY master unavailable during resize")
+                        })?;
+                        master.resize(pty_size).context("failed to resize PTY")?;
+                        drop(guard);
+                        let resize_msgs = terminal_core.resize_messages(event, false)?;
+                        if let Some(session_kind) = terminal_diagnostic_session_kind.as_deref() {
+                            if let Some(snapshot) = resize_msgs.iter().find_map(|msg| match msg {
+                                PlainMsg::TerminalSnapshotV2(snapshot) => Some(snapshot),
+                                _ => None,
+                            }) {
+                                let core = terminal_core.debug_snapshot();
+                                relaycat_log(
+                                    "INFO",
+                                    format!(
+                                        "terminal_resize_snapshot_diag kind={session_kind} snapshot={} seq={} scrollback_window={} core_history={} vt_scrollback={} frozen={} alt={} size={}x{}",
+                                        snapshot.snapshot_id,
+                                        snapshot.state_seq,
+                                        snapshot.scrollback_window.len(),
+                                        core.history_len,
+                                        core.vt_scrollback_len,
+                                        core.history_frozen,
+                                        core.alt_screen,
+                                        core.cols,
+                                        core.rows,
+                                    ),
+                                );
+                            }
+                        }
+                        msgs.extend(resize_msgs);
+                        msgs
+                    }
+                    TerminalV2Control::LocalResize { pty_size } => {
+                        let msgs = flush_pending_output(
+                            &mut pending_output,
+                            &mut flush_deadline,
+                            &mut terminal_core,
+                            terminal_diagnostic_session_kind.as_deref(),
+                        )?;
+                        mark_local_mode_dirty_from_msgs(
+                            &msgs,
+                            relay_output_in_local_mode,
+                            &mut local_mode_dirty,
+                        );
+                        let guard = master_for_terminal_control.lock().map_err(|_| {
+                            anyhow::anyhow!("PTY master lock poisoned during local resize")
+                        })?;
+                        let master = guard.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("PTY master unavailable during local resize")
+                        })?;
+                        master
+                            .resize(pty_size)
+                            .context("failed to resize PTY for local mode")?;
+                        drop(guard);
+                        let _ = terminal_core.resize(ResizeEventV2 {
+                            resize_seq: 0,
+                            cols: pty_size.cols,
+                            rows: pty_size.rows,
+                            input_stream_id: "local".to_string(),
+                            last_input_ack: 0,
+                        });
+                        msgs
+                    }
+                },
+                RelayOutputEvent::CliStatus(status) => {
                     vec![PlainMsg::CliStatus(status)]
                 }
-                _ = sleep_until_opt(flush_deadline), if flush_deadline.is_some() => {
+                RelayOutputEvent::FlushDeadline => {
                     let msgs = flush_pending_output(
                         &mut pending_output,
                         &mut flush_deadline,
@@ -1876,7 +1933,7 @@ where
                     );
                     msgs
                 }
-                _ = sleep_until_opt(deferred_history_thaw.deadline()), if deferred_history_thaw.deadline().is_some() => {
+                RelayOutputEvent::HistoryThawDeadline => {
                     if deferred_history_thaw.take_due(Instant::now()) {
                         let msgs = flush_pending_output(
                             &mut pending_output,
@@ -1895,34 +1952,16 @@ where
                         continue;
                     }
                 }
-                Some(event) = output_rx.recv() => {
-                    match event {
-                        PtyEvent::Plain(msg) => vec![msg],
-                        PtyEvent::Output(bytes) => {
-                            pending_output.extend_from_slice(&bytes);
-                            deferred_history_thaw.observe_pty_output(Instant::now());
-                            if flush_deadline.is_none() {
-                                flush_deadline = Some(Instant::now() + PTY_OUTPUT_COALESCE_WINDOW);
-                            }
-                            if pending_output.len() >= PTY_OUTPUT_COALESCE_MAX_BYTES {
-                                let msgs = flush_pending_output(
-                                    &mut pending_output,
-                                    &mut flush_deadline,
-                                    &mut terminal_core,
-                                    terminal_diagnostic_session_kind.as_deref(),
-                                )?;
-                                mark_local_mode_dirty_from_msgs(
-                                    &msgs,
-                                    relay_output_in_local_mode,
-                                    &mut local_mode_dirty,
-                                );
-                                msgs
-                            } else {
-                                continue;
-                            }
+                RelayOutputEvent::Output(event) => match event {
+                    PtyEvent::Plain(msg) => vec![msg],
+                    PtyEvent::Output(bytes) => {
+                        pending_output.extend_from_slice(&bytes);
+                        deferred_history_thaw.observe_pty_output(Instant::now());
+                        if flush_deadline.is_none() {
+                            flush_deadline = Some(Instant::now() + PTY_OUTPUT_COALESCE_WINDOW);
                         }
-                        PtyEvent::Exit(status) => {
-                            let mut msgs = flush_pending_output(
+                        if pending_output.len() >= PTY_OUTPUT_COALESCE_MAX_BYTES {
+                            let msgs = flush_pending_output(
                                 &mut pending_output,
                                 &mut flush_deadline,
                                 &mut terminal_core,
@@ -1933,12 +1972,27 @@ where
                                 relay_output_in_local_mode,
                                 &mut local_mode_dirty,
                             );
-                            msgs.push(process_exit_msg(&status));
                             msgs
-                        },
+                        } else {
+                            continue;
+                        }
                     }
-                }
-                else => break,
+                    PtyEvent::Exit(status) => {
+                        let mut msgs = flush_pending_output(
+                            &mut pending_output,
+                            &mut flush_deadline,
+                            &mut terminal_core,
+                            terminal_diagnostic_session_kind.as_deref(),
+                        )?;
+                        mark_local_mode_dirty_from_msgs(
+                            &msgs,
+                            relay_output_in_local_mode,
+                            &mut local_mode_dirty,
+                        );
+                        msgs.push(process_exit_msg(&status));
+                        msgs
+                    }
+                },
             };
 
             let sending_cli_metadata =

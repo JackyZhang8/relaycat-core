@@ -720,6 +720,73 @@ async fn app_resume_does_not_replace_the_active_app() {
 }
 
 #[tokio::test]
+async fn app_resume_replaces_a_lingering_transport_from_the_same_device() {
+    let hub = Hub::default();
+    let (cli_tx, mut cli_rx) = mpsc::channel(64);
+    let (app_active_tx, mut app_active_rx) = mpsc::channel(64);
+    let (app_active_close_tx, mut app_active_close_rx) = mpsc::channel(1);
+    let (app_resume_tx, _app_resume_rx) = mpsc::channel(64);
+    let app_device_pubkey = [2; 32];
+
+    hub.join(JoinRequest::new(
+        "room-1",
+        Role::Cli,
+        1,
+        [1; 32],
+        None,
+        cli_tx,
+    ))
+    .expect("cli joins");
+    hub.join(
+        JoinRequest::new(
+            "room-1",
+            Role::App,
+            2,
+            app_device_pubkey,
+            Some([9; 32]),
+            app_active_tx,
+        )
+        .with_close_signal(app_active_close_tx),
+    )
+    .expect("active app joins");
+
+    let _ = cli_rx.recv().await;
+    let _ = app_active_rx.recv().await;
+
+    let evicted_another_device = hub
+        .join(
+            JoinRequest::new(
+                "room-1",
+                Role::App,
+                3,
+                app_device_pubkey,
+                Some([8; 32]),
+                app_resume_tx,
+            )
+            .with_app_join_intent(AppJoinIntent::Resume),
+        )
+        .expect("same-device resume replaces its lingering transport");
+
+    assert!(!evicted_another_device);
+    assert_eq!(
+        app_active_close_rx.recv().await,
+        Some(CloseSignal::Replaced)
+    );
+    assert!(
+        app_active_rx.try_recv().is_err(),
+        "same-device replacement must not enqueue an Evicted frame"
+    );
+    assert!(matches!(
+        cli_rx.recv().await,
+        Some(OuterFrame::PeerJoined {
+            role: Role::App,
+            device_pubkey,
+            ..
+        }) if device_pubkey == app_device_pubkey
+    ));
+}
+
+#[tokio::test]
 async fn protected_room_rejects_app_without_matching_relay_admission() {
     let hub = Hub::default();
     let (cli_tx, mut cli_rx) = mpsc::channel(64);

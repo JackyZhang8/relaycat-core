@@ -561,6 +561,92 @@ fn terminal_core_resume_coalesces_contiguous_retained_patches() {
 }
 
 #[test]
+fn terminal_core_resume_uses_snapshot_when_replay_has_more_than_128_patches() {
+    let mut core = TerminalCore::new(TerminalCoreConfig {
+        terminal_run_id: "run-1".to_string(),
+        cols: 8,
+        rows: 3,
+        patch_retention: 256,
+    });
+    let base = core.snapshot();
+    for index in 0..129 {
+        core.apply_ops(vec![PatchOp::SetTitle(format!("title-{index}"))]);
+    }
+
+    let messages = core
+        .resume_messages(&ResumeV2 {
+            terminal_run_id: Some(base.terminal_run_id.clone()),
+            last_applied_state_seq: base.state_seq,
+            last_snapshot_id: Some(base.snapshot_id),
+            input_stream_id: "stream-1".to_string(),
+            last_input_ack: 0,
+        })
+        .expect("large replay should fall back to snapshot");
+
+    assert!(matches!(
+        messages.first(),
+        Some(PlainMsg::TerminalSnapshotV2(snapshot)) if snapshot.reset_app_cache
+    ));
+}
+
+#[test]
+fn terminal_core_resume_replays_exactly_128_small_patches() {
+    let mut core = TerminalCore::new(TerminalCoreConfig {
+        terminal_run_id: "run-1".to_string(),
+        cols: 8,
+        rows: 3,
+        patch_retention: 256,
+    });
+    let base = core.snapshot();
+    for index in 0..128 {
+        core.apply_ops(vec![PatchOp::SetTitle(format!("title-{index}"))]);
+    }
+
+    let messages = core
+        .resume_messages(&ResumeV2 {
+            terminal_run_id: Some(base.terminal_run_id.clone()),
+            last_applied_state_seq: base.state_seq,
+            last_snapshot_id: Some(base.snapshot_id),
+            input_stream_id: "stream-1".to_string(),
+            last_input_ack: 0,
+        })
+        .expect("replay at the patch-count limit should remain incremental");
+
+    assert!(matches!(
+        messages.as_slice(),
+        [PlainMsg::TerminalPatchV2(patch)] if patch.from_state_seq == 1 && patch.to_state_seq == 128
+    ));
+}
+
+#[test]
+fn terminal_core_resume_uses_snapshot_when_replay_exceeds_512_kib_total() {
+    let mut core = TerminalCore::new(TerminalCoreConfig {
+        terminal_run_id: "run-1".to_string(),
+        cols: 8,
+        rows: 3,
+        patch_retention: 8,
+    });
+    let base = core.snapshot();
+    core.apply_ops(vec![PatchOp::SetTitle("a".repeat(300 * 1024))]);
+    core.apply_ops(vec![PatchOp::SetTitle("b".repeat(300 * 1024))]);
+
+    let messages = core
+        .resume_messages(&ResumeV2 {
+            terminal_run_id: Some(base.terminal_run_id.clone()),
+            last_applied_state_seq: base.state_seq,
+            last_snapshot_id: Some(base.snapshot_id),
+            input_stream_id: "stream-1".to_string(),
+            last_input_ack: 0,
+        })
+        .expect("large replay should fall back to snapshot");
+
+    assert!(matches!(
+        messages.first(),
+        Some(PlainMsg::TerminalSnapshotV2(snapshot)) if snapshot.reset_app_cache
+    ));
+}
+
+#[test]
 fn terminal_core_resume_coalesced_patch_carries_latest_attr_table() {
     let mut core = TerminalCore::new(TerminalCoreConfig {
         terminal_run_id: "run-1".to_string(),
@@ -1160,15 +1246,14 @@ fn assert_ris_transaction_preserves_all_post_reset_rows(split_ris: bool) {
             last_input_ack: 0,
         })
         .expect("post-RIS patches should remain resumable");
-    let resumed_rows = resumed
-        .iter()
-        .map(|message| match message {
-            PlainMsg::TerminalPatchV2(patch) => patch,
-            other => panic!("post-RIS resume must replay patches, got {other:?}"),
-        })
-        .flat_map(|patch| appended_row_texts(patch, usize::from(cols)))
-        .collect::<Vec<_>>();
-    assert_eq!(resumed_rows, expected);
+    let Some(PlainMsg::TerminalSnapshotV2(snapshot)) = resumed.first() else {
+        panic!("large post-RIS resume must switch to a snapshot transaction");
+    };
+    assert!(snapshot.reset_app_cache);
+    assert_eq!(
+        row_text(&snapshot.screen_rows[0], usize::from(cols)).trim_end(),
+        format!("new-0399-{}", "x".repeat(220))
+    );
 }
 
 #[test]

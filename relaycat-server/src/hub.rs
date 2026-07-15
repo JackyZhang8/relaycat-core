@@ -175,9 +175,16 @@ impl Hub {
         if !room.accepts_admission(request.relay_admission) {
             return Err(HubError::AdmissionRejected);
         }
+        let resumes_same_app_device = request.role == Role::App
+            && request.app_join_intent == AppJoinIntent::Resume
+            && room
+                .app
+                .as_ref()
+                .is_some_and(|app| app.device_pubkey == request.device_pubkey);
         if request.role == Role::App
             && request.app_join_intent == AppJoinIntent::Resume
             && room.app.is_some()
+            && !resumes_same_app_device
         {
             return Err(HubError::AppSessionTaken);
         }
@@ -221,19 +228,27 @@ impl Hub {
                 let evicted = room.app.take();
                 room.app = Some(newcomer);
                 if let Some(old_app) = evicted {
-                    // Tell old app it was displaced by a newer connection so it
-                    // can surface "另一台设备已连接" and not auto-retry.
-                    // CLI learns about the new app connection from PeerJoined
-                    // below; app disconnects are intentionally invisible to CLI
-                    // so it can remain idle. The old transport is already
-                    // displaced, so a failed notice only leaves it to time out.
-                    if let Err(err) = old_app.outbound.try_send(OuterFrame::Evicted) {
-                        log_control_send_failure(&request.room_id, "Evicted", "old app", &err);
+                    if resumes_same_app_device {
+                        // A foreground/network resume can reach the relay before
+                        // the same App's previous WebSocket leave is observed.
+                        // Replace that stale transport without claiming another
+                        // device took over the session.
+                        signal_close(&old_app, CloseSignal::Replaced);
+                    } else {
+                        // Tell old app it was displaced by a newer connection so
+                        // it can surface "另一台设备已连接" and not auto-retry.
+                        // CLI learns about the new app connection from PeerJoined
+                        // below; app disconnects are intentionally invisible to
+                        // CLI so it can remain idle. The old transport is already
+                        // displaced, so a failed notice only leaves it to time out.
+                        if let Err(err) = old_app.outbound.try_send(OuterFrame::Evicted) {
+                            log_control_send_failure(&request.room_id, "Evicted", "old app", &err);
+                        }
+                        // Out-of-band close so the displaced transport terminates
+                        // even when its ordinary outbound queue is full.
+                        signal_close(&old_app, CloseSignal::Evicted);
+                        app_evicted = true;
                     }
-                    // Out-of-band close so the displaced transport terminates
-                    // even when its ordinary outbound queue is full.
-                    signal_close(&old_app, CloseSignal::Evicted);
-                    app_evicted = true;
                 }
             }
         }

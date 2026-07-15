@@ -1,5 +1,8 @@
 use super::*;
 
+const TERMINAL_RESUME_MAX_REPLAY_PATCHES: usize = 128;
+const TERMINAL_RESUME_MAX_REPLAY_BYTES: usize = 512 * 1024;
+
 struct SnapshotPlan {
     snapshot: TerminalSnapshotV2,
     patches: Vec<TerminalPatchV2>,
@@ -403,6 +406,16 @@ impl TerminalCore {
         snapshot_id: u64,
         state_seq: u64,
     ) -> Option<Vec<TerminalPatchV2>> {
+        self.retained_patches_after_with_budget(snapshot_id, state_seq, usize::MAX, usize::MAX)
+    }
+
+    fn retained_patches_after_with_budget(
+        &self,
+        snapshot_id: u64,
+        state_seq: u64,
+        max_patches: usize,
+        max_encoded_bytes: usize,
+    ) -> Option<Vec<TerminalPatchV2>> {
         if snapshot_id != self.active_snapshot_id {
             return None;
         }
@@ -421,8 +434,16 @@ impl TerminalCore {
 
         let mut expected = expected_first;
         let mut patches = Vec::new();
+        let mut encoded_bytes = 0usize;
         for patch in self.retained_patches.iter().skip(first_index) {
             if patch.from_state_seq != expected {
+                return None;
+            }
+            if patches.len() >= max_patches {
+                return None;
+            }
+            encoded_bytes = encoded_bytes.checked_add(terminal_patch_v2_encoded_len(patch))?;
+            if encoded_bytes > max_encoded_bytes {
                 return None;
             }
             expected = patch.to_state_seq.saturating_add(1);
@@ -443,8 +464,12 @@ impl TerminalCore {
             && resume.last_snapshot_id == Some(self.active_snapshot_id);
 
         if can_resume
-            && let Some(patches) =
-                self.retained_patches_after(self.active_snapshot_id, resume.last_applied_state_seq)
+            && let Some(patches) = self.retained_patches_after_with_budget(
+                self.active_snapshot_id,
+                resume.last_applied_state_seq,
+                TERMINAL_RESUME_MAX_REPLAY_PATCHES,
+                TERMINAL_RESUME_MAX_REPLAY_BYTES,
+            )
             && (self.incremental_attrs_enabled()
                 || patches.iter().all(|patch| patch.attrs_base_len.is_none()))
             && patches_fit_relay_budget(&patches)
