@@ -705,6 +705,14 @@ fn clear_sensitive_data(opts: ClearOpts) -> Result<ClearReport, String> {
 }
 
 #[tauri::command]
+async fn check_relay_compatibility(
+    app: AppHandle,
+    relay_url: String,
+) -> relay::RelayCompatibilityCheck {
+    relay::probe_relay_compatibility(&relay_url, &app.package_info().version.to_string()).await
+}
+
+#[tauri::command]
 fn create_session(
     app: AppHandle,
     state: State<SessionManager>,
@@ -1336,6 +1344,7 @@ pub fn run() {
             list_paired_devices,
             revoke_pairing,
             clear_sensitive_data,
+            check_relay_compatibility,
             create_session,
             write_session,
             resize_session,
