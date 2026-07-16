@@ -663,11 +663,11 @@ impl RelayErrorCode {
         match self {
             RelayErrorCode::ServerAtCapacity
             | RelayErrorCode::JoinTimeout
-            | RelayErrorCode::PeerNotRegistered
             | RelayErrorCode::JoinNotificationFailed
             | RelayErrorCode::HeartbeatTimeout
             | RelayErrorCode::RateLimited => true,
-            RelayErrorCode::InvalidRoomId
+            RelayErrorCode::PeerNotRegistered
+            | RelayErrorCode::InvalidRoomId
             | RelayErrorCode::FrameTooLarge
             | RelayErrorCode::InvalidJoin
             | RelayErrorCode::JoinRoomRoleMismatch
@@ -1210,7 +1210,7 @@ mod capability_decode_tests {
     fn relay_error_code_retryability_matrix() {
         assert!(RelayErrorCode::ServerAtCapacity.is_retryable());
         assert!(RelayErrorCode::JoinTimeout.is_retryable());
-        assert!(RelayErrorCode::PeerNotRegistered.is_retryable());
+        assert!(!RelayErrorCode::PeerNotRegistered.is_retryable());
         assert!(RelayErrorCode::JoinNotificationFailed.is_retryable());
         assert!(RelayErrorCode::HeartbeatTimeout.is_retryable());
         assert!(RelayErrorCode::RateLimited.is_retryable());
