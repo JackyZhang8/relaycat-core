@@ -15,6 +15,10 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { I18N, type Lang } from "./i18n";
+import {
+  createRelayCompatibilityChecker,
+  type RelayCompatibilityCheck,
+} from "./relay-compatibility";
 import { MAX_TAB_COUNT, canCreateTab } from "./tab-limit";
 import { tabScrollState } from "./tab-scroll";
 import thirdPartyLicenses from "./third-party-licenses.txt?raw";
@@ -231,6 +235,10 @@ let pairingTabId: string | null = null;
 let diagTimer: number | null = null;
 let pairCountdownTimer: number | null = null;
 let tabMenuEl: HTMLDivElement | null = null;
+
+const relayCompatibility = createRelayCompatibilityChecker((relayUrl) =>
+  invoke<RelayCompatibilityCheck>("check_relay_compatibility", { relayUrl }),
+);
 
 function clearPairCountdown() {
   if (pairCountdownTimer !== null) {
@@ -857,6 +865,29 @@ async function createTab(tool: string, project: string, relay: string) {
     else clearRemoteGrid(tab);
     return true;
   });
+
+  if (relay) {
+    const compatibility = await relayCompatibility(relay);
+    if (compatibility.status === "incompatible") {
+      tab.mode = "relay";
+      tab.state = "exited";
+      pairingTabId = tab.id;
+      openOverlay("ov-pair");
+      setPairView("error");
+      $("#pair-error-title").textContent = t("relay_incompatible_title");
+      const messageKey =
+        compatibility.action === "upgrade_server" ? "relay_upgrade_server" : "relay_upgrade_gui";
+      const detail = t(
+        "relay_version_detail",
+        compatibility.server_version ?? "—",
+        compatibility.min_gui_version ?? "—",
+      );
+      $("#pair-error-log").textContent = `${t(messageKey)}\n${detail}`;
+      refreshTabEl(tab);
+      renderStatusbar();
+      return;
+    }
+  }
 
   try {
     const info = await invoke<SessionInfo>("create_session", {
