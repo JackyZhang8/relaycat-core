@@ -49,6 +49,8 @@ async fn root_returns_running_status_and_version() {
 
     assert_eq!(json["status"], "running");
     assert_eq!(json["version"], format!("v{}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(json["protocol_version"], 1);
+    assert_eq!(json["min_gui_version"], "0.1.5");
 }
 
 #[tokio::test]
