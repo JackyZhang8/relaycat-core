@@ -391,7 +391,7 @@ pub enum TerminalTranscriptEntryKind {
 /// Identifies one row-boundary fragment of a logical screen-frame transcript
 /// entry. The field containing this metadata is optional so older V2 peers can
 /// ignore it while continuing to decode every fragment as an ordinary entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TerminalTranscriptFrameFragmentV2 {
     /// `entry_id` of the first fragment in this logical frame.
     pub frame_id: u64,
@@ -399,6 +399,32 @@ pub struct TerminalTranscriptFrameFragmentV2 {
     pub fragment_index: u32,
     /// Total number of fragments required to reconstruct the frame.
     pub fragment_count: u32,
+}
+
+impl<'de> Deserialize<'de> for TerminalTranscriptFrameFragmentV2 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireFragment {
+            frame_id: u64,
+            fragment_index: u32,
+            fragment_count: u32,
+        }
+
+        let fragment = WireFragment::deserialize(deserializer)?;
+        if fragment.fragment_count == 0 || fragment.fragment_index >= fragment.fragment_count {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "invalid transcript fragment coordinates",
+            ));
+        }
+        Ok(Self {
+            frame_id: fragment.frame_id,
+            fragment_index: fragment.fragment_index,
+            fragment_count: fragment.fragment_count,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

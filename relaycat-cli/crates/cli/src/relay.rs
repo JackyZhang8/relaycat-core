@@ -95,6 +95,10 @@ pub(crate) use work_mode::*;
 const CLI_STATUS_INTERVAL: Duration = Duration::from_secs(3);
 const MIN_REMOTE_RESIZE_COLS: u16 = 20;
 const MIN_REMOTE_RESIZE_ROWS: u16 = 5;
+/// Codex v0.144.x draws its welcome card across 52 columns even when the
+/// terminal is narrower. Reserve one additional column so the card's right
+/// border never enters delayed autowrap; the app can scroll its viewport.
+const CODEX_MIN_REMOTE_COLS: u16 = 53;
 const TERMINAL_V2_PATCH_RETENTION: usize = 4096;
 /// PTY output is coalesced over this window before a terminal patch is emitted,
 /// so a burst of small writes (e.g. a build log) becomes a handful of larger
@@ -1282,6 +1286,7 @@ where
         let status_bar_for_input_thread = status_bar.clone();
         let input_thread_title_context = chrome_title_context.clone();
         let local_mode_fallback_host_size = pty_size;
+        let remote_resize_session_kind_for_local_input = target.session_kind.clone();
         Some(thread::spawn(move || -> std::io::Result<()> {
             let mut stdin = io::stdin().lock();
             let mut buffer = [0_u8; 8192];
@@ -1373,7 +1378,10 @@ where
                                 // window on the GUI pipe bridge) picks up any
                                 // window resize on this Ctrl-G re-entry.
                                 let (pty_cols, pty_rows) = effective_remote_size(
-                                    app_size.0,
+                                    effective_remote_resize_cols_for_session(
+                                        &remote_resize_session_kind_for_local_input,
+                                        app_size.0,
+                                    ),
                                     app_size.1,
                                     current_terminal_size(),
                                 );
@@ -1500,6 +1508,7 @@ where
     let reconnect_signal_tx_for_input_gap = reconnect_signal_tx.clone();
     let pty_work_mode_for_input = pty_work_mode.clone();
     let pty_work_mode_for_relay_input = pty_work_mode.clone();
+    let remote_resize_session_kind_for_relay_input = target.session_kind.clone();
     let terminal_palette_for_relay = terminal_palette.palette.clone();
     let pty_work_mode_for_relay_output = pty_work_mode.clone();
     let status_bar_for_resize = status_bar.clone();
@@ -2463,7 +2472,10 @@ where
                     // and the phone then render the same layout, and
                     // bottom-anchored TUIs stay visible on both sides.
                     let (effective_cols, effective_rows) = effective_remote_size(
-                        effective_remote_resize_cols(event.cols),
+                        effective_remote_resize_cols_for_session(
+                            &remote_resize_session_kind_for_relay_input,
+                            event.cols,
+                        ),
                         event.rows,
                         current_terminal_size(),
                     );
@@ -2844,6 +2856,14 @@ fn remote_resize_pty_size(cols: u16, rows: u16) -> Option<PtySize> {
 
 fn effective_remote_resize_cols(cols: u16) -> u16 {
     cols
+}
+
+fn effective_remote_resize_cols_for_session(session_kind: &SessionKind, cols: u16) -> u16 {
+    if session_kind == &SessionKind::codex() {
+        cols.max(CODEX_MIN_REMOTE_COLS)
+    } else {
+        effective_remote_resize_cols(cols)
+    }
 }
 
 /// The size given to the app-facing semantic model (`terminal_core`). It always

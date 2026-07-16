@@ -73,7 +73,11 @@ impl CodexWelcomeNormalizer {
             }
             if self.marker_probe == CODEX_WELCOME_TOP_LEFT {
                 let visible_prefix = terminal_visible_text(&self.normal_line_prefix);
-                if self.normal_line_started_by_newline && visible_prefix.is_empty() {
+                let starts_after_newline =
+                    self.normal_line_started_by_newline && visible_prefix.is_empty();
+                let starts_after_terminal_home =
+                    visible_prefix.is_empty() && line_was_explicitly_homed(&self.normal_line_prefix);
+                if starts_after_newline || starts_after_terminal_home {
                     self.candidate.append(&mut self.marker_probe);
                     self.in_candidate = true;
                 } else {
@@ -116,6 +120,38 @@ impl CodexWelcomeNormalizer {
     }
 }
 
+fn line_was_explicitly_homed(bytes: &[u8]) -> bool {
+    let mut index = 0;
+    let mut last_cursor_position_is_home = None;
+    while index < bytes.len() {
+        if let Some(len) = terminal_control_sequence_len(&bytes[index..]) {
+            let sequence = &bytes[index..index + len];
+            if matches!(sequence.last(), Some(b'H' | b'f')) && sequence.starts_with(b"\x1b[") {
+                last_cursor_position_is_home = Some(cursor_position_is_home(sequence));
+            }
+            index += len;
+        } else if let Some((_, len)) = next_utf8_char(&bytes[index..]) {
+            index += len;
+        } else {
+            index += 1;
+        }
+    }
+    last_cursor_position_is_home == Some(true)
+}
+
+fn cursor_position_is_home(sequence: &[u8]) -> bool {
+    let Some(params) = sequence.get(2..sequence.len().saturating_sub(1)) else {
+        return false;
+    };
+    let mut params = params.split(|byte| *byte == b';');
+    let row = params.next().unwrap_or_default();
+    let col = params.next().unwrap_or_default();
+    params.next().is_none()
+        && [row, col]
+            .iter()
+            .all(|param| param.is_empty() || *param == b"1")
+}
+
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
@@ -128,6 +164,10 @@ fn normalize_codex_welcome_card(card: &[u8], cols: u16) -> Vec<u8> {
         return card.to_vec();
     }
     let mut output = Vec::with_capacity(card.len());
+    // Codex can position its first border cell at column 2 before writing the
+    // welcome card. Start the rebuilt card at column 1 so its deliberately
+    // unused final column remains unused in the physical terminal as well.
+    output.push(b'\r');
     let mut start = 0;
     for (index, byte) in card.iter().enumerate() {
         if *byte == b'\n' {
@@ -163,7 +203,7 @@ fn rebuild_codex_border_line(line: &[u8], cols: u16, left: char, right: char) ->
     let (body, ending) = split_line_ending(line);
     let first_printable = first_printable_offset(body).unwrap_or(0);
     let mut output = Vec::with_capacity(body.len());
-    output.extend_from_slice(&body[..first_printable]);
+    append_sgr_sequences(&mut output, &body[..first_printable]);
     output.extend_from_slice(left.to_string().as_bytes());
     output.extend_from_slice("─".repeat(usize::from(cols.saturating_sub(2))).as_bytes());
     output.extend_from_slice(right.to_string().as_bytes());
@@ -181,7 +221,10 @@ fn rebuild_codex_content_line(line: &[u8], cols: u16) -> Vec<u8> {
     let mut saw_printable = false;
     while index < body.len() {
         if let Some(len) = terminal_control_sequence_len(&body[index..]) {
-            output.extend_from_slice(&body[index..index + len]);
+            let sequence = &body[index..index + len];
+            if is_sgr_sequence(sequence) {
+                output.extend_from_slice(sequence);
+            }
             index += len;
             continue;
         }
@@ -211,6 +254,29 @@ fn rebuild_codex_content_line(line: &[u8], cols: u16) -> Vec<u8> {
     output.extend_from_slice(b"\x1b[0m");
     output.extend_from_slice(ending);
     output
+}
+
+fn append_sgr_sequences(output: &mut Vec<u8>, bytes: &[u8]) {
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(len) = terminal_control_sequence_len(&bytes[index..]) {
+            let sequence = &bytes[index..index + len];
+            if is_sgr_sequence(sequence) {
+                output.extend_from_slice(sequence);
+            }
+            index += len;
+            continue;
+        }
+        if let Some((_, len)) = next_utf8_char(&bytes[index..]) {
+            index += len;
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn is_sgr_sequence(sequence: &[u8]) -> bool {
+    sequence.starts_with(b"\x1b[") && sequence.ends_with(b"m")
 }
 
 fn split_line_ending(line: &[u8]) -> (&[u8], &[u8]) {

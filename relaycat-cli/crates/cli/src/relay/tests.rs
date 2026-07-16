@@ -1,7 +1,7 @@
 use super::*;
 use crate::i18n::CliLanguage;
 use relaycat_crypto::{KeyPair, PairingRole, SessionKeys, pairing_token_hash, pairing_token_proof};
-use relaycat_protocol::TerminalPatchV2;
+use relaycat_protocol::{ResizeAckV2, TerminalPatchV2};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -481,6 +481,18 @@ fn remote_resize_accepts_usable_terminal_sizes() {
 #[test]
 fn remote_resize_preserves_phone_reported_width() {
     assert_eq!(effective_remote_resize_cols(42), 42);
+}
+
+#[test]
+fn codex_remote_resize_reserves_its_minimum_banner_width() {
+    assert_eq!(
+        effective_remote_resize_cols_for_session(&SessionKind::codex(), 48),
+        53
+    );
+    assert_eq!(
+        effective_remote_resize_cols_for_session(&SessionKind::claude(), 48),
+        48
+    );
 }
 
 fn host(cols: u16, rows: u16) -> Option<PtySize> {
@@ -1415,6 +1427,47 @@ fn codex_welcome_normalizer_uses_current_pty_width() {
 }
 
 #[test]
+fn codex_welcome_normalizer_handles_card_after_terminal_home() {
+    let mut card = oversized_codex_welcome_card();
+    let card = card.split_off(b"before\r\n".len());
+    let mut input = b"\x1b[?1049h\x1b[H\x1b[2J".to_vec();
+    input.extend_from_slice(&card);
+
+    let mut normalizer = CodexWelcomeNormalizer::new(true);
+    let output = normalizer.filter(&input, 51);
+
+    assert_eq!(normalizer.take_normalized_count(), 1);
+    let visible = terminal_visible_text_for_test(&output);
+    for line in visible
+        .lines()
+        .filter(|line| matches!(line.chars().next(), Some('╭' | '│' | '╰')))
+    {
+        assert_eq!(terminal_display_width_for_test(line), 50, "{line:?}");
+    }
+}
+
+#[test]
+fn codex_welcome_normalizer_resets_a_narrow_card_to_the_first_column() {
+    let mut card = oversized_codex_welcome_card();
+    let card = card.split_off(b"before\r\n".len());
+    let mut input = b"\r\n\x1b[1;2H".to_vec();
+    input.extend_from_slice(&card);
+
+    let mut normalizer = CodexWelcomeNormalizer::new(true);
+    let output = normalizer.filter(&input, 52);
+
+    let mut terminal = vt100::Parser::new(8, 52, 0);
+    terminal.process(&output);
+    let screen = terminal.screen();
+    assert_eq!(screen.cell(0, 0).unwrap().contents(), "╭");
+    assert_eq!(screen.cell(0, 50).unwrap().contents(), "╮");
+    assert!(
+        !screen.cell(0, 51).unwrap().has_contents(),
+        "the final terminal column must stay unused"
+    );
+}
+
+#[test]
 fn codex_welcome_normalizer_leaves_last_terminal_column_unused() {
     let mut normalizer = CodexWelcomeNormalizer::new(true);
     let output = normalizer.filter(&oversized_codex_welcome_card(), 48);
@@ -1503,6 +1556,34 @@ fn codex_welcome_normalizer_preserves_utf8_cell_boundaries() {
     {
         assert_eq!(terminal_display_width_for_test(line), 19);
     }
+}
+
+#[test]
+fn codex_welcome_normalizer_removes_cursor_motion_that_overwrites_left_border() {
+    let card = concat!(
+        "\r\n\x1b[2m╭──────────────────────────────────────────────────╮\x1b[0m\r\n",
+        "\x1b[2m│ \x1b[4D>_ \x1b[1mOpenAI Codex\x1b[22m                    │\x1b[0m\r\n",
+        "\x1b[2m│ model: gpt-5                                    │\x1b[0m\r\n",
+        "\x1b[2m╰──────────────────────────────────────────────────╯\x1b[0m\r\n"
+    )
+    .as_bytes();
+    let mut normalizer = CodexWelcomeNormalizer::new(true);
+    let output = normalizer.filter(card, 51);
+
+    let mut terminal = vt100::Parser::new(8, 51, 0);
+    terminal.process(&output);
+    let screen = terminal.screen();
+    let content_row: String = (0..51)
+        .map(|col| match screen.cell(2, col) {
+            Some(cell) if cell.has_contents() => cell.contents().to_string(),
+            _ => " ".to_string(),
+        })
+        .collect();
+
+    assert!(
+        content_row.starts_with("│ >_ OpenAI Codex"),
+        "cursor motion must not overwrite the rebuilt left border: {content_row:?}"
+    );
 }
 
 #[test]
@@ -2452,6 +2533,94 @@ fn resume_accepted_reflects_reply_contents() {
         .mode,
         ResumeAcceptMode::ReplayingPatches
     );
+
+    let mut terminal_core = TerminalCore::new(TerminalCoreConfig {
+        terminal_run_id: "run".to_string(),
+        cols: 4,
+        rows: 2,
+        patch_retention: 8,
+    });
+    let snapshot = PlainMsg::TerminalSnapshotV2(terminal_core.snapshot());
+    let patch = PlainMsg::TerminalPatchV2(
+        terminal_core.apply_ops(vec![PatchOp::SetTitle("resumed".to_string())]),
+    );
+
+    assert_eq!(
+        resume_accepted_for(&[snapshot.clone()], 0),
+        ResumeAcceptedV2 {
+            mode: ResumeAcceptMode::SendingSnapshot,
+            target_state_seq: 0,
+        }
+    );
+    assert_eq!(
+        resume_accepted_for(&[patch, snapshot], u64::MAX),
+        ResumeAcceptedV2 {
+            mode: ResumeAcceptMode::SendingSnapshot,
+            target_state_seq: u64::MAX,
+        },
+        "snapshot recovery must take precedence over patch replay"
+    );
+}
+
+#[test]
+fn terminal_resume_gate_allows_control_but_blocks_terminal_state() {
+    let control_messages = vec![
+        PlainMsg::HelloAckV2(HelloAckV2 {
+            selected_protocol_version: TERMINAL_STATE_PROTOCOL_V2,
+            capabilities: MANDATORY_CAPABILITIES.to_vec(),
+        }),
+        PlainMsg::ProtocolRejectV2(ProtocolRejectV2 {
+            reason: "incompatible".to_string(),
+            supported_versions: vec![TERMINAL_STATE_PROTOCOL_V2],
+        }),
+        PlainMsg::ResumeAcceptedV2(ResumeAcceptedV2 {
+            mode: ResumeAcceptMode::UpToDate,
+            target_state_seq: u64::MAX,
+        }),
+        PlainMsg::InputAckV2(InputAckV2 {
+            input_stream_id: "stream-1".to_string(),
+            highest_contiguous_input_seq: u64::MAX,
+        }),
+        PlainMsg::ResizeAckV2(ResizeAckV2 {
+            resize_seq: u64::MAX,
+        }),
+        PlainMsg::Heartbeat,
+        PlainMsg::CliStatus(CliStatus {
+            cpu_percent_x10: 0,
+            memory_bytes: 0,
+            rx_bytes_per_sec: 0,
+            tx_bytes_per_sec: 0,
+            process_name: "relaycat".to_string(),
+            collected_at_unix_ms: 0,
+        }),
+        PlainMsg::CliMetadata(CliMetadata {
+            project_path: "/work/project".to_string(),
+        }),
+        PlainMsg::ProcessExit { code: None },
+    ];
+    for message in control_messages {
+        assert!(
+            can_send_without_terminal_resume(&message),
+            "control message should bypass resume gate: {message:?}"
+        );
+    }
+
+    let mut terminal_core = TerminalCore::new(TerminalCoreConfig {
+        terminal_run_id: "run".to_string(),
+        cols: 4,
+        rows: 2,
+        patch_retention: 8,
+    });
+    let terminal_messages = [
+        PlainMsg::TerminalSnapshotV2(terminal_core.snapshot()),
+        PlainMsg::TerminalPatchV2(terminal_core.apply_ops(vec![PatchOp::Bell])),
+    ];
+    for message in terminal_messages {
+        assert!(
+            !can_send_without_terminal_resume(&message),
+            "terminal state must wait for ResumeV2: {message:?}"
+        );
+    }
 }
 
 #[test]
