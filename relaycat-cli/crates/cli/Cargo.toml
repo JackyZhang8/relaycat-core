@@ -24,13 +24,16 @@ ratatui = "0.28"
 rand_core = { version = "0.6", features = ["getrandom"] }
 relaycat-crypto = { path = "../crypto" }
 relaycat-protocol.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls.workspace = true
+semver = "1"
 serde.workspace = true
 serde_json = "1.0"
 sha2 = "0.10"
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 unicode-width = "0.2"
+url = "2"
 vt100 = "0.16"
 
 # Native process metrics on Windows. Reading CPU/memory through the OS APIs

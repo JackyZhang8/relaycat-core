@@ -304,6 +304,26 @@ pub async fn prepare_secure_pairing(
     let language = CliLanguage::from_system_locale();
     let quiet = gui_pairing_quiet();
     target.validate()?;
+    let compatibility = probe_relay_compatibility(&relay.url, env!("CARGO_PKG_VERSION")).await;
+    if compatibility.status == RelayCompatibilityStatus::Incompatible {
+        let server_version = compatibility.server_version.as_deref().unwrap_or("unknown");
+        let minimum_cli = compatibility.min_cli_version.as_deref().unwrap_or("unknown");
+        match compatibility.action.as_deref() {
+            Some("upgrade_server") => anyhow::bail!(
+                "{}: {} ({})",
+                language.t("Upgrade the relay server", "请升级 relay server"),
+                server_version,
+                compatibility.reason
+            ),
+            _ => anyhow::bail!(
+                "{}: relaycat CLI {} requires at least {} (server {})",
+                language.t("Upgrade relaycat CLI", "请升级 relaycat CLI"),
+                env!("CARGO_PKG_VERSION"),
+                minimum_cli,
+                server_version
+            ),
+        }
+    }
     let project_dir = project_dir(target.cwd.as_deref())?;
     if !quiet {
         eprintln!("{}", secure_pairing_header_message(language));

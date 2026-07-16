@@ -2900,3 +2900,69 @@ fn wheel_rewrite_ignores_non_wheel_sgr_reports() {
     assert_eq!(result.bytes, input.to_vec());
     assert_eq!(result.reports, 0);
 }
+
+fn relay_health(protocol_version: Option<u16>, min_cli_version: Option<&str>) -> RelayHealthResponse {
+    RelayHealthResponse {
+        status: "running".to_string(),
+        version: "v0.1.2".to_string(),
+        protocol_version,
+        min_cli_version: min_cli_version.map(str::to_string),
+    }
+}
+
+#[test]
+fn relay_compatibility_accepts_supported_protocol_and_cli_version() {
+    assert_eq!(
+        evaluate_relay_health(&relay_health(Some(1), Some("0.1.2")), "0.1.2").status,
+        RelayCompatibilityStatus::Compatible,
+    );
+}
+
+#[test]
+fn relay_compatibility_asks_for_cli_upgrade_when_server_protocol_is_newer() {
+    let result = evaluate_relay_health(&relay_health(Some(2), None), "0.1.2");
+    assert_eq!(result.status, RelayCompatibilityStatus::Incompatible);
+    assert_eq!(result.action.as_deref(), Some("upgrade_cli"));
+}
+
+#[test]
+fn relay_compatibility_asks_for_server_upgrade_when_server_protocol_is_older() {
+    let result = evaluate_relay_health(&relay_health(Some(0), None), "0.1.2");
+    assert_eq!(result.status, RelayCompatibilityStatus::Incompatible);
+    assert_eq!(result.action.as_deref(), Some("upgrade_server"));
+}
+
+#[test]
+fn relay_compatibility_asks_for_cli_upgrade_when_below_server_minimum() {
+    let result = evaluate_relay_health(&relay_health(Some(1), Some("0.1.3")), "0.1.2");
+    assert_eq!(result.status, RelayCompatibilityStatus::Incompatible);
+    assert_eq!(result.action.as_deref(), Some("upgrade_cli"));
+}
+
+#[test]
+fn relay_compatibility_accepts_legacy_health_without_compatibility_fields() {
+    assert_eq!(
+        evaluate_relay_health(&relay_health(None, None), "0.1.2").status,
+        RelayCompatibilityStatus::Compatible,
+    );
+}
+
+#[test]
+fn relay_compatibility_builds_health_url_from_websocket_relay_url() {
+    assert_eq!(
+        relay_health_url("wss://relay.example.com/prefix/ws?token=abc")
+            .unwrap()
+            .as_str(),
+        "https://relay.example.com/prefix/?token=abc",
+    );
+    assert_eq!(
+        relay_health_url("ws://127.0.0.1:8787").unwrap().as_str(),
+        "http://127.0.0.1:8787/",
+    );
+}
+
+#[tokio::test]
+async fn relay_compatibility_marks_invalid_health_urls_as_unverified() {
+    let result = probe_relay_compatibility("not a URL", "0.1.2").await;
+    assert_eq!(result.status, RelayCompatibilityStatus::Unverified);
+}

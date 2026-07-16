@@ -61,6 +61,7 @@ use crate::{
 // items back through this module root, so the core relay loop in this file and
 // the test module keep referring to them unqualified.
 mod chrome;
+mod compatibility;
 mod diagnostics;
 mod input_filter;
 mod logging;
@@ -76,6 +77,7 @@ mod transport;
 mod work_mode;
 
 pub(crate) use chrome::*;
+pub(crate) use compatibility::*;
 pub(crate) use diagnostics::*;
 pub(crate) use input_filter::*;
 pub(crate) use logging::*;
