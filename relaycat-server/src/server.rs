@@ -49,6 +49,7 @@ pub const DEFAULT_INBOUND_MESSAGES_PER_SECOND: u32 = 120;
 pub const DEFAULT_INBOUND_BYTES_PER_SECOND: usize = 2 * 1024 * 1024;
 const RELAY_PROTOCOL_VERSION: u16 = 1;
 const MIN_GUI_VERSION: &str = "0.1.5";
+const MIN_CLI_VERSION: &str = "0.1.2";
 const ROOM_TTL: Duration = Duration::from_secs(30 * 60);
 const ROOM_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const STATS_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -261,6 +262,7 @@ struct HealthResponse {
     version: String,
     protocol_version: u16,
     min_gui_version: &'static str,
+    min_cli_version: &'static str,
 }
 
 fn deserialize_role<'de, D>(deserializer: D) -> Result<Role, D::Error>
@@ -815,6 +817,7 @@ async fn root_handler() -> impl IntoResponse {
         version: format!("v{}", env!("CARGO_PKG_VERSION")),
         protocol_version: RELAY_PROTOCOL_VERSION,
         min_gui_version: MIN_GUI_VERSION,
+        min_cli_version: MIN_CLI_VERSION,
     })
 }
 
