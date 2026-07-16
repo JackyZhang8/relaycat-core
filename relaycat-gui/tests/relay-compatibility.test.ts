@@ -42,7 +42,9 @@ test("provides localized guidance for incompatible relay versions", () => {
   assert.equal(I18N.zh.relay_incompatible_title, "Relay 版本不兼容");
   assert.match(I18N.zh.relay_upgrade_gui, /升级 GUI/);
   assert.match(I18N.zh.relay_upgrade_server, /升级 relaycat-relay/);
+  assert.match(I18N.zh.relay_version_detail, /最低 CLI/);
   assert.equal(I18N.en.relay_incompatible_title, "Incompatible relay version");
   assert.match(I18N.en.relay_upgrade_gui, /newer RelayCat GUI/);
   assert.match(I18N.en.relay_upgrade_server, /relaycat-relay/);
+  assert.match(I18N.en.relay_version_detail, /minimum CLI/);
 });

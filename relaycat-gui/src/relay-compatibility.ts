@@ -3,6 +3,7 @@ export type RelayCompatibilityCheck = {
   action?: "upgrade_gui" | "upgrade_server" | null;
   server_version?: string | null;
   min_gui_version?: string | null;
+  min_cli_version?: string | null;
   reason: string;
 };
 

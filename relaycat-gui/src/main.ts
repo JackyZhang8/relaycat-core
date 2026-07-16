@@ -881,6 +881,7 @@ async function createTab(tool: string, project: string, relay: string) {
         "relay_version_detail",
         compatibility.server_version ?? "—",
         compatibility.min_gui_version ?? "—",
+        compatibility.min_cli_version ?? "—",
       );
       $("#pair-error-log").textContent = `${t(messageKey)}\n${detail}`;
       refreshTabEl(tab);

@@ -32,6 +32,8 @@ pub struct RelayHealthResponse {
     pub protocol_version: Option<u16>,
     #[serde(default)]
     pub min_gui_version: Option<String>,
+    #[serde(default)]
+    pub min_cli_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -48,16 +50,22 @@ pub struct RelayCompatibilityCheck {
     pub action: Option<String>,
     pub server_version: Option<String>,
     pub min_gui_version: Option<String>,
+    pub min_cli_version: Option<String>,
     pub reason: String,
 }
 
 impl RelayCompatibilityCheck {
-    fn compatible(server_version: &str, min_gui_version: Option<String>) -> Self {
+    fn compatible(
+        server_version: &str,
+        min_gui_version: Option<String>,
+        min_cli_version: Option<String>,
+    ) -> Self {
         Self {
             status: RelayCompatibilityStatus::Compatible,
             action: None,
             server_version: Some(server_version.to_string()),
             min_gui_version,
+            min_cli_version,
             reason: "compatible".to_string(),
         }
     }
@@ -66,6 +74,7 @@ impl RelayCompatibilityCheck {
         action: &str,
         server_version: &str,
         min_gui_version: Option<String>,
+        min_cli_version: Option<String>,
         reason: String,
     ) -> Self {
         Self {
@@ -73,6 +82,7 @@ impl RelayCompatibilityCheck {
             action: Some(action.to_string()),
             server_version: Some(server_version.to_string()),
             min_gui_version,
+            min_cli_version,
             reason,
         }
     }
@@ -83,6 +93,7 @@ impl RelayCompatibilityCheck {
             action: None,
             server_version: None,
             min_gui_version: None,
+            min_cli_version: None,
             reason,
         }
     }
@@ -91,6 +102,7 @@ impl RelayCompatibilityCheck {
 pub fn evaluate_relay_health(
     health: &RelayHealthResponse,
     gui_version: &str,
+    cli_version: &str,
 ) -> RelayCompatibilityCheck {
     let protocol = health.protocol_version.unwrap_or(1);
     let min_supported = *SUPPORTED_RELAY_PROTOCOLS
@@ -114,6 +126,7 @@ pub fn evaluate_relay_health(
             action,
             &health.version,
             health.min_gui_version.clone(),
+            health.min_cli_version.clone(),
             format!("unsupported relay protocol {protocol}"),
         );
     }
@@ -126,12 +139,31 @@ pub fn evaluate_relay_health(
                 "upgrade_gui",
                 &health.version,
                 health.min_gui_version.clone(),
+                health.min_cli_version.clone(),
                 format!("GUI {gui_version} is below required {minimum}"),
             );
         }
     }
 
-    RelayCompatibilityCheck::compatible(&health.version, health.min_gui_version.clone())
+    if let Some(minimum) = health.min_cli_version.as_deref() {
+        let current = Version::parse(cli_version);
+        let required = Version::parse(minimum);
+        if matches!((current, required), (Ok(current), Ok(required)) if current < required) {
+            return RelayCompatibilityCheck::incompatible(
+                "upgrade_gui",
+                &health.version,
+                health.min_gui_version.clone(),
+                health.min_cli_version.clone(),
+                format!("embedded CLI {cli_version} is below required {minimum}"),
+            );
+        }
+    }
+
+    RelayCompatibilityCheck::compatible(
+        &health.version,
+        health.min_gui_version.clone(),
+        health.min_cli_version.clone(),
+    )
 }
 
 pub fn relay_health_url(relay_url: &str) -> Result<Url, String> {
@@ -161,6 +193,7 @@ pub fn relay_health_url(relay_url: &str) -> Result<Url, String> {
 pub async fn probe_relay_compatibility(
     relay_url: &str,
     gui_version: &str,
+    cli_version: &str,
 ) -> RelayCompatibilityCheck {
     let health_url = match relay_health_url(relay_url) {
         Ok(url) => url,
@@ -184,7 +217,7 @@ pub async fn probe_relay_compatibility(
         ));
     }
     match response.json::<RelayHealthResponse>().await {
-        Ok(health) => evaluate_relay_health(&health, gui_version),
+        Ok(health) => evaluate_relay_health(&health, gui_version, cli_version),
         Err(error) => RelayCompatibilityCheck::unverified(error.to_string()),
     }
 }
@@ -254,40 +287,46 @@ pub fn cli_log_path(project_dir: &Path) -> PathBuf {
 mod relay_compatibility_tests {
     use super::*;
 
-    fn health(protocol_version: Option<u16>, min_gui_version: Option<&str>) -> RelayHealthResponse {
+    fn health(
+        protocol_version: Option<u16>,
+        min_gui_version: Option<&str>,
+        min_cli_version: Option<&str>,
+    ) -> RelayHealthResponse {
         RelayHealthResponse {
             status: "running".to_string(),
             version: "v0.1.2".to_string(),
             protocol_version,
             min_gui_version: min_gui_version.map(str::to_string),
+            min_cli_version: min_cli_version.map(str::to_string),
         }
     }
 
     #[test]
     fn accepts_supported_protocol_and_gui_version() {
         assert_eq!(
-            evaluate_relay_health(&health(Some(1), Some("0.1.5")), "0.1.5").status,
+            evaluate_relay_health(&health(Some(1), Some("0.1.5"), None), "0.1.5", "0.1.2").status,
             RelayCompatibilityStatus::Compatible,
         );
     }
 
     #[test]
     fn asks_for_gui_upgrade_when_server_protocol_is_newer() {
-        let result = evaluate_relay_health(&health(Some(2), None), "0.1.5");
+        let result = evaluate_relay_health(&health(Some(2), None, None), "0.1.5", "0.1.2");
         assert_eq!(result.status, RelayCompatibilityStatus::Incompatible);
         assert_eq!(result.action.as_deref(), Some("upgrade_gui"));
     }
 
     #[test]
     fn asks_for_server_upgrade_when_server_protocol_is_older() {
-        let result = evaluate_relay_health(&health(Some(0), None), "0.1.5");
+        let result = evaluate_relay_health(&health(Some(0), None, None), "0.1.5", "0.1.2");
         assert_eq!(result.status, RelayCompatibilityStatus::Incompatible);
         assert_eq!(result.action.as_deref(), Some("upgrade_server"));
     }
 
     #[test]
     fn asks_for_gui_upgrade_when_gui_is_below_server_minimum() {
-        let result = evaluate_relay_health(&health(Some(1), Some("0.1.6")), "0.1.5");
+        let result =
+            evaluate_relay_health(&health(Some(1), Some("0.1.6"), None), "0.1.5", "0.1.2");
         assert_eq!(result.status, RelayCompatibilityStatus::Incompatible);
         assert_eq!(result.action.as_deref(), Some("upgrade_gui"));
     }
@@ -295,9 +334,20 @@ mod relay_compatibility_tests {
     #[test]
     fn accepts_legacy_health_without_compatibility_fields_as_protocol_one() {
         assert_eq!(
-            evaluate_relay_health(&health(None, None), "0.1.5").status,
+            evaluate_relay_health(&health(None, None, None), "0.1.5", "0.1.2").status,
             RelayCompatibilityStatus::Compatible,
         );
+    }
+
+    #[test]
+    fn asks_for_gui_upgrade_when_embedded_cli_is_below_server_minimum() {
+        let result = evaluate_relay_health(
+            &health(Some(1), None, Some("0.1.3")),
+            "0.1.5",
+            "0.1.2",
+        );
+        assert_eq!(result.status, RelayCompatibilityStatus::Incompatible);
+        assert_eq!(result.action.as_deref(), Some("upgrade_gui"));
     }
 
     #[test]
@@ -316,8 +366,11 @@ mod relay_compatibility_tests {
 
     #[test]
     fn marks_an_invalid_relay_url_as_unverified() {
-        let result =
-            tauri::async_runtime::block_on(probe_relay_compatibility("not a URL", "0.1.5"));
+        let result = tauri::async_runtime::block_on(probe_relay_compatibility(
+            "not a URL",
+            "0.1.5",
+            "0.1.2",
+        ));
         assert_eq!(result.status, RelayCompatibilityStatus::Unverified);
     }
 }

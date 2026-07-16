@@ -709,7 +709,12 @@ async fn check_relay_compatibility(
     app: AppHandle,
     relay_url: String,
 ) -> relay::RelayCompatibilityCheck {
-    relay::probe_relay_compatibility(&relay_url, &app.package_info().version.to_string()).await
+    relay::probe_relay_compatibility(
+        &relay_url,
+        &app.package_info().version.to_string(),
+        relaycat_cli::gui_bridge::RELAYCAT_CLI_VERSION,
+    )
+    .await
 }
 
 #[tauri::command]
