@@ -1096,8 +1096,8 @@ async fn open_url(url: String) -> Result<(), String> {
                 .unwrap_or("");
             host == "relaycat.cn"
                 || host == "www.relaycat.cn"
-                || host == "relaycat.dev"
-                || host == "www.relaycat.dev"
+                || host == "relaycat.app"
+                || host == "www.relaycat.app"
                 || (host == "github.com" && url == "https://github.com/jackyZhang8/relaycat-core")
         };
     if !allowed {

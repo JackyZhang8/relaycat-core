@@ -45,7 +45,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     lp_ft3_title: "准备好在沙发上写代码了吗？",
     lp_ft3_desc:
       "可自托管中继，支持主流 Coding Agent，五分钟内配对你的 iPhone。无需订阅，无需注册——跑“/goal”长任务，你需要 RelayCat.app。",
-    lp_foot_site: "官网(https://relaycat.dev)",
+    lp_foot_site: "官网(https://relaycat.app)",
     lp_foot_repo: "开源地址",
     lp_foot_author: "作者 JackyZhang8",
     lp_foot_star: "★ Star",
@@ -387,7 +387,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     lp_ft3_title: "Ready to code from the couch?",
     lp_ft3_desc:
       "Self-host the relay, works with the major coding agents, and pair your iPhone in five minutes. No subscription, no sign-up — to run long \"/goal\" tasks, you want RelayCat.app.",
-    lp_foot_site: "Website (https://relaycat.dev)",
+    lp_foot_site: "Website (https://relaycat.app)",
     lp_foot_repo: "Source",
     lp_foot_author: "By JackyZhang8",
     lp_foot_star: "★ Star",
