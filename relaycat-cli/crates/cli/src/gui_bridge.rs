@@ -7,11 +7,18 @@
 //! so the GUI never needs to locate or spawn a separately compiled `relaycat`
 //! executable.
 
+use std::io::Write;
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::FromArgMatches;
+use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 
 use crate::args::Cli;
 use crate::command::TargetCommand;
@@ -51,10 +58,233 @@ pub const GUI_BRIDGE_ROWS_ENV: &str = "RELAYCAT_GUI_BRIDGE_ROWS";
 pub const GUI_BRIDGE_RESIZE_FILE_ENV: &str = "RELAYCAT_GUI_BRIDGE_RESIZE_FILE";
 
 /// Unique GUI tab/session identifier the GUI host assigns to each relay child.
-/// Scopes the per-session side channels (pairing-URL fallback file, log-tail
-/// pairing marker) so multiple relay tabs on the same project + tool kind never
-/// read each other's pairing URL or paired status.
+/// Scopes the per-session side channels so multiple relay tabs on the same
+/// project + tool kind never read each other's pairing URL or state.
 pub const GUI_SESSION_ID_ENV: &str = "RELAYCAT_GUI_SESSION_ID";
+/// Loopback TCP address of the GUI-owned relay state listener.
+pub const GUI_RELAY_STATE_ADDR_ENV: &str = "RELAYCAT_GUI_STATE_ADDR";
+/// Per-session bearer token required on every relay state message.
+pub const GUI_RELAY_STATE_TOKEN_ENV: &str = "RELAYCAT_GUI_STATE_TOKEN";
+
+/// Relay lifecycle states reported by a GUI-hosted relay child over its
+/// dedicated control channel. Terminal bytes continue to use the PTY/pipe.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuiRelayState {
+    Wait,
+    Syncing,
+    Paired,
+    Error,
+}
+
+impl GuiRelayState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wait => "wait",
+            Self::Syncing => "syncing",
+            Self::Paired => "paired",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Latest relay state for one GUI tab. Revisions are monotonically increasing
+/// within the relay child so the GUI can discard delayed/replayed messages.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct GuiRelayStateSnapshot {
+    pub revision: u64,
+    pub state: GuiRelayState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl GuiRelayStateSnapshot {
+    pub fn wait(revision: u64) -> Self {
+        Self::simple(revision, GuiRelayState::Wait)
+    }
+
+    pub fn syncing(revision: u64) -> Self {
+        Self::simple(revision, GuiRelayState::Syncing)
+    }
+
+    pub fn paired(revision: u64) -> Self {
+        Self::simple(revision, GuiRelayState::Paired)
+    }
+
+    pub fn error(revision: u64, code: String, retryable: bool, message: String) -> Self {
+        Self {
+            revision,
+            state: GuiRelayState::Error,
+            code: Some(code),
+            retryable: Some(retryable),
+            message: Some(message),
+        }
+    }
+
+    fn simple(revision: u64, state: GuiRelayState) -> Self {
+        Self {
+            revision,
+            state,
+            code: None,
+            retryable: None,
+            message: None,
+        }
+    }
+}
+
+/// Authentication wrapper for one newline-delimited state snapshot.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct GuiRelayStateEnvelope {
+    pub token: String,
+    pub snapshot: GuiRelayStateSnapshot,
+}
+
+pub fn encode_gui_relay_state_line(
+    token: &str,
+    snapshot: &GuiRelayStateSnapshot,
+) -> serde_json::Result<String> {
+    let mut line = serde_json::to_string(&GuiRelayStateEnvelope {
+        token: token.to_string(),
+        snapshot: snapshot.clone(),
+    })?;
+    line.push('\n');
+    Ok(line)
+}
+
+pub fn decode_gui_relay_state_line(line: &str) -> serde_json::Result<GuiRelayStateEnvelope> {
+    serde_json::from_str(line.trim_end())
+}
+
+static GUI_RELAY_STATE_SENDER: OnceLock<Sender<GuiRelayStateSnapshot>> = OnceLock::new();
+static GUI_RELAY_STATE_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a per-session token for authenticating the loopback state stream.
+pub fn new_gui_relay_state_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(token, "{byte:02x}");
+    }
+    token
+}
+
+/// Start the relay child's state writer when the GUI supplied an endpoint.
+/// Publishing remains a no-op for the standalone CLI.
+pub fn init_gui_relay_state_reporter() {
+    if GUI_RELAY_STATE_SENDER.get().is_some() {
+        return;
+    }
+    let Some(address) = std::env::var(GUI_RELAY_STATE_ADDR_ENV)
+        .ok()
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+    else {
+        return;
+    };
+    let Ok(token) = std::env::var(GUI_RELAY_STATE_TOKEN_ENV) else {
+        return;
+    };
+    if token.is_empty() {
+        return;
+    }
+
+    let (sender, receiver) = channel();
+    if GUI_RELAY_STATE_SENDER.set(sender).is_err() {
+        return;
+    }
+    std::thread::spawn(move || gui_relay_state_writer_loop(address, token, receiver));
+}
+
+pub fn publish_gui_relay_state(state: GuiRelayState) {
+    init_gui_relay_state_reporter();
+    let Some(sender) = GUI_RELAY_STATE_SENDER.get() else {
+        return;
+    };
+    let revision = GUI_RELAY_STATE_REVISION.fetch_add(1, Ordering::Relaxed) + 1;
+    let snapshot = match state {
+        GuiRelayState::Wait => GuiRelayStateSnapshot::wait(revision),
+        GuiRelayState::Syncing => GuiRelayStateSnapshot::syncing(revision),
+        GuiRelayState::Paired => GuiRelayStateSnapshot::paired(revision),
+        GuiRelayState::Error => return,
+    };
+    let _ = sender.send(snapshot);
+}
+
+pub fn publish_gui_relay_error(code: String, retryable: bool, message: String) {
+    init_gui_relay_state_reporter();
+    let Some(sender) = GUI_RELAY_STATE_SENDER.get() else {
+        return;
+    };
+    let revision = GUI_RELAY_STATE_REVISION.fetch_add(1, Ordering::Relaxed) + 1;
+    let code = if code.is_empty() {
+        "unknown".to_string()
+    } else {
+        code
+    };
+    let _ = sender.send(GuiRelayStateSnapshot::error(
+        revision, code, retryable, message,
+    ));
+}
+
+fn gui_relay_state_writer_loop(
+    address: SocketAddr,
+    token: String,
+    receiver: Receiver<GuiRelayStateSnapshot>,
+) {
+    let mut stream = None;
+    while let Ok(mut snapshot) = receiver.recv() {
+        while let Ok(newer) = receiver.try_recv() {
+            snapshot = newer;
+        }
+        loop {
+            if stream.is_none() {
+                match TcpStream::connect_timeout(&address, Duration::from_millis(500)) {
+                    Ok(connected) => stream = Some(connected),
+                    Err(_) => {
+                        while let Ok(newer) = receiver.try_recv() {
+                            snapshot = newer;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                }
+            }
+            let Ok(line) = encode_gui_relay_state_line(&token, &snapshot) else {
+                break;
+            };
+            let result = stream
+                .as_mut()
+                .expect("relay state stream initialized")
+                .write_all(line.as_bytes());
+            if result.is_ok() {
+                break;
+            }
+            stream = None;
+            while let Ok(newer) = receiver.try_recv() {
+                snapshot = newer;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn connect_and_write_gui_relay_state(
+    address: SocketAddr,
+    token: &str,
+    snapshot: &GuiRelayStateSnapshot,
+) -> Result<()> {
+    let mut stream = TcpStream::connect(address).context("failed to connect GUI state channel")?;
+    let line =
+        encode_gui_relay_state_line(token, snapshot).context("failed to encode GUI relay state")?;
+    stream
+        .write_all(line.as_bytes())
+        .context("failed to write GUI relay state")
+}
 
 /// The GUI host's session id for this relay child, sanitised for use in file
 /// names. `None` outside a GUI-hosted relay child.
@@ -158,6 +388,7 @@ pub fn parse_resize_line(contents: &str) -> Option<(u16, u16)> {
 /// real terminal to drive, exactly as the standalone CLI does).
 pub fn run_relay_child(args: &[String]) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    init_gui_relay_state_reporter();
     // The GUI renders the pairing QR / URL / hints in a native popup, so keep
     // the embedded terminal clean by suppressing the human-facing pairing block
     // (the URL is still handed to the GUI host via a private OSC sequence).
@@ -187,6 +418,7 @@ fn parse_cli(args: &[String], language: CliLanguage) -> Result<Cli> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
 
     #[test]
     fn parse_resize_line_reads_cols_then_rows() {
@@ -215,5 +447,54 @@ mod tests {
         assert_eq!(bridge_terminal_size(), None);
         set_bridge_terminal_size(80, 0);
         assert_eq!(bridge_terminal_size(), None);
+    }
+
+    #[test]
+    fn relay_state_envelope_round_trips_as_one_json_line() {
+        let snapshot = GuiRelayStateSnapshot::paired(7);
+
+        let line = encode_gui_relay_state_line("secret-token", &snapshot).unwrap();
+        let decoded = decode_gui_relay_state_line(&line).unwrap();
+
+        assert!(line.ends_with('\n'));
+        assert_eq!(decoded.token, "secret-token");
+        assert_eq!(decoded.snapshot, snapshot);
+    }
+
+    #[test]
+    fn relay_error_snapshot_keeps_structured_details() {
+        let snapshot = GuiRelayStateSnapshot::error(
+            9,
+            "rate_limited".to_string(),
+            true,
+            "relay is busy".to_string(),
+        );
+
+        assert_eq!(snapshot.state, GuiRelayState::Error);
+        assert_eq!(snapshot.code.as_deref(), Some("rate_limited"));
+        assert_eq!(snapshot.retryable, Some(true));
+        assert_eq!(snapshot.message.as_deref(), Some("relay is busy"));
+    }
+
+    #[test]
+    fn relay_state_writer_sends_an_authenticated_snapshot() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let snapshot = GuiRelayStateSnapshot::syncing(3);
+        let expected = snapshot.clone();
+
+        let writer = std::thread::spawn(move || {
+            connect_and_write_gui_relay_state(address, "secret-token", &snapshot).unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .unwrap();
+        writer.join().unwrap();
+
+        let envelope = decode_gui_relay_state_line(&line).unwrap();
+        assert_eq!(envelope.token, "secret-token");
+        assert_eq!(envelope.snapshot, expected);
     }
 }

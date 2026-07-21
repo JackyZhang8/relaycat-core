@@ -412,9 +412,8 @@ fn normalized_title_part(value: Option<&str>) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-/// Log marker the GUI host's log tail watches to derive the tab's paired /
-/// syncing / disconnected presentation state. Tagged with the GUI session id
-/// so sibling tabs sharing the same log file never react to each other.
+/// Diagnostic marker for paired / syncing / disconnected transitions. GUI
+/// state is delivered separately over the dedicated state channel.
 fn gui_terminal_state_log(state: &str) -> String {
     match crate::gui_bridge::gui_session_id() {
         Some(id) => format!("app terminal {state} gui_session={id}"),
@@ -422,9 +421,19 @@ fn gui_terminal_state_log(state: &str) -> String {
     }
 }
 
-/// Log marker the GUI host's log tail watches to surface a relay `Error`
-/// frame with its stable code and retryability, so the GUI can present the
-/// same reason/retryability the mobile apps derive from the code.
+fn report_gui_terminal_state(state: &str) {
+    relaycat_log("INFO", gui_terminal_state_log(state));
+    let state = match state {
+        "live" => crate::gui_bridge::GuiRelayState::Paired,
+        "syncing" => crate::gui_bridge::GuiRelayState::Syncing,
+        "disconnected" => crate::gui_bridge::GuiRelayState::Wait,
+        _ => return,
+    };
+    crate::gui_bridge::publish_gui_relay_state(state);
+}
+
+/// Diagnostic marker for relay `Error` frames. The structured code,
+/// retryability and message are delivered to the GUI over the state channel.
 fn gui_relay_error_log(message: &str, code: Option<RelayErrorCode>) -> String {
     let code_str = code.map(RelayErrorCode::as_str).unwrap_or("unknown");
     let retryable = code.map(RelayErrorCode::is_retryable).unwrap_or(false);
@@ -435,6 +444,14 @@ fn gui_relay_error_log(message: &str, code: Option<RelayErrorCode>) -> String {
         ),
         None => format!("relay error code={code_str} retryable={retryable} message={sanitized}"),
     }
+}
+
+fn report_gui_relay_error(message: &str, code: Option<RelayErrorCode>) {
+    relaycat_log("WARN", gui_relay_error_log(message, code));
+    let code_str = code.map(RelayErrorCode::as_str).unwrap_or("unknown");
+    let retryable = code.map(RelayErrorCode::is_retryable).unwrap_or(false);
+    let sanitized: String = message.chars().filter(|ch| !ch.is_control()).collect();
+    crate::gui_bridge::publish_gui_relay_error(code_str.to_string(), retryable, sanitized);
 }
 
 /// User-facing description for a relay `Error` frame. The stable `code` (when
@@ -662,7 +679,7 @@ async fn run_secure_pty_relay(
         },
         move |frame| {
             if let OuterFrame::Error { message, code } = &frame {
-                relaycat_log("WARN", gui_relay_error_log(message, *code));
+                report_gui_relay_error(message, *code);
                 return Ok(None);
             }
             if matches!(&frame, OuterFrame::PeerLeft { role: Role::App }) {
@@ -670,7 +687,7 @@ async fn run_secure_pty_relay(
                 if let Ok(mut gate) = resume_gate_for_decode.lock() {
                     gate.mark_app_disconnected();
                 }
-                relaycat_log("INFO", gui_terminal_state_log("disconnected"));
+                report_gui_terminal_state("disconnected");
                 return Ok(None);
             }
             match accept_secure_peer_joined_and_reset_sessions(
@@ -688,7 +705,7 @@ async fn run_secure_pty_relay(
                     if let Ok(mut gate) = resume_gate_for_decode.lock() {
                         gate.mark_app_rejoined();
                     }
-                    relaycat_log("INFO", gui_terminal_state_log("syncing"));
+                    report_gui_terminal_state("syncing");
                     return Ok(None);
                 }
                 SecurePeerJoined::SessionPreserved => {
@@ -700,7 +717,7 @@ async fn run_secure_pty_relay(
                     if let Ok(mut gate) = resume_gate_for_decode.lock() {
                         gate.mark_resume_processed();
                     }
-                    relaycat_log("INFO", gui_terminal_state_log("live"));
+                    report_gui_terminal_state("live");
                     return Ok(None);
                 }
                 SecurePeerJoined::NotPeerJoined => {}
@@ -960,6 +977,8 @@ where
         command.cwd(cwd);
     }
     configure_child_terminal_env(&mut command, &target.session_kind);
+    command.env_remove(crate::gui_bridge::GUI_RELAY_STATE_ADDR_ENV);
+    command.env_remove(crate::gui_bridge::GUI_RELAY_STATE_TOKEN_ENV);
     // On Windows, portable_pty's CommandBuilder rebuilds the child's
     // environment from the Windows Registry, which overwrites PATH with the
     // registry-only value and loses entries added at runtime (Volta, nvm,
@@ -1741,7 +1760,7 @@ where
                         if let Ok(mut gate) = resume_gate.lock() {
                             gate.mark_resume_processed();
                         }
-                        relaycat_log("INFO", gui_terminal_state_log("live"));
+                        report_gui_terminal_state("live");
                         // Announce how the backlog will arrive before it
                         // does, so the app keeps its reconnect overlay up
                         // until `target_state_seq` is applied instead of

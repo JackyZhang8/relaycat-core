@@ -100,14 +100,18 @@ fn write_gui_pairing_url_file(
     }
 }
 
-/// The pairing-success log line the GUI log tail watches for. Tagged with the
-/// GUI tab/session id (when hosted by the GUI) so a tab only reacts to its own
-/// relay child pairing, never a sibling tab's in the same shared `cli.log`.
+/// Pairing-success diagnostic marker. GUI state is published separately over
+/// the dedicated state channel.
 fn secure_session_established_log() -> String {
     match crate::gui_bridge::gui_session_id() {
         Some(id) => format!("secure session established gui_session={id}"),
         None => "secure session established".to_string(),
     }
+}
+
+fn report_secure_session_established() {
+    relaycat_log("INFO", secure_session_established_log());
+    crate::gui_bridge::publish_gui_relay_state(crate::gui_bridge::GuiRelayState::Syncing);
 }
 
 /// A secure pairing that has connected to the relay and emitted its pairing
@@ -427,7 +431,7 @@ pub async fn run_secure_pairing_prepared(prepared: PreparedSecurePairing) -> Res
         }
         log_received_peer_joined(&frame);
         if let Some(keys) = handshake.accept_peer_joined(&frame)? {
-            relaycat_log("INFO", secure_session_established_log());
+            report_secure_session_established();
             crate::recent_store::remember_recent_target_or_warn(&target);
             return run_secure_pty_relay(
                 target,
@@ -504,7 +508,7 @@ pub(crate) async fn run_secure_pairing_prepared_with_launcher_controls(
             Err(err) => return Ok(PairingRunOutcome::PairingFailed(err)),
         };
         if let Some(keys) = keys {
-            relaycat_log("INFO", secure_session_established_log());
+            report_secure_session_established();
             crate::recent_store::remember_recent_target_or_warn(&target);
             drop(control_mode);
             run_secure_pty_relay(

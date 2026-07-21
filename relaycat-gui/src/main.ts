@@ -21,6 +21,7 @@ import {
 } from "./relay-compatibility";
 import { MAX_TAB_COUNT, canCreateTab } from "./tab-limit";
 import { tabScrollState } from "./tab-scroll";
+import { shouldApplyRelaySnapshot } from "./relay-state";
 import thirdPartyLicenses from "./third-party-licenses.txt?raw";
 
 type Tool = { name: string; label: string; kind: string };
@@ -38,6 +39,7 @@ type StatusEvent = { id: string; state: string; code?: number };
 type PairingEvent = { id: string; url: string };
 type RelayEvent = {
   id: string;
+  revision: number;
   state: string;
   code?: string;
   retryable?: boolean;
@@ -61,6 +63,7 @@ interface Tab {
   state: TabState;
   project: string;
   relay: string;
+  relayRevision: number;
   logPath?: string;
   peers: number;
   term: Terminal;
@@ -641,6 +644,7 @@ async function createTab(tool: string, project: string, relay: string) {
     state: relay ? "wait" : "local",
     project,
     relay,
+    relayRevision: 0,
     peers: 0,
     term,
     fit,
@@ -903,10 +907,22 @@ async function createTab(tool: string, project: string, relay: string) {
     });
     tab.title = info.title;
     tab.mode = info.mode;
-    tab.state = info.mode === "relay" ? "wait" : "local";
+    if (info.mode === "relay") {
+      // A state event can arrive while create_session is still resolving.
+      // Never overwrite an already-applied IPC snapshot with local `wait`.
+      if (tab.relayRevision === 0) tab.state = "wait";
+    } else {
+      tab.state = "local";
+    }
     tab.logPath = info.log_path || undefined;
     refreshTabEl(tab);
     renderStatusbar();
+    if (info.mode === "relay") {
+      const snapshot = await invoke<RelayEvent | null>("get_relay_state", { id: tab.id }).catch(
+        () => null,
+      );
+      if (snapshot) applyRelayEvent(snapshot);
+    }
   } catch (e) {
     term.writeln(`\x1b[31m${t("launch_failed", String(e))}\x1b[0m`);
     tab.state = "exited";
@@ -2124,6 +2140,40 @@ function wireSettingsControls() {
 
 /* -------------------------------- events --------------------------------- */
 
+function applyRelayEvent(payload: RelayEvent) {
+  const tab = tabs.find((t) => t.id === payload.id);
+  if (
+    !tab ||
+    !shouldApplyRelaySnapshot(tab.relayRevision, payload.revision, tab.state === "exited")
+  )
+    return;
+  tab.relayRevision = payload.revision;
+  const state = payload.state;
+  if (state === "paired") {
+    // Green only when the terminal stream is actually live, not merely
+    // when the secure session was accepted.
+    if (tab.state !== "paired") tab.peers = Math.max(1, tab.peers + 1);
+    tab.state = "paired";
+    refreshTabEl(tab);
+    renderStatusbar();
+    // If the QR is on screen for this tab, swap it for the auto-closing
+    // success confirmation; otherwise just keep the state in sync.
+    if (pairingTabId === tab.id && $("#ov-pair").classList.contains("show")) {
+      showPairingSuccess(tab);
+    }
+  } else if (state === "syncing" || state === "wait") {
+    tab.state = state;
+    refreshTabEl(tab);
+    renderStatusbar();
+  } else if (state === "error") {
+    // Structured relay error delivered over the dedicated state channel.
+    const code = payload.code ?? "unknown";
+    const hint = payload.retryable ? t("relay_err_retryable") : t("relay_err_fatal");
+    const detail = payload.message ? `: ${payload.message}` : "";
+    tab.term.writeln(`\r\n\x1b[33m${t("relay_err_line", code, hint)}${detail}\x1b[0m`);
+  }
+}
+
 function wireEvents() {
   listen<OutputEvent>("session://output", (event) => {
     const tab = tabs.find((t) => t.id === event.payload.id);
@@ -2157,33 +2207,7 @@ function wireEvents() {
   });
 
   listen<RelayEvent>("session://relay", (event) => {
-    const tab = tabs.find((t) => t.id === event.payload.id);
-    if (!tab || tab.state === "exited") return;
-    const state = event.payload.state;
-    if (state === "paired") {
-      // Green only when the terminal stream is actually live, not merely
-      // when the secure session was accepted.
-      if (tab.state !== "paired") tab.peers = Math.max(1, tab.peers + 1);
-      tab.state = "paired";
-      refreshTabEl(tab);
-      renderStatusbar();
-      // If the QR is on screen for this tab, swap it for the auto-closing
-      // success confirmation; otherwise just keep the state in sync.
-      if (pairingTabId === tab.id && $("#ov-pair").classList.contains("show")) {
-        showPairingSuccess(tab);
-      }
-    } else if (state === "syncing" || state === "wait") {
-      tab.state = state;
-      refreshTabEl(tab);
-      renderStatusbar();
-    } else if (state === "error") {
-      // Stable relay error propagated from the CLI log: show the same
-      // code-derived reason/retryability the mobile apps present.
-      const code = event.payload.code ?? "unknown";
-      const hint = event.payload.retryable ? t("relay_err_retryable") : t("relay_err_fatal");
-      const detail = event.payload.message ? `: ${event.payload.message}` : "";
-      tab.term.writeln(`\r\n\x1b[33m${t("relay_err_line", code, hint)}${detail}\x1b[0m`);
-    }
+    applyRelayEvent(event.payload);
   });
 }
 

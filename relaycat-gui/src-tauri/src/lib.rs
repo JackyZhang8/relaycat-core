@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use manager::{RelayContext, SessionManager};
+use manager::{RelayContext, RelayEvent, RelayStateBridge, SessionManager};
 use relaycat_cli::command::{SessionKind, TargetCommand};
 use relaycat_cli::config::{self, Config, CustomTool};
 use relaycat_cli::pairing_store;
@@ -99,7 +99,7 @@ struct SessionInfo {
     title: String,
     /// `local` | `relay`
     mode: String,
-    /// For relay sessions, the CLI log path the GUI tails (diagnostics panel).
+    /// For relay sessions, the CLI log path shown in the diagnostics panel.
     log_path: Option<String>,
 }
 
@@ -796,9 +796,8 @@ fn create_relay_session(
         session_kind,
     };
     let log_path = relay::cli_log_path(&project_dir);
-    // Per-tab scope for the pairing/resize side channels and the log-tail
-    // pairing marker, so multiple relay tabs on the same project + tool kind
-    // never read each other's pairing URL, paired status, or resize file.
+    // Per-tab scope for the pairing, resize, and state side channels so
+    // multiple relay tabs never read each other's pairing URL or state.
     let gui_session_id = relaycat_cli::gui_bridge::sanitize_session_id(&id);
     // The relay child writes the pairing URL here as a ConPTY-proof fallback to
     // the private OSC it also prints. Clear any stale file from a prior session
@@ -822,11 +821,14 @@ fn create_relay_session(
         ));
     let _ = std::fs::remove_file(&resize_file);
     let _ = std::fs::remove_file(resize_file.with_extension("tmp"));
+    let state_bridge =
+        RelayStateBridge::bind(relaycat_cli::gui_bridge::new_gui_relay_state_token())
+            .map_err(|e| e.to_string())?;
     let context = RelayContext {
-        log_path: log_path.clone(),
         pairing_url_path,
         resize_file,
         gui_session_id,
+        state_bridge,
     };
 
     state
@@ -880,6 +882,13 @@ fn resize_session(
 #[tauri::command]
 fn close_session(state: State<SessionManager>, id: String) -> Result<(), String> {
     state.close(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_relay_state(state: State<SessionManager>, id: String) -> Option<RelayEvent> {
+    state
+        .relay_state(&id)
+        .map(|snapshot| RelayEvent::from_snapshot(id, &snapshot))
 }
 
 /// Render a QR code SVG for an arbitrary pairing URL. Relay sessions scrape the
@@ -1354,6 +1363,7 @@ pub fn run() {
             write_session,
             resize_session,
             close_session,
+            get_relay_state,
             render_qr,
             open_url,
             diagnostics,

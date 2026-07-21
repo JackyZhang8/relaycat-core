@@ -8,11 +8,12 @@
 //!
 //! Relay sessions run the `relaycat` CLI inside the PTY (see [`crate::relay`]).
 //! For those the reader also scrapes the pairing URL the CLI prints
-//! (`session://pairing`) and a background thread tails the CLI log file to
-//! report when the mobile app has paired (`session://relay`).
+//! (`session://pairing`) and a dedicated loopback state channel reports when
+//! the mobile app has paired (`session://relay`).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,9 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use relaycat_cli::gui_bridge::{
+    GuiRelayStateEnvelope, GuiRelayStateSnapshot, decode_gui_relay_state_line,
+};
 use relaycat_cli::session::PtySession;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -116,21 +120,46 @@ struct LiveSession {
     control: Arc<dyn SessionControl>,
     /// Cleared on exit/close so relay helper threads can stop.
     alive: Arc<AtomicBool>,
+    /// Latest authenticated state received from this relay child.
+    relay_state: Option<Arc<Mutex<Option<GuiRelayStateSnapshot>>>>,
 }
 
-/// Extra wiring for a relay session: where the CLI writes its log file and the
-/// pairing-URL fallback file the GUI polls. `resize_file` is the path the
-/// Windows pipe-bridged relay child polls for terminal-size changes (unused on
-/// other platforms).
+/// GUI-owned state channel bound before the relay child starts. Binding first
+/// lets the OS queue an immediate child connection even if the accept thread
+/// has not started running yet.
+pub struct RelayStateBridge {
+    listener: TcpListener,
+    address: String,
+    token: String,
+}
+
+impl RelayStateBridge {
+    pub fn bind(token: String) -> Result<Self> {
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).context("failed to bind relay state listener")?;
+        let address = listener
+            .local_addr()
+            .context("failed to read relay state listener address")?
+            .to_string();
+        Ok(Self {
+            listener,
+            address,
+            token,
+        })
+    }
+}
+
+/// Extra wiring for a relay session: the pairing-URL fallback, resize channel,
+/// and authenticated state listener owned by this GUI tab.
 pub struct RelayContext {
-    pub log_path: PathBuf,
     pub pairing_url_path: PathBuf,
     #[cfg_attr(not(windows), allow(dead_code))]
     pub resize_file: PathBuf,
     /// Per-tab id handed to the relay child (see
     /// [`relaycat_cli::gui_bridge::GUI_SESSION_ID_ENV`]); scopes the pairing
-    /// file name and the log-tail pairing marker to this tab.
+    /// file name and child-side diagnostics to this tab.
     pub gui_session_id: String,
+    pub state_bridge: RelayStateBridge,
 }
 
 #[derive(Default)]
@@ -161,8 +190,9 @@ struct PairingEvent {
 }
 
 #[derive(Clone, Serialize)]
-struct RelayEvent {
+pub(crate) struct RelayEvent {
     id: String,
+    revision: u64,
     /// `paired` | `syncing` | `wait` | `error`
     state: String,
     /// For `error`: the relay's stable error code (or `unknown`).
@@ -174,6 +204,19 @@ struct RelayEvent {
     /// For `error`: the relay's free-text reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+}
+
+impl RelayEvent {
+    pub(crate) fn from_snapshot(id: String, snapshot: &GuiRelayStateSnapshot) -> Self {
+        Self {
+            id,
+            revision: snapshot.revision,
+            state: snapshot.state.as_str().to_string(),
+            code: snapshot.code.clone(),
+            retryable: snapshot.retryable,
+            message: snapshot.message.clone(),
+        }
+    }
 }
 
 impl SessionManager {
@@ -191,7 +234,7 @@ impl SessionManager {
 
     /// Spawn a relay session: `target` runs the `relaycat` CLI, which performs
     /// the secure pairing + mirror. The reader scrapes the pairing URL and a
-    /// tail thread reports pairing status from the CLI log file.
+    /// dedicated control channel reports the current relay state.
     ///
     /// On macOS/Linux the relay child is hosted in a PTY just like a local
     /// session. On Windows it is hosted over plain pipes instead (see
@@ -223,13 +266,23 @@ impl SessionManager {
         cols: u16,
         relay: Option<RelayContext>,
     ) -> Result<()> {
-        // Hand relay children their per-tab id so the pairing-URL fallback
-        // file and the pairing log line are scoped to this tab.
+        // Hand relay children their per-tab id and authenticated state channel
+        // so all GUI side channels remain scoped to this tab.
         let envs: Vec<(&str, String)> = match &relay {
-            Some(context) => vec![(
-                relaycat_cli::gui_bridge::GUI_SESSION_ID_ENV,
-                context.gui_session_id.clone(),
-            )],
+            Some(context) => vec![
+                (
+                    relaycat_cli::gui_bridge::GUI_SESSION_ID_ENV,
+                    context.gui_session_id.clone(),
+                ),
+                (
+                    relaycat_cli::gui_bridge::GUI_RELAY_STATE_ADDR_ENV,
+                    context.state_bridge.address.clone(),
+                ),
+                (
+                    relaycat_cli::gui_bridge::GUI_RELAY_STATE_TOKEN_ENV,
+                    context.state_bridge.token.clone(),
+                ),
+            ],
             None => Vec::new(),
         };
         let session = PtySession::spawn_with_envs(target, rows, cols, &envs)?;
@@ -288,9 +341,14 @@ impl SessionManager {
                 &relay.gui_session_id,
             )
             .env(
-                crate::GUI_PARENT_PID_ENV,
-                std::process::id().to_string(),
+                relaycat_cli::gui_bridge::GUI_RELAY_STATE_ADDR_ENV,
+                &relay.state_bridge.address,
             )
+            .env(
+                relaycat_cli::gui_bridge::GUI_RELAY_STATE_TOKEN_ENV,
+                &relay.state_bridge.token,
+            )
+            .env(crate::GUI_PARENT_PID_ENV, std::process::id().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -337,6 +395,9 @@ impl SessionManager {
     ) {
         let alive = Arc::new(AtomicBool::new(true));
         let is_relay = relay.is_some();
+        let relay_state = relay
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(Some(GuiRelayStateSnapshot::wait(0)))));
         let control_for_reader = control.clone();
         let alive_for_reader = alive.clone();
         let reader_app = app.clone();
@@ -383,11 +444,14 @@ impl SessionManager {
         });
 
         if let Some(relay) = relay {
-            spawn_log_tail(
+            spawn_relay_state_listener(
                 app.clone(),
                 id.clone(),
-                relay.log_path,
-                relay.gui_session_id,
+                relay.state_bridge,
+                relay_state
+                    .as_ref()
+                    .expect("relay state initialized")
+                    .clone(),
                 alive.clone(),
             );
             spawn_pairing_url_poll(app, id.clone(), relay.pairing_url_path, alive.clone());
@@ -399,6 +463,7 @@ impl SessionManager {
                 writer: Mutex::new(writer),
                 control,
                 alive,
+                relay_state,
             },
         );
     }
@@ -429,116 +494,109 @@ impl SessionManager {
         }
         Ok(())
     }
+
+    pub fn relay_state(&self, id: &str) -> Option<GuiRelayStateSnapshot> {
+        let state = self.sessions.lock().ok()?.get(id)?.relay_state.clone()?;
+        state.lock().ok()?.clone()
+    }
 }
 
-/// Tails the relay CLI log file and emits `session://relay` state transitions
-/// derived from the CLI's terminal-sync markers: `syncing` once the mobile app
-/// has a secure session or rejoins, `paired` only once the terminal stream is
-/// actually live, and `wait` when the app disconnects. Starts from the current
-/// end of the file so stale lines from earlier runs are ignored.
-fn spawn_log_tail(
+/// Receives authenticated state snapshots from the relay child, saves the
+/// latest revision in memory, and only then emits the frontend event.
+fn spawn_relay_state_listener(
     app: AppHandle,
     id: String,
-    log_path: PathBuf,
-    gui_session_id: String,
+    bridge: RelayStateBridge,
+    current: Arc<Mutex<Option<GuiRelayStateSnapshot>>>,
     alive: Arc<AtomicBool>,
 ) {
-    // The log file is shared by every relay session in the project, so only
-    // react to the lines tagged with this tab's session id.
-    let pairing_marker = format!("secure session established gui_session={gui_session_id}");
-    let live_marker = format!("app terminal live gui_session={gui_session_id}");
-    let syncing_marker = format!("app terminal syncing gui_session={gui_session_id}");
-    let disconnected_marker = format!("app terminal disconnected gui_session={gui_session_id}");
-    let error_marker = format!("relay error gui_session={gui_session_id} ");
     thread::spawn(move || {
-        // Wait for the CLI to create the log file.
-        let mut waited = 0u32;
-        while alive.load(Ordering::Acquire) && !log_path.is_file() {
-            thread::sleep(Duration::from_millis(200));
-            waited += 1;
-            if waited > 150 {
-                return; // ~30s without a log file: give up.
-            }
-        }
-        let Ok(file) = std::fs::File::open(&log_path) else {
+        if bridge.listener.set_nonblocking(true).is_err() {
             return;
-        };
-        let mut reader = BufReader::new(file);
-        // Skip whatever is already there (previous sessions in this project).
-        let _ = reader.seek(SeekFrom::End(0));
-        let mut last_state = String::new();
-        let mut line = String::new();
+        }
         while alive.load(Ordering::Acquire) {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    thread::sleep(Duration::from_millis(250));
+            match bridge.listener.accept() {
+                Ok((stream, _)) => receive_relay_state_connection(
+                    &app,
+                    &id,
+                    stream,
+                    &bridge.token,
+                    &current,
+                    &alive,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(50));
                 }
-                Ok(_) => {
-                    if let Some(rest) = line
-                        .find(&error_marker)
-                        .map(|at| &line[at + error_marker.len()..])
-                    {
-                        let (code, retryable, message) = parse_relay_error_fields(rest);
-                        let _ = app.emit(
-                            "session://relay",
-                            RelayEvent {
-                                id: id.clone(),
-                                state: "error".to_string(),
-                                code: Some(code),
-                                retryable: Some(retryable),
-                                message: Some(message),
-                            },
-                        );
-                        continue;
-                    }
-                    let state = if line.contains(&live_marker) {
-                        "paired"
-                    } else if line.contains(&pairing_marker) || line.contains(&syncing_marker) {
-                        "syncing"
-                    } else if line.contains(&disconnected_marker) {
-                        "wait"
-                    } else {
-                        continue;
-                    };
-                    if state != last_state {
-                        last_state = state.to_string();
-                        let _ = app.emit(
-                            "session://relay",
-                            RelayEvent {
-                                id: id.clone(),
-                                state: state.to_string(),
-                                code: None,
-                                retryable: None,
-                                message: None,
-                            },
-                        );
-                    }
-                }
-                Err(_) => return,
+                Err(_) => break,
             }
         }
     });
 }
 
-/// Parses the tail of a CLI `relay error gui_session=<id> ...` log line:
-/// `code=<code> retryable=<bool> message=<free text>`.
-fn parse_relay_error_fields(rest: &str) -> (String, bool, String) {
-    let rest = rest.trim_end();
-    let code = rest
-        .strip_prefix("code=")
-        .and_then(|s| s.split_whitespace().next())
-        .unwrap_or("unknown")
-        .to_string();
-    let retryable = rest
-        .find("retryable=")
-        .map(|at| rest[at + "retryable=".len()..].starts_with("true"))
-        .unwrap_or(false);
-    let message = rest
-        .find("message=")
-        .map(|at| rest[at + "message=".len()..].to_string())
-        .unwrap_or_default();
-    (code, retryable, message)
+fn receive_relay_state_connection(
+    app: &AppHandle,
+    id: &str,
+    stream: std::net::TcpStream,
+    token: &str,
+    current: &Arc<Mutex<Option<GuiRelayStateSnapshot>>>,
+    alive: &Arc<AtomicBool>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    while alive.load(Ordering::Acquire) {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if line.len() > 64 * 1024 {
+                    break;
+                }
+                let Ok(envelope) = decode_gui_relay_state_line(&line) else {
+                    continue;
+                };
+                if envelope.token != token {
+                    break;
+                }
+                let accepted = current
+                    .lock()
+                    .ok()
+                    .and_then(|mut state| {
+                        accept_relay_snapshot(&mut state, envelope, token)
+                            .then(|| state.as_ref().cloned())
+                    })
+                    .flatten();
+                if let Some(snapshot) = accepted {
+                    let _ = app.emit(
+                        "session://relay",
+                        RelayEvent::from_snapshot(id.to_string(), &snapshot),
+                    );
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+fn accept_relay_snapshot(
+    current: &mut Option<GuiRelayStateSnapshot>,
+    envelope: GuiRelayStateEnvelope,
+    token: &str,
+) -> bool {
+    if envelope.token != token
+        || current
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.revision >= envelope.snapshot.revision)
+    {
+        return false;
+    }
+    *current = Some(envelope.snapshot);
+    true
 }
 
 /// Polls the relay child's pairing-URL fallback file and emits
@@ -669,5 +727,48 @@ mod tests {
         let mut scanner = PairingUrlScanner::new(false);
         let osc = format!("\x1b]9779;{URL}\x07");
         assert_eq!(scanner.feed(osc.as_bytes()), None);
+    }
+
+    #[test]
+    fn relay_snapshot_accepts_a_newer_authenticated_revision() {
+        let mut current = Some(relaycat_cli::gui_bridge::GuiRelayStateSnapshot::syncing(2));
+        let envelope = relaycat_cli::gui_bridge::GuiRelayStateEnvelope {
+            token: "secret-token".to_string(),
+            snapshot: relaycat_cli::gui_bridge::GuiRelayStateSnapshot::paired(3),
+        };
+
+        assert!(accept_relay_snapshot(
+            &mut current,
+            envelope,
+            "secret-token"
+        ));
+        assert_eq!(
+            current.unwrap().state,
+            relaycat_cli::gui_bridge::GuiRelayState::Paired
+        );
+    }
+
+    #[test]
+    fn relay_snapshot_rejects_wrong_tokens_and_stale_revisions() {
+        let initial = relaycat_cli::gui_bridge::GuiRelayStateSnapshot::syncing(4);
+        let mut current = Some(initial.clone());
+
+        assert!(!accept_relay_snapshot(
+            &mut current,
+            relaycat_cli::gui_bridge::GuiRelayStateEnvelope {
+                token: "wrong-token".to_string(),
+                snapshot: relaycat_cli::gui_bridge::GuiRelayStateSnapshot::paired(5),
+            },
+            "secret-token",
+        ));
+        assert!(!accept_relay_snapshot(
+            &mut current,
+            relaycat_cli::gui_bridge::GuiRelayStateEnvelope {
+                token: "secret-token".to_string(),
+                snapshot: relaycat_cli::gui_bridge::GuiRelayStateSnapshot::wait(4),
+            },
+            "secret-token",
+        ));
+        assert_eq!(current, Some(initial));
     }
 }
