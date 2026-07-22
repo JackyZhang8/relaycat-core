@@ -65,7 +65,6 @@ interface Tab {
   relay: string;
   relayRevision: number;
   logPath?: string;
-  peers: number;
   term: Terminal;
   fit: FitAddon;
   webgl?: WebglAddon;
@@ -645,7 +644,6 @@ async function createTab(tool: string, project: string, relay: string) {
     project,
     relay,
     relayRevision: 0,
-    peers: 0,
     term,
     fit,
     webgl,
@@ -1553,7 +1551,7 @@ function renderStatusbar() {
     const txt = el("span");
     txt.textContent =
       tab.state === "paired"
-        ? t("paired_devices", Math.max(1, tab.peers))
+        ? t("paired_devices")
         : tab.state === "syncing"
           ? t("st_syncing")
           : t("st_wait");
@@ -2152,7 +2150,6 @@ function applyRelayEvent(payload: RelayEvent) {
   if (state === "paired") {
     // Green only when the terminal stream is actually live, not merely
     // when the secure session was accepted.
-    if (tab.state !== "paired") tab.peers = Math.max(1, tab.peers + 1);
     tab.state = "paired";
     refreshTabEl(tab);
     renderStatusbar();

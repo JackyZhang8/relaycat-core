@@ -103,7 +103,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     st_paired: "已配对",
     local_mode: "本地模式",
     view_qr: "查看配对二维码",
-    paired_devices: "已配对 · {0} 台设备",
+    paired_devices: "已配对",
     split_on: "分屏",
     reopen: "重开会话",
 
@@ -442,7 +442,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     st_paired: "paired",
     local_mode: "Local mode",
     view_qr: "View pairing QR",
-    paired_devices: "Paired · {0} device(s)",
+    paired_devices: "Paired",
     split_on: "Split",
     reopen: "Reopen session",
 
