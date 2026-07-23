@@ -624,14 +624,25 @@ async function createTab(tool: string, project: string, relay: string) {
   $("#terminals").appendChild(pane);
   term.open(pane);
 
-  let webgl: WebglAddon | undefined;
-  try {
-    webgl = new WebglAddon();
-    webgl.onContextLoss(() => webgl?.dispose());
-    term.loadAddon(webgl);
-  } catch {
-    webgl = undefined; // fall back to the DOM renderer
-  }
+  // The WebGL renderer keeps glyphs in a GPU texture atlas. When the GPU
+  // context is lost (driver reset, sleep/resume) the atlas becomes invalid and
+  // text renders as garbage even though the buffer is intact, so recreate the
+  // renderer instead of silently dropping it.
+  const loadWebgl = (): WebglAddon | undefined => {
+    try {
+      const addon = new WebglAddon();
+      addon.onContextLoss(() => {
+        addon.dispose();
+        tab.webgl = loadWebgl();
+        tab.term.refresh(0, tab.term.rows - 1);
+      });
+      term.loadAddon(addon);
+      return addon;
+    } catch {
+      return undefined; // fall back to the DOM renderer
+    }
+  };
+  const webgl = loadWebgl();
   fit.fit();
 
   const id = `s-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
@@ -2731,6 +2742,17 @@ function wireUi() {
   document.querySelectorAll("#set-tabs .set-tab").forEach((b) => {
     (b as HTMLElement).onclick = () =>
       showSettingsGroup((b as HTMLElement).dataset.group!);
+  });
+
+  // The glyph texture atlas can survive a GPU reset in a corrupted state
+  // without a context-loss event (text garbled, buffer/copy still correct).
+  // Rebuild it whenever the window becomes visible again.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    for (const tab of tabs) {
+      tab.webgl?.clearTextureAtlas();
+      tab.term.refresh(0, tab.term.rows - 1);
+    }
   });
 
   // Dismiss the tab context menu on any outside interaction.
