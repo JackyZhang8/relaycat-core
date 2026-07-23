@@ -73,6 +73,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     proj_list_empty: "暂无项目目录，点击「浏览…」或手动输入路径添加",
     proj_remove_title: "移除项目目录",
     proj_remove_confirm: "确定要从列表中移除 {0} 吗？",
+    proj_fill_path: "填入路径",
 
     // pairing
     pair_title: "扫码连接手机",
@@ -414,6 +415,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     proj_list_empty: "No project directories yet — click Browse… or type a path to add one",
     proj_remove_title: "Remove project",
     proj_remove_confirm: "Remove {0} from the list?",
+    proj_fill_path: "Fill path",
 
     pair_title: "Scan to connect phone",
     copy: "Copy",

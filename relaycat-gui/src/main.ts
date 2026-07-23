@@ -22,6 +22,7 @@ import {
 import { MAX_TAB_COUNT, canCreateTab } from "./tab-limit";
 import { tabScrollState } from "./tab-scroll";
 import { shouldApplyRelaySnapshot } from "./relay-state";
+import { projectRowMenuItems } from "./project-row-menu";
 import thirdPartyLicenses from "./third-party-licenses.txt?raw";
 
 type Tool = { name: string; label: string; kind: string };
@@ -516,8 +517,36 @@ function renderProjectList() {
       row.classList.add("sel");
       syncLaunchValidity();
     };
+    row.oncontextmenu = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openProjectRowMenu(p.path, ev.clientX, ev.clientY);
+    };
     projList.appendChild(row);
   }
+}
+
+function openProjectRowMenu(path: string, x: number, y: number) {
+  closeTabMenu();
+  const menu = el("div", "ctxmenu") as HTMLDivElement;
+  const items = projectRowMenuItems(path, {
+    copy: (rowPath) => navigator.clipboard?.writeText(rowPath),
+    fill: (rowPath) => {
+      const input = $("#proj-input") as HTMLInputElement;
+      input.value = rowPath;
+      syncLaunchValidity();
+      input.focus();
+    },
+  });
+  const icons = ["⧉", "↳"];
+  items.forEach((item, index) => {
+    appendMenuItem(menu, {
+      icon: icons[index],
+      label: t(item.labelKey),
+      onClick: () => void item.run(),
+    });
+  });
+  placeMenu(menu, x, y);
 }
 
 // Remove a project from the picker list after confirmation: unstar it (if
