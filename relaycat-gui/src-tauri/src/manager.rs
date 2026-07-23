@@ -541,7 +541,9 @@ fn receive_relay_state_connection(
     current: &Arc<Mutex<Option<GuiRelayStateSnapshot>>>,
     alive: &Arc<AtomicBool>,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    if configure_relay_state_stream(&stream).is_err() {
+        return;
+    }
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     while alive.load(Ordering::Acquire) {
@@ -581,6 +583,14 @@ fn receive_relay_state_connection(
             Err(_) => break,
         }
     }
+}
+
+fn configure_relay_state_stream(stream: &std::net::TcpStream) -> std::io::Result<()> {
+    // The listener is nonblocking so the thread can periodically observe
+    // `alive`. On macOS an accepted socket can retain that mode, which makes an
+    // idle `read_line` return WouldBlock immediately and spin at full CPU.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_millis(250)))
 }
 
 fn accept_relay_snapshot(
@@ -693,8 +703,39 @@ fn is_url_terminator(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Instant;
 
     const URL: &str = "relaycat://pair?relay=wss%3A%2F%2Frelay.example&room=abc&kind=shell";
+
+    #[test]
+    fn relay_state_stream_is_restored_to_blocking_reads() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let client = TcpStream::connect(address).expect("connect test client");
+        let (mut server, _) = listener.accept().expect("accept test connection");
+
+        server
+            .set_nonblocking(true)
+            .expect("make regression socket nonblocking");
+        configure_relay_state_stream(&server).expect("configure relay state stream");
+
+        let started = Instant::now();
+        let error = server
+            .read(&mut [0u8; 1])
+            .expect_err("idle blocking stream should time out");
+
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "relay state read returned immediately and would busy-loop"
+        );
+        drop(client);
+    }
 
     #[test]
     fn scrapes_url_from_plain_terminal_output() {
