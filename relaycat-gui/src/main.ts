@@ -23,6 +23,7 @@ import { MAX_TAB_COUNT, canCreateTab } from "./tab-limit";
 import { tabScrollState } from "./tab-scroll";
 import { shouldApplyRelaySnapshot } from "./relay-state";
 import { projectRowMenuItems } from "./project-row-menu";
+import { restoreTerminalFocusAfterOverlayClose } from "./pairing-focus";
 import thirdPartyLicenses from "./third-party-licenses.txt?raw";
 
 type Tool = { name: string; label: string; kind: string };
@@ -281,6 +282,7 @@ function openOverlay(id: string) {
 // devices / clear-data / diagnostics dialogs opened from Settings) return to
 // their parent instead of closing everything outright.
 function dismissOverlay(ov: HTMLElement | null) {
+  const closedOverlayId = ov?.id;
   const parent = ov?.dataset.parent;
   if (parent) {
     openOverlay(parent);
@@ -290,6 +292,7 @@ function dismissOverlay(ov: HTMLElement | null) {
     // (e.g. right after the first-run wizard or new-session dialog is closed).
     maybeShowCoachMarks();
   }
+  restoreTerminalFocusAfterOverlayClose(closedOverlayId, focusActiveTerminal);
 }
 
 // Close a dialog from its "×" button, mapping to the dialog's own dismissal
@@ -1731,11 +1734,18 @@ function showPairingSuccess(tab: Tab) {
     remain -= 1;
     if (remain <= 0) {
       clearPairCountdown();
-      if (pairingTabId === tab.id) closeOverlays();
+      if (pairingTabId === tab.id) {
+        closeOverlays();
+        restoreTerminalFocusAfterOverlayClose("ov-pair", focusActiveTerminal);
+      }
       return;
     }
     cd.textContent = t("pair_success_countdown", remain);
   }, 1000);
+}
+
+function focusActiveTerminal() {
+  tabs.find((tab) => tab.id === activeId)?.term.focus();
 }
 
 async function renderPairingOverlay(tab: Tab) {
