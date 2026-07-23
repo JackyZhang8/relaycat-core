@@ -977,6 +977,10 @@ body.plat-win .card {
   flex-wrap: wrap;
   gap: 8px;
 }
+#ov-new #tool-chips .chip:not(.disabled),
+#ov-new #proj-list .row {
+  cursor: pointer;
+}
 .chip {
   padding: 7px 14px;
   border: 1px solid var(--border);
