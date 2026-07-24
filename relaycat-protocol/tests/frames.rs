@@ -190,6 +190,7 @@ fn cli_status_round_trips() {
 fn cli_metadata_round_trips() {
     let msg = PlainMsg::CliMetadata(CliMetadata {
         project_path: "/Users/apple/rustdev/relaycat".to_string(),
+        project_id: None,
     });
 
     assert_eq!(
@@ -919,7 +920,7 @@ fn plain_msg_types_are_unique_and_complete() {
     );
     assert_eq!(
         labels.len(),
-        19,
+        22,
         "label count drifted from PlainMsg variants"
     );
 }

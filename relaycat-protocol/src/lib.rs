@@ -1,11 +1,13 @@
 use serde::{Deserialize, Serialize};
 
 pub mod compression;
+pub mod workspace;
 
 pub use compression::{
     PAYLOAD_COMPRESSION_MIN_BYTES, PAYLOAD_FRAME_DEFLATE, PAYLOAD_FRAME_IDENTITY, frame_payload,
     unframe_payload,
 };
+pub use workspace::*;
 
 pub type Result<T> = std::result::Result<T, rmp_serde::decode::Error>;
 
@@ -67,6 +69,8 @@ pub enum ProtocolCapabilityV2 {
     /// Hello/HelloAck handshake; a peer that does not advertise it keeps
     /// receiving the full table on growth.
     IncrementalAttrs,
+    /// Project-scoped file, Git and auxiliary shell RPC.
+    WorkspaceRpc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -499,6 +503,8 @@ pub struct ResizeAckV2 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliMetadata {
     pub project_path: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -741,6 +747,9 @@ pub enum PlainMsg {
     Heartbeat,
     CliStatus(CliStatus),
     CliMetadata(CliMetadata),
+    WorkspaceRequest(WorkspaceRequestEnvelope),
+    WorkspaceResponse(WorkspaceResponseEnvelope),
+    WorkspaceEvent(WorkspaceEventEnvelope),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1025,6 +1034,9 @@ pub fn plain_msg_type(msg: &PlainMsg) -> &'static [u8] {
         PlainMsg::Heartbeat => b"heartbeat",
         PlainMsg::CliStatus(_) => b"cli_status",
         PlainMsg::CliMetadata(_) => b"cli_metadata",
+        PlainMsg::WorkspaceRequest(_) => b"workspace_request",
+        PlainMsg::WorkspaceResponse(_) => b"workspace_response",
+        PlainMsg::WorkspaceEvent(_) => b"workspace_event",
     }
 }
 
@@ -1054,6 +1066,9 @@ pub fn plain_msg_types() -> &'static [&'static [u8]] {
         b"protocol_reject_v2",
         b"cli_status",
         b"cli_metadata",
+        b"workspace_request",
+        b"workspace_response",
+        b"workspace_event",
         b"process_exit",
     ]
 }
