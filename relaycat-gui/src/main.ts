@@ -27,6 +27,7 @@ import { restoreTerminalFocusAfterOverlayClose } from "./pairing-focus";
 import { runSplitAction } from "./split-action";
 import {
   createWorkspacePanel,
+  type WorkspaceEntryMode,
   type WorkspacePanelController,
 } from "./workspace-panel";
 import {
@@ -89,7 +90,7 @@ interface Tab {
   // layout as the phone (which is what a full-screen TUI drew for). Unset on
   // macOS/Linux and for local sessions, where the terminal just fits the window.
   remoteGrid?: { cols: number; rows: number };
-  sidePanelMode: "files" | "git" | "history" | null;
+  sidePanelMode: "files" | "git" | "history" | "shell" | null;
 }
 
 /* ------------------------------- theming --------------------------------- */
@@ -1439,6 +1440,19 @@ function toggleSplit() {
   );
 }
 
+function applyTermSidePanel(
+  tab: Tab | undefined,
+  mode: WorkspaceEntryMode,
+  activateShell = true,
+) {
+  if (tab) tab.sidePanelMode = mode;
+  workspacePanel?.show(mode);
+  embeddedShellPanel?.setVisible(mode === "shell");
+  if (activateShell && mode === "shell" && tab) {
+    void embeddedShellPanel?.activateForProject(tab.project);
+  }
+}
+
 function selectTab(id: string) {
   // Clicking the secondary pane's tab just moves focus there; swapping the two
   // ids keeps each pane on its current side (sides follow tab order).
@@ -1447,7 +1461,7 @@ function selectTab(id: string) {
   applyLayout();
   const tab = tabs.find((t) => t.id === id);
   workspacePanel?.setProject(tab?.project ?? null);
-  workspacePanel?.show(tab?.sidePanelMode ?? null);
+  applyTermSidePanel(tab, tab?.sidePanelMode ?? null);
   if (tab) {
     tab.tabEl.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
     tab.term.focus();
@@ -1496,7 +1510,7 @@ async function closeTab(id: string, force = false) {
       activeId = null;
       applyLayout();
       workspacePanel?.setProject(null);
-      workspacePanel?.show(null);
+      applyTermSidePanel(undefined, null);
     }
   } else {
     applyLayout();
@@ -1643,19 +1657,17 @@ function appendTermToolRail(tab: Tab) {
   files.onclick = (event) => {
     event.stopPropagation();
     focusTab();
-    tab.sidePanelMode = toggleTermSidePanel(tab.sidePanelMode, "files");
-    workspacePanel?.show(tab.sidePanelMode);
+    applyTermSidePanel(tab, toggleTermSidePanel(tab.sidePanelMode, "files"));
   };
   git.onclick = (event) => {
     event.stopPropagation();
     focusTab();
-    tab.sidePanelMode = toggleTermSidePanel(tab.sidePanelMode, "git");
-    workspacePanel?.show(tab.sidePanelMode);
+    applyTermSidePanel(tab, toggleTermSidePanel(tab.sidePanelMode, "git"));
   };
   shell.onclick = (event) => {
     event.stopPropagation();
     focusTab();
-    void embeddedShellPanel?.toggleForProject(tab.project);
+    applyTermSidePanel(tab, toggleTermSidePanel(tab.sidePanelMode, "shell"));
   };
   rail.append(files, git, shell);
   tab.pane.appendChild(rail);
@@ -2979,10 +2991,12 @@ async function init() {
     onClose: () => {
       const tab = tabs.find((item) => item.id === activeId);
       if (tab) tab.sidePanelMode = null;
+      embeddedShellPanel?.setVisible(false);
     },
     onModeChange: (mode) => {
       const tab = tabs.find((item) => item.id === activeId);
       if (tab) tab.sidePanelMode = mode;
+      embeddedShellPanel?.setVisible(mode === "shell");
     },
   });
   embeddedShellPanel = createEmbeddedShellPanel({
@@ -3005,6 +3019,7 @@ async function init() {
         okLabel: t("close"),
         danger: true,
       }),
+    onRequestClose: () => workspacePanel?.close(),
   });
   wireUi();
   wireEvents();

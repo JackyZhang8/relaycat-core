@@ -58,6 +58,7 @@ test("clamps and defaults the workspace panel width", () => {
 
 test("uses the default width when no saved preference exists", () => {
   assert.equal(storedWorkspacePanelWidth(null), 360);
+  assert.equal(storedWorkspacePanelWidth(null, 440), 440);
   assert.equal(storedWorkspacePanelWidth("410"), 410);
 });
 

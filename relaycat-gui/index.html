@@ -73,18 +73,6 @@
         <div class="terminal-stage" id="terminal-stage">
           <div class="terminals" id="terminals"></div>
 
-          <div class="embedded-shell-resizer" id="embedded-shell-resizer" role="separator" aria-orientation="horizontal"></div>
-          <section class="embedded-shell-panel" id="embedded-shell-panel" aria-hidden="true">
-            <header class="embedded-shell-header">
-              <div class="embedded-shell-tabs" id="embedded-shell-tabs"></div>
-              <button class="embedded-shell-action" id="embedded-shell-add" type="button" data-i18n-title="embedded_shell_add">＋</button>
-              <button class="embedded-shell-action" id="embedded-shell-hide" type="button" data-i18n-title="embedded_shell_hide">⌄</button>
-              <button class="embedded-shell-action" id="embedded-shell-close-all" type="button" data-i18n-title="embedded_shell_close_all">×</button>
-            </header>
-            <div class="embedded-shell-path" id="embedded-shell-path"></div>
-            <div class="embedded-shell-terminals" id="embedded-shell-terminals"></div>
-          </section>
-
           <div class="empty" id="empty">
             <div class="lp-actions">
               <button class="lp-act-btn primary" id="empty-new" data-i18n="empty_new_btn">＋ 新建会话</button>
@@ -219,6 +207,20 @@
               <pre class="ws-preview-code" id="workspace-preview-code"></pre>
             </section>
           </div>
+          <section class="embedded-shell-panel" id="embedded-shell-panel" aria-hidden="true">
+            <header class="embedded-shell-header">
+              <button class="embedded-shell-scroll" id="embedded-shell-scroll-left" type="button" hidden data-i18n-title="tab_scroll_left" aria-label="向左滚动标签">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+              </button>
+              <div class="embedded-shell-tabs" id="embedded-shell-tabs"></div>
+              <button class="embedded-shell-scroll" id="embedded-shell-scroll-right" type="button" hidden data-i18n-title="tab_scroll_right" aria-label="向右滚动标签">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+              </button>
+              <button class="embedded-shell-action" id="embedded-shell-add" type="button" data-i18n-title="embedded_shell_add">＋</button>
+              <button class="embedded-shell-action" id="embedded-shell-close-all" type="button" data-i18n-title="embedded_shell_close_all">×</button>
+            </header>
+            <div class="embedded-shell-terminals" id="embedded-shell-terminals"></div>
+          </section>
         </aside>
       </div>
 

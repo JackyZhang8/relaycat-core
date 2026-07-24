@@ -81,8 +81,8 @@ export function workspacePanelWidth(width: number): number {
   return Math.max(280, Math.min(720, finiteWidth));
 }
 
-export function storedWorkspacePanelWidth(stored: string | null): number {
-  return workspacePanelWidth(stored === null ? Number.NaN : Number(stored));
+export function storedWorkspacePanelWidth(stored: string | null, fallback = 360): number {
+  return workspacePanelWidth(stored === null ? fallback : Number(stored));
 }
 
 export function projectBasename(project: string): string {

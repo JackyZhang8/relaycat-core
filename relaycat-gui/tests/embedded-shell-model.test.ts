@@ -3,8 +3,6 @@ import test from "node:test";
 
 import {
   embeddedShellAction,
-  embeddedShellHeight,
-  storedEmbeddedShellHeight,
   toggleTermSidePanel,
 } from "../src/embedded-shell-model.ts";
 
@@ -14,44 +12,27 @@ const shells = [
 ];
 
 test("selects an existing project shell or creates a new one", () => {
-  assert.deepEqual(embeddedShellAction(false, null, "/work/one", shells), {
+  assert.deepEqual(embeddedShellAction("/work/one", shells), {
     kind: "select",
     id: "embedded-shell-1",
   });
-  assert.deepEqual(embeddedShellAction(false, null, "/work/new", shells), {
+  assert.deepEqual(embeddedShellAction("/work/new", shells), {
     kind: "create",
     project: "/work/new",
   });
 });
 
-test("hides only when the open dock already shows the requested project", () => {
-  assert.deepEqual(
-    embeddedShellAction(true, "embedded-shell-1", "/work/one", shells),
-    { kind: "hide" },
-  );
-  assert.deepEqual(
-    embeddedShellAction(true, "embedded-shell-1", "/work/two", shells),
-    { kind: "select", id: "embedded-shell-2" },
-  );
-  assert.deepEqual(
-    embeddedShellAction(false, "embedded-shell-2", "/work/two", shells),
-    { kind: "select", id: "embedded-shell-2" },
-  );
+test("requires a project before activating a Shell", () => {
+  assert.deepEqual(embeddedShellAction(null, shells), { kind: "disabled" });
 });
 
-test("requires a project and clamps dock height", () => {
-  assert.deepEqual(embeddedShellAction(false, null, null, shells), { kind: "disabled" });
-  assert.equal(embeddedShellHeight(80, 900), 160);
-  assert.equal(embeddedShellHeight(320, 900), 320);
-  assert.equal(embeddedShellHeight(800, 900), 540);
-  assert.equal(storedEmbeddedShellHeight(null, 900), null);
-  assert.equal(storedEmbeddedShellHeight("320", 900), 320);
-});
-
-test("file and Git toggles affect only the requested session state", () => {
+test("file Git and Shell entries are mutually exclusive per session", () => {
   assert.equal(toggleTermSidePanel(null, "files"), "files");
   assert.equal(toggleTermSidePanel("files", "files"), null);
   assert.equal(toggleTermSidePanel("files", "git"), "git");
   assert.equal(toggleTermSidePanel("git", "git"), null);
   assert.equal(toggleTermSidePanel("history", "git"), null);
+  assert.equal(toggleTermSidePanel("git", "shell"), "shell");
+  assert.equal(toggleTermSidePanel("shell", "shell"), null);
+  assert.equal(toggleTermSidePanel("shell", "files"), "files");
 });

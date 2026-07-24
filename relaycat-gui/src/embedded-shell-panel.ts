@@ -4,11 +4,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal, type ITheme } from "@xterm/xterm";
 
-import {
-  embeddedShellAction,
-  embeddedShellHeight,
-  storedEmbeddedShellHeight,
-} from "./embedded-shell-model";
+import { embeddedShellAction } from "./embedded-shell-model";
+import { tabScrollState } from "./tab-scroll";
 
 interface SessionInfo {
   id: string;
@@ -47,49 +44,34 @@ interface EmbeddedShellPanelOptions {
   focusMainTerminal: () => void;
   afterLayoutChange: () => void;
   confirm: (message: string) => Promise<boolean>;
+  onRequestClose: () => void;
 }
 
 export interface EmbeddedShellPanelController {
-  toggleForProject(project: string | null): Promise<void>;
+  activateForProject(project: string | null): Promise<void>;
   createForProject(project: string | null): Promise<void>;
-  hide(): void;
+  setVisible(visible: boolean): void;
   refit(): void;
   runningCount(): number;
   updateAppearance(theme: ITheme, fontSize: number): void;
 }
 
 const MAX_EMBEDDED_SHELLS = 8;
-const HEIGHT_STORAGE_KEY = "relaycat.embeddedShellHeight";
-
 export function createEmbeddedShellPanel(
   options: EmbeddedShellPanelOptions,
 ): EmbeddedShellPanelController {
   const { translate: t } = options;
-  const host = document.querySelector("#terminal-stage") as HTMLElement;
   const panel = document.querySelector("#embedded-shell-panel") as HTMLElement;
   const tabsEl = document.querySelector("#embedded-shell-tabs") as HTMLElement;
   const terminalsEl = document.querySelector("#embedded-shell-terminals") as HTMLElement;
-  const pathEl = document.querySelector("#embedded-shell-path") as HTMLElement;
-  const resizer = document.querySelector("#embedded-shell-resizer") as HTMLElement;
+  const scrollLeftBtn = document.querySelector("#embedded-shell-scroll-left") as HTMLButtonElement;
+  const scrollRightBtn = document.querySelector("#embedded-shell-scroll-right") as HTMLButtonElement;
   const addBtn = document.querySelector("#embedded-shell-add") as HTMLButtonElement;
-  const hideBtn = document.querySelector("#embedded-shell-hide") as HTMLButtonElement;
   const closeAllBtn = document.querySelector("#embedded-shell-close-all") as HTMLButtonElement;
 
   const shells: EmbeddedShellTab[] = [];
   let activeShellId: string | null = null;
   let opened = false;
-  let resizing = false;
-
-  const storedHeight = storedEmbeddedShellHeight(
-    localStorage.getItem(HEIGHT_STORAGE_KEY),
-    host.clientHeight || window.innerHeight,
-  );
-  if (storedHeight !== null) {
-    host.style.setProperty(
-      "--embedded-shell-height",
-      `${storedHeight}px`,
-    );
-  }
 
   function shellById(id: string | null) {
     return shells.find((shell) => shell.id === id);
@@ -129,6 +111,22 @@ export function createEmbeddedShellPanel(
       shell.tabEl.classList.toggle("active", shell.id === activeShellId);
       shell.tabEl.classList.toggle("exited", shell.state === "exited");
     }
+    requestAnimationFrame(updateShellTabScrollControls);
+  }
+
+  function updateShellTabScrollControls() {
+    const state = tabScrollState(tabsEl);
+    scrollLeftBtn.hidden = !state.overflow;
+    scrollRightBtn.hidden = !state.overflow;
+    scrollLeftBtn.disabled = !state.canScrollLeft;
+    scrollRightBtn.disabled = !state.canScrollRight;
+  }
+
+  function scrollShellTabs(direction: -1 | 1) {
+    tabsEl.scrollBy({
+      left: direction * Math.max(120, Math.floor(tabsEl.clientWidth * 0.7)),
+      behavior: "smooth",
+    });
   }
 
   function selectShell(id: string) {
@@ -136,31 +134,25 @@ export function createEmbeddedShellPanel(
     if (!selected) return;
     activeShellId = id;
     for (const shell of shells) shell.pane.classList.toggle("active", shell.id === id);
-    pathEl.textContent = selected.project;
-    pathEl.title = selected.project;
     renderTabs();
     requestAnimationFrame(() => {
       if (shellById(id) !== selected || activeShellId !== id) return;
+      selected.tabEl.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
       refit();
       selected.term.focus();
     });
   }
 
-  function show() {
-    if (opened) return;
-    opened = true;
-    host.classList.add("shell-dock-open");
-    panel.setAttribute("aria-hidden", "false");
+  function setVisible(visible: boolean) {
+    if (opened === visible) return;
+    opened = visible;
+    panel.setAttribute("aria-hidden", String(!visible));
     options.afterLayoutChange();
-  }
-
-  function hide() {
-    if (!opened) return;
-    opened = false;
-    host.classList.remove("shell-dock-open");
-    panel.setAttribute("aria-hidden", "true");
-    options.afterLayoutChange();
-    options.focusMainTerminal();
+    if (visible) {
+      requestAnimationFrame(refit);
+    } else {
+      options.focusMainTerminal();
+    }
   }
 
   function finalizeShellRemoval(id: string, selectNext: boolean) {
@@ -170,12 +162,13 @@ export function createEmbeddedShellPanel(
     shell.term.dispose();
     shell.pane.remove();
     shell.tabEl.remove();
+    requestAnimationFrame(updateShellTabScrollControls);
     if (activeShellId === id) {
       activeShellId = null;
       if (!selectNext) return;
       const next = shells[index] || shells[index - 1];
       if (next) selectShell(next.id);
-      else hide();
+      else options.onRequestClose();
     }
   }
 
@@ -206,7 +199,7 @@ export function createEmbeddedShellPanel(
     activeShellId = null;
     const remaining = shells[0];
     if (remaining) selectShell(remaining.id);
-    else hide();
+    else options.onRequestClose();
   }
 
   async function createForProject(project: string | null) {
@@ -216,7 +209,6 @@ export function createEmbeddedShellPanel(
       shellById(activeShellId)?.term.writeln(`\r\n\x1b[33m${t("embedded_shell_limit")}\x1b[0m`);
       return;
     }
-    show();
     const id = `embedded-shell-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
     const term = new Terminal(options.terminalOptions());
     const fit = new FitAddon();
@@ -294,15 +286,11 @@ export function createEmbeddedShellPanel(
     await shell.ready;
   }
 
-  async function toggleForProject(project: string | null) {
-    const action = embeddedShellAction(opened, activeShellId, project, shells);
+  async function activateForProject(project: string | null) {
+    const action = embeddedShellAction(project, shells);
     if (action.kind === "disabled") return;
-    if (action.kind === "hide") {
-      hide();
-      return;
-    }
+    setVisible(true);
     if (action.kind === "select") {
-      show();
       selectShell(action.id);
       return;
     }
@@ -310,35 +298,13 @@ export function createEmbeddedShellPanel(
   }
 
   addBtn.onclick = () => void createForProject(options.currentProject());
-  hideBtn.onclick = hide;
   closeAllBtn.onclick = () => void requestCloseAllShells();
-
-  resizer.addEventListener("pointerdown", (event) => {
-    event.preventDefault();
-    resizing = true;
-    resizer.setPointerCapture(event.pointerId);
-  });
-  resizer.addEventListener("pointermove", (event) => {
-    if (!resizing) return;
-    const bounds = host.getBoundingClientRect();
-    const height = embeddedShellHeight(bounds.bottom - event.clientY, bounds.height);
-    host.style.setProperty("--embedded-shell-height", `${height}px`);
-    options.afterLayoutChange();
-    refit();
-  });
-  const finishResize = (event: PointerEvent) => {
-    if (!resizing) return;
-    resizing = false;
-    if (resizer.hasPointerCapture(event.pointerId)) resizer.releasePointerCapture(event.pointerId);
-    const height = panel.getBoundingClientRect().height;
-    localStorage.setItem(HEIGHT_STORAGE_KEY, String(height));
-    options.afterLayoutChange();
-    refit();
-  };
-  resizer.addEventListener("pointerup", finishResize);
-  resizer.addEventListener("pointercancel", finishResize);
+  scrollLeftBtn.onclick = () => scrollShellTabs(-1);
+  scrollRightBtn.onclick = () => scrollShellTabs(1);
+  tabsEl.addEventListener("scroll", updateShellTabScrollControls, { passive: true });
 
   new ResizeObserver(refit).observe(terminalsEl);
+  new ResizeObserver(updateShellTabScrollControls).observe(tabsEl);
   void listen<OutputEvent>("session://output", (event) => {
     shellById(event.payload.id)?.term.write(new Uint8Array(event.payload.data));
   }).catch(() => {});
@@ -355,9 +321,9 @@ export function createEmbeddedShellPanel(
   }).catch(() => {});
 
   return {
-    toggleForProject,
+    activateForProject,
     createForProject,
-    hide,
+    setVisible,
     refit,
     runningCount,
     updateAppearance,

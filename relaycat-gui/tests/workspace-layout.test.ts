@@ -93,3 +93,25 @@ test("preview height is resizable and survives collapse and expand", () => {
     /setPreviewCollapsed[\s\S]{0,400}removeProperty\("--workspace-preview-height"/,
   );
 });
+
+test("workspace remembers separate file Git and Shell widths", () => {
+  assert.match(workspacePanel, /relaycat\.workspacePanelWidth\.files/);
+  assert.match(workspacePanel, /relaycat\.workspacePanelWidth\.git/);
+  assert.match(workspacePanel, /relaycat\.workspacePanelWidth\.shell/);
+  assert.match(workspacePanel, /storedWorkspacePanelWidth\([^,]+,\s*440\)/s);
+  assert.match(
+    workspacePanel,
+    /widthMode === "shell"[\s\S]*?storedWorkspacePanelWidth\(stored,\s*440\)/,
+  );
+  assert.match(
+    workspacePanel,
+    /value === "shell"[\s\S]*?window\.innerWidth \* 0\.6/,
+  );
+});
+
+test("Shell mode owns the workspace body without showing file or Git chrome", () => {
+  assert.match(css, /\.workspace-panel\.shell-mode \.embedded-shell-panel\s*{[^}]*display:\s*flex;/s);
+  assert.match(css, /\.workspace-panel\.shell-mode \.ws-main\s*{[^}]*display:\s*none;/s);
+  assert.match(css, /\.workspace-panel\.shell-mode \.ws-tabs/s);
+  assert.match(css, /\.workspace-panel\.shell-mode \.ws-refresh-progress/s);
+});

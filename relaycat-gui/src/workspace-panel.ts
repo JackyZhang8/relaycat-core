@@ -31,8 +31,8 @@ import {
   type WorkspaceEntriesPage,
 } from "./workspace-model";
 
-type WorkspaceMode = "files" | "git" | "history";
-export type WorkspaceEntryMode = "files" | "git" | "history" | null;
+type WorkspaceMode = "files" | "git" | "history" | "shell";
+export type WorkspaceEntryMode = WorkspaceMode | null;
 
 export interface WorkspacePanelController {
   show(mode: WorkspaceEntryMode): void;
@@ -64,7 +64,12 @@ interface GitRef {
   current: boolean;
 }
 
-const WIDTH_STORAGE_KEY = "relaycat.workspacePanelWidth";
+const WIDTH_STORAGE_KEYS = {
+  files: "relaycat.workspacePanelWidth.files",
+  git: "relaycat.workspacePanelWidth.git",
+  shell: "relaycat.workspacePanelWidth.shell",
+} as const;
+const LEGACY_WIDTH_STORAGE_KEY = "relaycat.workspacePanelWidth";
 const PREVIEW_HEIGHT_STORAGE_KEY = "relaycat.workspacePreviewHeight";
 
 export function createWorkspacePanel(
@@ -139,7 +144,30 @@ export function createWorkspacePanel(
 
   panel.classList.add("files-mode");
 
-  panel.style.width = `${storedWorkspacePanelWidth(localStorage.getItem(WIDTH_STORAGE_KEY))}px`;
+  function widthStorageMode(value: WorkspaceMode): keyof typeof WIDTH_STORAGE_KEYS {
+    if (value === "shell") return "shell";
+    return value === "files" ? "files" : "git";
+  }
+
+  function constrainedPanelWidth(requested: number, value: WorkspaceMode): number {
+    const width = workspacePanelWidth(requested);
+    if (value === "shell") {
+      return Math.min(width, Math.max(280, Math.floor(window.innerWidth * 0.6)));
+    }
+    return width;
+  }
+
+  function restorePanelWidth(value: WorkspaceMode) {
+    const widthMode = widthStorageMode(value);
+    const stored = localStorage.getItem(WIDTH_STORAGE_KEYS[widthMode]);
+    const legacy = localStorage.getItem(LEGACY_WIDTH_STORAGE_KEY);
+    const width = widthMode === "shell"
+      ? storedWorkspacePanelWidth(stored, 440)
+      : storedWorkspacePanelWidth(stored ?? legacy, 360);
+    panel.style.width = `${constrainedPanelWidth(width, value)}px`;
+  }
+
+  restorePanelWidth(mode);
   const storedPreviewHeight = Number(localStorage.getItem(PREVIEW_HEIGHT_STORAGE_KEY));
   if (Number.isFinite(storedPreviewHeight) && storedPreviewHeight >= 140) {
     workspaceMain.style.setProperty("--workspace-preview-height", `${storedPreviewHeight}px`);
@@ -1104,7 +1132,7 @@ export function createWorkspacePanel(
   }
 
   async function refresh(background = false) {
-    if (!opened || !project) return;
+    if (!opened || !project || mode === "shell") return;
     if (!background) {
       refreshCount += 1;
       refreshBtn.disabled = true;
@@ -1142,7 +1170,8 @@ export function createWorkspacePanel(
 
   function syncOpenModeClasses() {
     stage.classList.toggle("workspace-files-open", opened && mode === "files");
-    stage.classList.toggle("workspace-git-open", opened && mode !== "files");
+    stage.classList.toggle("workspace-git-open", opened && (mode === "git" || mode === "history"));
+    stage.classList.toggle("workspace-shell-open", opened && mode === "shell");
   }
 
   function setOpened(next: boolean) {
@@ -1152,7 +1181,7 @@ export function createWorkspacePanel(
     syncOpenModeClasses();
     panel.setAttribute("aria-hidden", String(!opened));
     resizer.setAttribute("aria-hidden", String(!opened));
-    if (opened) {
+    if (opened && mode !== "shell") {
       startRefreshTimer();
       void refresh();
     } else {
@@ -1166,8 +1195,10 @@ export function createWorkspacePanel(
     const filesActive = mode === "files";
     const gitActive = mode === "git";
     const historyActive = mode === "history";
+    const shellActive = mode === "shell";
     panel.classList.toggle("files-mode", filesActive);
-    panel.classList.toggle("git-mode", !filesActive);
+    panel.classList.toggle("git-mode", gitActive || historyActive);
+    panel.classList.toggle("shell-mode", shellActive);
     gitTab.classList.toggle("active", gitActive);
     gitTab.setAttribute("aria-selected", String(gitActive));
     historyTab.classList.toggle("active", historyActive);
@@ -1175,11 +1206,19 @@ export function createWorkspacePanel(
     filesView.hidden = !filesActive;
     gitView.hidden = !gitActive;
     historyView.hidden = !historyActive;
+    restorePanelWidth(mode);
     onModeChange(mode);
     syncOpenModeClasses();
-    clearPreview();
-    setPreviewCollapsed(workspacePreviewStartsCollapsed(mode));
-    if (opened) void refresh();
+    if (shellActive) {
+      stopRefreshTimer();
+    } else {
+      clearPreview();
+      setPreviewCollapsed(mode === "shell" ? false : workspacePreviewStartsCollapsed(mode));
+      if (opened) {
+        startRefreshTimer();
+        void refresh();
+      }
+    }
   }
 
   closeBtn.onclick = () => {
@@ -1326,7 +1365,7 @@ export function createWorkspacePanel(
   });
   resizer.addEventListener("pointermove", (event) => {
     if (!resizing) return;
-    const width = workspacePanelWidth(window.innerWidth - event.clientX);
+    const width = constrainedPanelWidth(window.innerWidth - event.clientX, mode);
     panel.style.width = `${width}px`;
     scheduleLayoutChange();
   });
@@ -1335,7 +1374,10 @@ export function createWorkspacePanel(
     resizing = false;
     document.body.classList.remove("ws-resizing");
     if (resizer.hasPointerCapture(event.pointerId)) resizer.releasePointerCapture(event.pointerId);
-    localStorage.setItem(WIDTH_STORAGE_KEY, String(panel.getBoundingClientRect().width));
+    localStorage.setItem(
+      WIDTH_STORAGE_KEYS[widthStorageMode(mode)],
+      String(panel.getBoundingClientRect().width),
+    );
     scheduleLayoutChange();
   };
   resizer.addEventListener("pointerup", finishResize);
@@ -1385,7 +1427,7 @@ export function createWorkspacePanel(
       projectLabel.textContent = project ? projectBasename(project) : "";
       projectLabel.title = project ?? "";
       clearPreview();
-      setPreviewCollapsed(workspacePreviewStartsCollapsed(mode));
+      setPreviewCollapsed(mode === "shell" ? false : workspacePreviewStartsCollapsed(mode));
       renderState(fileTree, project ? t("workspace_loading") : "");
       renderState(gitList, project ? t("workspace_loading") : "");
       renderState(historyList, project ? t("workspace_loading") : "");

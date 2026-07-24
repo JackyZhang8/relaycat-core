@@ -403,11 +403,10 @@ button {
   z-index: 15;
   flex-direction: column;
   gap: 4px;
-  padding: 3px;
-  border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
-  border-radius: 9px;
-  background: color-mix(in srgb, #17110d 78%, transparent);
-  backdrop-filter: blur(8px);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  backdrop-filter: none;
 }
 .term-pane.active .term-toolrail,
 .terminals.split .term-pane.focused .term-toolrail {
@@ -422,10 +421,11 @@ button {
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: #c8b8aa;
+  color: var(--dim);
   cursor: pointer;
-  opacity: 0.66;
-  transition: opacity 0.14s ease, color 0.14s ease, background 0.14s ease;
+  opacity: 0.85;
+  transition: opacity 0.14s ease, color 0.14s ease, background 0.14s ease,
+    box-shadow 0.14s ease;
 }
 .term-toolbtn svg {
   width: 17px;
@@ -441,64 +441,47 @@ button {
   opacity: 1;
   color: var(--accent);
   background: var(--accent-soft);
+  box-shadow: 0 0 8px var(--accent-ring);
 }
 .stage.workspace-files-open .term-pane.active .term-toolbtn.files,
 .stage.workspace-git-open .term-pane.active .term-toolbtn.git,
-.terminal-stage.shell-dock-open .term-pane.active .term-toolbtn.shell {
+.stage.workspace-shell-open .term-pane.active .term-toolbtn.shell {
   opacity: 1;
   color: var(--accent);
   background: var(--accent-soft);
 }
 
-.terminal-stage.shell-dock-open .terminals,
-.terminal-stage.shell-dock-open .empty {
-  bottom: var(--embedded-shell-height, 280px);
-}
 .embedded-shell-panel {
   display: none;
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: var(--embedded-shell-height, 280px);
-  min-height: 160px;
-  background: #0f0b09;
-  color: #f6eee7;
-  border-top: 1px solid var(--border);
-  z-index: 8;
+  min-width: 0;
+  min-height: 0;
+  background: var(--panel);
+  color: var(--text);
 }
-.terminal-stage.shell-dock-open .embedded-shell-panel {
-  display: grid;
-  grid-template-rows: 34px 24px minmax(0, 1fr);
-}
-.embedded-shell-resizer {
-  display: none;
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: calc(var(--embedded-shell-height, 280px) - 3px);
-  height: 6px;
-  cursor: row-resize;
-  z-index: 9;
-  touch-action: none;
-}
-.terminal-stage.shell-dock-open .embedded-shell-resizer {
-  display: block;
-}
-.embedded-shell-resizer:hover {
-  background: var(--accent);
+.workspace-panel.shell-mode .embedded-shell-panel {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
 }
 .embedded-shell-header {
+  height: 36px;
+  flex: none;
   display: flex;
+  align-items: stretch;
   min-width: 0;
   border-bottom: 1px solid var(--border);
-  background: #17110d;
+  background: var(--panel);
 }
 .embedded-shell-tabs {
   display: flex;
   flex: 1;
   min-width: 0;
   overflow-x: auto;
+  scrollbar-width: none;
+}
+.embedded-shell-tabs::-webkit-scrollbar {
+  height: 0;
 }
 .embedded-shell-tab {
   flex: none;
@@ -509,16 +492,22 @@ button {
   padding: 0 8px 0 10px;
   border: 0;
   border-right: 1px solid var(--border);
-  border-bottom: 2px solid transparent;
+  border-top: 2px solid transparent;
   background: transparent;
-  color: #aa9b8f;
+  color: var(--dim);
   cursor: pointer;
   font-size: 12px;
+  transition: color 0.14s ease, background 0.14s ease,
+    border-color 0.14s ease;
+}
+.embedded-shell-tab:hover {
+  color: var(--text);
+  background: var(--hover);
 }
 .embedded-shell-tab.active {
-  color: #fff7ef;
-  border-bottom-color: var(--accent);
-  background: #211711;
+  color: var(--text);
+  border-top-color: var(--accent);
+  background: var(--hover-strong);
 }
 .embedded-shell-tab.exited {
   text-decoration: line-through;
@@ -526,37 +515,74 @@ button {
 }
 .embedded-shell-tab-close {
   font-size: 15px;
+  opacity: 0;
+  color: var(--dim);
+  transition: opacity 0.14s ease, color 0.14s ease;
+}
+.embedded-shell-tab:hover .embedded-shell-tab-close,
+.embedded-shell-tab.active .embedded-shell-tab-close {
+  opacity: 1;
+}
+.embedded-shell-tab-close:hover {
+  color: var(--text);
 }
 .embedded-shell-action {
   width: 30px;
   border: 0;
   background: transparent;
-  color: #aa9b8f;
+  color: var(--dim);
   cursor: pointer;
+  transition: color 0.14s ease, background 0.14s ease;
 }
 .embedded-shell-action:hover {
-  color: #fff7ef;
-  background: #2a1d15;
+  color: var(--text);
+  background: var(--hover);
 }
-.embedded-shell-path {
-  padding: 4px 9px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: #8f8176;
-  font: 11px var(--mono);
-  border-bottom: 1px solid #2e2119;
+.embedded-shell-scroll {
+  width: 26px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+.embedded-shell-scroll[hidden] {
+  display: none;
+}
+.embedded-shell-scroll:hover:not(:disabled) {
+  color: var(--accent);
+  background: var(--hover);
+}
+.embedded-shell-scroll:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.embedded-shell-scroll svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .embedded-shell-terminals {
+  flex: 1;
   position: relative;
   min-height: 0;
   overflow: hidden;
+  background: #0f0b09;
 }
 .embedded-shell-pane {
   display: none;
   position: absolute;
   inset: 0;
   padding: 6px 8px;
+  background: #0f0b09;
 }
 .embedded-shell-pane.active {
   display: block;
@@ -712,6 +738,15 @@ body.ws-resizing .workspace-resizer {
 }
 .workspace-panel.files-mode .ws-tabs,
 .workspace-panel.files-mode .ws-operation {
+  display: none;
+}
+.workspace-panel.shell-mode .ws-refresh-progress,
+.workspace-panel.shell-mode .ws-tabs,
+.workspace-panel.shell-mode .ws-operation,
+.workspace-panel.shell-mode .ws-main {
+  display: none;
+}
+.workspace-panel.shell-mode #workspace-refresh {
   display: none;
 }
 .ws-tab {
