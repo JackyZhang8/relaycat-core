@@ -2,6 +2,7 @@
 members = [
     "crates/cli",
     "crates/crypto",
+    "crates/workspace",
 ]
 exclude = ["third_party/vt100"]
 resolver = "2"
