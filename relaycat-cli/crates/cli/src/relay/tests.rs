@@ -2475,6 +2475,35 @@ fn workspace_messages_route_and_bypass_terminal_resume_gate() {
 }
 
 #[test]
+fn one_maximum_workspace_frame_keeps_terminal_patch_inside_outbound_burst_budget() {
+    let now = Instant::now();
+    let mut pacer = RelayOutboundBytePacer::new(now);
+    assert_eq!(pacer.delay_for(MAX_OUTER_FRAME_BYTES, now), None);
+    assert_eq!(pacer.delay_for(64 * 1024, now), None);
+}
+
+#[test]
+fn workspace_diagnostics_include_metrics_without_user_paths_or_messages() {
+    let operation = relaycat_protocol::WorkspaceRequest::ReadFile {
+        path: "/Users/alice/secret.txt".into(),
+        max_bytes: 1024,
+        image_variant: relaycat_protocol::ImageVariant::Original,
+    };
+    let line = workspace_diagnostic_line(
+        &operation,
+        Duration::from_millis(12),
+        345,
+        Some(relaycat_protocol::WorkspaceErrorCode::PathOutsideProject),
+    );
+    assert!(line.contains("op=read_file"));
+    assert!(line.contains("elapsed_ms=12"));
+    assert!(line.contains("response_bytes=345"));
+    assert!(line.contains("error_code=path_outside_project"));
+    assert!(!line.contains("Users"));
+    assert!(!line.contains("secret"));
+}
+
+#[test]
 fn hello_ack_can_send_before_terminal_resume() {
     // The capability handshake reply must not be gated by the resume window.
     assert!(can_send_without_terminal_resume(&PlainMsg::HelloAckV2(

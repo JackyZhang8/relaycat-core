@@ -1,5 +1,47 @@
 use super::*;
 
+pub(crate) fn workspace_operation_name(operation: &relaycat_protocol::WorkspaceRequest) -> &'static str {
+    use relaycat_protocol::WorkspaceRequest::*;
+    match operation {
+        Capabilities => "capabilities", Cancel { .. } => "cancel", ListDirectory { .. } => "list_directory",
+        ReadFile { .. } => "read_file", GitSummary => "git_summary", GitStatus => "git_status",
+        GitDiff { .. } => "git_diff", GitHistory { .. } => "git_history", GitCommitDetail { .. } => "git_commit_detail",
+        GitListRefs => "git_list_refs", GitStage { .. } => "git_stage", GitUnstage { .. } => "git_unstage",
+        GitDiscard { .. } => "git_discard", GitApplyPatch { .. } => "git_apply_patch", GitCheckout { .. } => "git_checkout",
+        GitCreateBranch { .. } => "git_create_branch", GitRenameBranch { .. } => "git_rename_branch",
+        GitDeleteBranch { .. } => "git_delete_branch", GitCreateTag { .. } => "git_create_tag",
+        GitCommit { .. } => "git_commit", GitRemote { .. } => "git_remote", GitCommitAction { .. } => "git_commit_action",
+        GitReset { .. } => "git_reset", ShellList => "shell_list", ShellCreate { .. } => "shell_create",
+        ShellInput { .. } => "shell_input", ShellResize { .. } => "shell_resize", ShellSnapshot { .. } => "shell_snapshot",
+        ShellClose { .. } => "shell_close", ShellCloseAll => "shell_close_all",
+    }
+}
+
+pub(crate) fn workspace_diagnostic_line(
+    operation: &relaycat_protocol::WorkspaceRequest,
+    elapsed: Duration,
+    response_bytes: usize,
+    error: Option<relaycat_protocol::WorkspaceErrorCode>,
+) -> String {
+    format!(
+        "workspace_request op={} elapsed_ms={} response_bytes={} error_code={}",
+        workspace_operation_name(operation),
+        elapsed.as_millis(),
+        response_bytes,
+        error.map(workspace_error_code_name).unwrap_or("none"),
+    )
+}
+
+fn workspace_error_code_name(code: relaycat_protocol::WorkspaceErrorCode) -> &'static str {
+    use relaycat_protocol::WorkspaceErrorCode::*;
+    match code {
+        Unsupported => "unsupported", InvalidRequest => "invalid_request", PermissionDenied => "permission_denied",
+        PathOutsideProject => "path_outside_project", NotFound => "not_found", TooLarge => "too_large",
+        Binary => "binary", NotGitRepository => "not_git_repository", Conflict => "conflict", Timeout => "timeout",
+        Busy => "busy", Cancelled => "cancelled", Internal => "internal",
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct TerminalPatchOpCounts {
     append_scrollback_rows: usize,

@@ -2649,9 +2649,19 @@ where
                     let service = workspace_service_for_input.clone();
                     let output = heartbeat_output_tx_for_input.clone();
                     tokio::spawn(async move {
+                        let started = Instant::now();
+                        let operation = request.operation.clone();
                         let response = tokio::task::spawn_blocking(move || service.execute(request))
                             .await;
                         if let Ok(response) = response {
+                            let response_bytes = relaycat_protocol::plain_msg_encoded_len(
+                                &PlainMsg::WorkspaceResponse(response.clone()),
+                            );
+                            let error = response.result.as_ref().err().map(|error| error.code);
+                            relaycat_log(
+                                "INFO",
+                                workspace_diagnostic_line(&operation, started.elapsed(), response_bytes, error),
+                            );
                             let _ = output
                                 .send(PtyEvent::Plain(PlainMsg::WorkspaceResponse(response)))
                                 .await;
