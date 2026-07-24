@@ -1,9 +1,16 @@
 use relaycat_protocol::{PlainMsg, WorkspaceRequest, WorkspaceRequestEnvelope, WorkspaceResponse};
 use relaycat_workspace::{ProjectRoot, WorkspaceService};
-use std::{fs, path::PathBuf, process::Command, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    fs,
+    path::PathBuf,
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+static NEXT_REPO_ID: AtomicU64 = AtomicU64::new(1);
 
 struct Repo { root: PathBuf }
-impl Repo { fn new()->Self{let n=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();let root=std::env::temp_dir().join(format!("relaycat-service-{n}"));fs::create_dir_all(&root).unwrap();git(&root,&["init","--quiet"]);git(&root,&["config","user.name","RelayCat Test"]);git(&root,&["config","user.email","relaycat@example.test"]);fs::write(root.join("a.txt"),"a").unwrap();git(&root,&["add","--","a.txt"]);git(&root,&["commit","--quiet","-m","initial"]);Self{root}} }
+impl Repo { fn new()->Self{let n=NEXT_REPO_ID.fetch_add(1,Ordering::Relaxed);let root=std::env::temp_dir().join(format!("relaycat-service-{}-{n}",std::process::id()));fs::create_dir_all(&root).unwrap();git(&root,&["init","--quiet"]);git(&root,&["config","user.name","RelayCat Test"]);git(&root,&["config","user.email","relaycat@example.test"]);fs::write(root.join("a.txt"),"a").unwrap();git(&root,&["add","--","a.txt"]);git(&root,&["commit","--quiet","-m","initial"]);Self{root}} }
 impl Drop for Repo{fn drop(&mut self){let _=fs::remove_dir_all(&self.root);}}
 fn git(root:&PathBuf,args:&[&str]){assert!(Command::new("git").args(args).current_dir(root).status().unwrap().success());}
 
