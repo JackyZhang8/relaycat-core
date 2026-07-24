@@ -395,6 +395,172 @@ button {
 .term-pane.active {
   display: block;
 }
+.term-toolrail {
+  display: none;
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 15;
+  flex-direction: column;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, #17110d 78%, transparent);
+  backdrop-filter: blur(8px);
+}
+.term-pane.active .term-toolrail,
+.terminals.split .term-pane.focused .term-toolrail {
+  display: flex;
+}
+.term-toolbtn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #c8b8aa;
+  cursor: pointer;
+  opacity: 0.66;
+  transition: opacity 0.14s ease, color 0.14s ease, background 0.14s ease;
+}
+.term-toolbtn svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.term-toolbtn:hover,
+.term-toolbtn.active {
+  opacity: 1;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.stage.workspace-files-open .term-pane.active .term-toolbtn.files,
+.stage.workspace-git-open .term-pane.active .term-toolbtn.git,
+.terminal-stage.shell-dock-open .term-pane.active .term-toolbtn.shell {
+  opacity: 1;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.terminal-stage.shell-dock-open .terminals,
+.terminal-stage.shell-dock-open .empty {
+  bottom: var(--embedded-shell-height, 280px);
+}
+.embedded-shell-panel {
+  display: none;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: var(--embedded-shell-height, 280px);
+  min-height: 160px;
+  background: #0f0b09;
+  color: #f6eee7;
+  border-top: 1px solid var(--border);
+  z-index: 8;
+}
+.terminal-stage.shell-dock-open .embedded-shell-panel {
+  display: grid;
+  grid-template-rows: 34px 24px minmax(0, 1fr);
+}
+.embedded-shell-resizer {
+  display: none;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(var(--embedded-shell-height, 280px) - 3px);
+  height: 6px;
+  cursor: row-resize;
+  z-index: 9;
+  touch-action: none;
+}
+.terminal-stage.shell-dock-open .embedded-shell-resizer {
+  display: block;
+}
+.embedded-shell-resizer:hover {
+  background: var(--accent);
+}
+.embedded-shell-header {
+  display: flex;
+  min-width: 0;
+  border-bottom: 1px solid var(--border);
+  background: #17110d;
+}
+.embedded-shell-tabs {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+}
+.embedded-shell-tab {
+  flex: none;
+  max-width: 220px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px 0 10px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: #aa9b8f;
+  cursor: pointer;
+  font-size: 12px;
+}
+.embedded-shell-tab.active {
+  color: #fff7ef;
+  border-bottom-color: var(--accent);
+  background: #211711;
+}
+.embedded-shell-tab.exited {
+  text-decoration: line-through;
+  opacity: 0.65;
+}
+.embedded-shell-tab-close {
+  font-size: 15px;
+}
+.embedded-shell-action {
+  width: 30px;
+  border: 0;
+  background: transparent;
+  color: #aa9b8f;
+  cursor: pointer;
+}
+.embedded-shell-action:hover {
+  color: #fff7ef;
+  background: #2a1d15;
+}
+.embedded-shell-path {
+  padding: 4px 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #8f8176;
+  font: 11px var(--mono);
+  border-bottom: 1px solid #2e2119;
+}
+.embedded-shell-terminals {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+}
+.embedded-shell-pane {
+  display: none;
+  position: absolute;
+  inset: 0;
+  padding: 6px 8px;
+}
+.embedded-shell-pane.active {
+  display: block;
+}
 /* Letterbox: when the terminal grid is pinned to the phone-negotiated size
    (smaller than the desktop window), align it to the top-left and leave the
    extra space blank so the desktop renders the same layout as the phone. Scoped
@@ -482,11 +648,71 @@ body.ws-resizing .workspace-resizer {
   color: var(--text);
   background: var(--hover-strong);
 }
+.workspace-panel.refreshing #workspace-refresh {
+  animation: ws-refresh-spin 0.8s linear infinite;
+}
+.ws-refresh-progress {
+  display: none;
+  height: 3px;
+  flex: none;
+  overflow: hidden;
+  background: var(--inset);
+}
+.workspace-panel.refreshing .ws-refresh-progress,
+.workspace-panel.refreshed .ws-refresh-progress,
+.workspace-panel.refresh-error .ws-refresh-progress {
+  display: block;
+}
+.ws-refresh-progress-bar {
+  width: 36%;
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    #ff3b30,
+    #ffcc00,
+    #00e676,
+    #00c7ff,
+    #a855f7,
+    #ff2d92,
+    #ff3b30
+  );
+  box-shadow: 0 0 8px rgba(0, 199, 255, 0.7), 0 0 5px rgba(255, 45, 146, 0.65);
+  animation: ws-refresh-progress 0.9s ease-in-out infinite;
+}
+.workspace-panel.refreshed .ws-refresh-progress-bar {
+  width: 100%;
+  animation: none;
+  transition: width 0.18s ease-out;
+}
+.workspace-panel.refresh-error .ws-refresh-progress-bar {
+  width: 100%;
+  background: var(--red);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--red) 60%, transparent);
+  animation: none;
+}
+@keyframes ws-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes ws-refresh-progress {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(285%);
+  }
+}
 .ws-tabs {
   height: 36px;
   flex: none;
   display: flex;
   border-bottom: 1px solid var(--border);
+}
+.workspace-panel.files-mode .ws-tabs,
+.workspace-panel.files-mode .ws-operation {
+  display: none;
 }
 .ws-tab {
   flex: 1;
@@ -507,9 +733,42 @@ body.ws-resizing .workspace-resizer {
 }
 .ws-main {
   flex: 1;
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
   display: grid;
-  grid-template-rows: minmax(150px, 44%) minmax(140px, 1fr);
+  grid-template-rows:
+    minmax(100px, 1fr)
+    5px
+    minmax(140px, var(--workspace-preview-height, 44%));
+}
+.ws-main.preview-collapsed {
+  grid-template-rows: minmax(0, 1fr) 0 34px;
+}
+.ws-main.preview-collapsed .ws-preview > :not(.ws-preview-title) {
+  display: none !important;
+}
+.ws-preview-resizer {
+  position: relative;
+  z-index: 2;
+  cursor: row-resize;
+  background: transparent;
+  touch-action: none;
+}
+.ws-preview-resizer::after {
+  content: "";
+  position: absolute;
+  inset: 1px 0;
+  background: var(--border);
+  transition: background 0.14s ease;
+}
+.ws-preview-resizer:hover::after,
+body.ws-preview-resizing .ws-preview-resizer::after {
+  background: var(--accent);
+}
+.ws-main.preview-collapsed .ws-preview-resizer {
+  visibility: hidden;
+  pointer-events: none;
 }
 .ws-browser {
   min-height: 0;
@@ -530,6 +789,27 @@ body.ws-resizing .workspace-resizer {
   color: var(--dim);
   font-size: 12px;
   text-align: center;
+}
+.ws-directory-more,
+.ws-directory-cap {
+  width: 100%;
+  min-width: max-content;
+  padding: 8px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  font: 10.5px var(--mono);
+  text-align: center;
+}
+.ws-directory-more {
+  cursor: pointer;
+}
+.ws-directory-more:hover {
+  color: var(--accent);
+  background: var(--hover);
+}
+.ws-directory-cap {
+  color: var(--yellow);
 }
 .ws-tree-node {
   min-width: 100%;
@@ -584,6 +864,328 @@ body.ws-resizing .workspace-resizer {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.ws-git-toolbar,
+.ws-change-actions,
+.ws-commit-actions,
+.ws-preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 8px;
+}
+.ws-git-toolbar {
+  position: sticky;
+  top: -6px;
+  z-index: 2;
+  background: var(--panel);
+  border-bottom: 1px solid var(--divider);
+}
+.ws-select,
+.ws-filter-input,
+.ws-commit-message {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--text);
+  font: 11px var(--mono);
+}
+.ws-select {
+  height: 27px;
+  flex: 1;
+}
+.ws-small-btn {
+  min-height: 27px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--hover);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.ws-small-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.ws-small-btn.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: white;
+}
+.ws-small-btn.danger {
+  color: var(--red);
+}
+.ws-small-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.ws-operation {
+  display: none;
+  margin: 0 8px 5px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--dim);
+  font: 10.5px var(--mono);
+  min-width: 0;
+}
+.ws-operation.show {
+  display: block;
+}
+.ws-operation-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text);
+}
+.ws-operation-icon {
+  width: 14px;
+  flex: none;
+  color: var(--accent);
+  text-align: center;
+}
+.ws-operation-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+}
+.ws-operation-detail {
+  margin-left: auto;
+  flex: none;
+  color: var(--dim);
+  font-size: 9.5px;
+}
+.ws-operation-progress {
+  height: 3px;
+  margin: 7px 0;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--inset);
+}
+.ws-operation-progress-bar {
+  width: 38%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  animation: ws-operation-progress 1.1s ease-in-out infinite;
+}
+.ws-operation-log {
+  max-height: 140px;
+  margin: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  color: var(--dim);
+  font: inherit;
+  line-height: 1.5;
+  white-space: pre;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.ws-operation.success {
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+}
+.ws-operation.success .ws-operation-icon {
+  color: var(--green);
+}
+.ws-operation.success .ws-operation-progress-bar {
+  width: 100%;
+  background: var(--green);
+  animation: none;
+}
+.ws-operation.error {
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+}
+.ws-operation.error .ws-operation-icon {
+  color: var(--red);
+}
+.ws-operation.error .ws-operation-progress-bar {
+  width: 100%;
+  background: var(--red);
+  animation: none;
+}
+@keyframes ws-operation-progress {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(275%);
+  }
+}
+.ws-git-row {
+  justify-content: flex-start;
+}
+.ws-git-row-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ws-row-actions {
+  display: none;
+  gap: 3px;
+}
+.ws-git-row:hover .ws-row-actions {
+  display: flex;
+}
+.ws-git-row.ws-row-enter {
+  animation: ws-row-enter 140ms ease-out;
+}
+.ws-git-row.ws-row-leave {
+  pointer-events: none;
+  animation: ws-row-leave 140ms ease-in forwards;
+}
+@keyframes ws-row-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes ws-row-leave {
+  to {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ws-git-row.ws-row-enter,
+  .ws-git-row.ws-row-leave {
+    animation-duration: 1ms;
+  }
+}
+.ws-row-action {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--dim);
+  cursor: pointer;
+}
+.ws-row-action.danger {
+  color: var(--red);
+}
+.ws-commit-box {
+  position: sticky;
+  bottom: -6px;
+  padding: 8px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+.ws-commit-message {
+  width: 100%;
+  min-height: 54px;
+  padding: 7px;
+  resize: vertical;
+}
+.ws-check {
+  display: block;
+  padding-top: 5px;
+  color: var(--dim);
+  font-size: 10.5px;
+}
+.ws-commit-actions {
+  padding: 6px 0 0;
+}
+.ws-history-filters {
+  position: sticky;
+  top: -6px;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: 1fr 80px;
+  gap: 5px;
+  padding: 6px 8px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--divider);
+  width: 100%;
+  min-width: 0;
+}
+.ws-history-filters > * {
+  min-width: 0;
+  max-width: 100%;
+}
+#workspace-history-view:not([hidden]) {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.ws-history-list {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  overflow: auto;
+}
+.ws-filter-input {
+  height: 27px;
+  padding: 0 7px;
+}
+.ws-preview-actions:empty {
+  display: none;
+}
+.ws-preview-actions {
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--divider);
+}
+.ws-history-graph {
+  color: var(--accent);
+  font-family: var(--mono);
+  text-align: center;
+}
+.ws-history-refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 4px;
+}
+.ws-history-ref-badge {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 9px;
+}
+.ws-commit-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 150px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel);
+  box-shadow: var(--shadow-pop);
+}
+.ws-commit-menu button {
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.ws-commit-menu button:hover {
+  background: var(--hover-strong);
+}
+.ws-commit-menu button.danger {
+  color: var(--red);
+}
 .ws-git-section-title {
   padding: 8px 12px 4px;
   color: var(--dim);
@@ -600,10 +1202,10 @@ body.ws-resizing .workspace-resizer {
   text-align: center;
 }
 .ws-history-row {
-  width: 100%;
-  min-width: 260px;
+  width: max-content;
+  min-width: 100%;
   display: grid;
-  grid-template-columns: 58px minmax(0, 1fr);
+  grid-template-columns: 58px max-content;
   gap: 8px;
   padding: 8px 10px;
   border: 0;
@@ -626,8 +1228,6 @@ body.ws-resizing .workspace-resizer {
 }
 .ws-history-subject {
   display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 11.5px;
 }
@@ -641,7 +1241,9 @@ body.ws-resizing .workspace-resizer {
   font-size: 10px;
 }
 .ws-preview {
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   background: var(--bg);
@@ -657,6 +1259,20 @@ body.ws-resizing .workspace-resizer {
   font-family: var(--mono);
   font-size: 11px;
   border-bottom: 1px solid var(--divider);
+  width: 100%;
+  border-top: 0;
+  border-right: 0;
+  border-left: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.ws-preview-title::after {
+  content: "⌄";
+  float: right;
+}
+.ws-main.preview-collapsed .ws-preview-title::after {
+  content: "›";
 }
 .ws-preview-notice {
   display: none;
@@ -671,10 +1287,16 @@ body.ws-resizing .workspace-resizer {
 }
 .ws-preview-code {
   flex: 1;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   min-height: 0;
   margin: 0;
   padding: 10px 12px 18px;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   color: var(--text);
   background: transparent;
   font-family: var(--mono);
@@ -704,6 +1326,8 @@ body.ws-resizing .workspace-resizer {
 }
 .ws-code-line {
   display: block;
+  width: max-content;
+  min-width: 100%;
   min-height: 1.55em;
 }
 .ws-token.keyword {
@@ -742,6 +1366,14 @@ body[data-theme="light"] .ws-token.number {
 }
 .ws-diff-line.hunk {
   color: var(--accent);
+}
+.ws-diff-line.selectable {
+  cursor: pointer;
+}
+.ws-diff-line.selectable:hover,
+.ws-diff-line.selected {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 .iconbtn.active {
   color: var(--accent);

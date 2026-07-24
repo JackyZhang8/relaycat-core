@@ -10,6 +10,12 @@ export interface WorkspaceEntry {
   is_dir: boolean;
 }
 
+export interface WorkspaceEntriesPage {
+  entries: WorkspaceEntry[];
+  has_more: boolean;
+  capped: boolean;
+}
+
 export interface FilePreview {
   kind: "text" | "image" | "binary" | "too_large";
   content: string;
@@ -26,6 +32,8 @@ export interface GitStatus {
 export interface GitCommit {
   hash: string;
   short_hash: string;
+  parents: string[];
+  refs: string[];
   author: string;
   date: string;
   subject: string;
@@ -35,6 +43,12 @@ export interface GitDisplayChange {
   path: string;
   status: string;
   staged: boolean;
+}
+
+export function workspacePreviewStartsCollapsed(
+  mode: "files" | "git" | "history",
+): boolean {
+  return mode === "git";
 }
 
 export function groupGitChanges(changes: GitChange[]): {

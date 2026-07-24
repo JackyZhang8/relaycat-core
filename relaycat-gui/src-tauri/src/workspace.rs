@@ -1,9 +1,10 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use crate::git::runner::git_output;
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -11,6 +12,13 @@ pub struct WorkspaceEntryDto {
     pub name: String,
     pub relative_path: String,
     pub is_dir: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkspaceEntriesPageDto {
+    pub entries: Vec<WorkspaceEntryDto>,
+    pub has_more: bool,
+    pub capped: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -48,12 +56,15 @@ pub struct GitStatusDto {
 pub struct GitCommitDto {
     pub hash: String,
     pub short_hash: String,
+    pub parents: Vec<String>,
+    pub refs: Vec<String>,
     pub author: String,
     pub date: String,
     pub subject: String,
 }
 
-const MAX_DIRECTORY_ENTRIES: usize = 500;
+const MAX_DIRECTORY_ENTRIES: usize = 1000;
+const DIRECTORY_PAGE_SIZE: usize = 100;
 const MAX_FILE_PREVIEW_BYTES: u64 = 512 * 1024;
 const MAX_IMAGE_PREVIEW_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_DIFF_BYTES: usize = 1024 * 1024;
@@ -110,10 +121,20 @@ fn relative_path_string(root: &Path, path: &Path) -> Result<String, String> {
         .join("/"))
 }
 
+#[cfg(test)]
 fn list_workspace_entries_impl(
     project: &str,
     relative_path: &str,
 ) -> Result<Vec<WorkspaceEntryDto>, String> {
+    Ok(list_workspace_entries_page_impl(project, relative_path, 0, DIRECTORY_PAGE_SIZE)?.entries)
+}
+
+fn list_workspace_entries_page_impl(
+    project: &str,
+    relative_path: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<WorkspaceEntriesPageDto, String> {
     let root = project_root(Path::new(project))?;
     let directory = resolve_project_path(&root, relative_path)?;
     if !directory.is_dir() {
@@ -137,9 +158,6 @@ fn list_workspace_entries_impl(
             relative_path: relative_path_string(&root, &path)?,
             is_dir: file_type.is_dir(),
         });
-        if entries.len() >= MAX_DIRECTORY_ENTRIES {
-            break;
-        }
     }
     entries.sort_by(|a, b| {
         b.is_dir
@@ -147,7 +165,22 @@ fn list_workspace_entries_impl(
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             .then_with(|| a.name.cmp(&b.name))
     });
-    Ok(entries)
+    let capped = entries.len() > MAX_DIRECTORY_ENTRIES;
+    entries.truncate(MAX_DIRECTORY_ENTRIES);
+    let offset = offset.min(MAX_DIRECTORY_ENTRIES);
+    let limit = limit.clamp(1, DIRECTORY_PAGE_SIZE);
+    let total = entries.len();
+    let page_entries = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let has_more = offset + page_entries.len() < total;
+    Ok(WorkspaceEntriesPageDto {
+        entries: page_entries,
+        has_more,
+        capped,
+    })
 }
 
 fn read_workspace_file_impl(
@@ -284,15 +317,25 @@ fn parse_git_log(raw: &[u8]) -> Result<Vec<GitCommitDto>, String> {
         .filter(|record| !record.is_empty())
         .map(|record| {
             let fields = record.split(|byte| *byte == 0x1f).collect::<Vec<_>>();
-            if fields.len() != 5 {
+            if fields.len() != 7 {
                 return Err("invalid git history output".to_string());
             }
             Ok(GitCommitDto {
                 hash: String::from_utf8_lossy(fields[0]).into_owned(),
                 short_hash: String::from_utf8_lossy(fields[1]).into_owned(),
-                author: String::from_utf8_lossy(fields[2]).into_owned(),
-                date: String::from_utf8_lossy(fields[3]).into_owned(),
-                subject: String::from_utf8_lossy(fields[4]).into_owned(),
+                parents: String::from_utf8_lossy(fields[2])
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+                refs: String::from_utf8_lossy(fields[3])
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                author: String::from_utf8_lossy(fields[4]).into_owned(),
+                date: String::from_utf8_lossy(fields[5]).into_owned(),
+                subject: String::from_utf8_lossy(fields[6]).into_owned(),
             })
         })
         .collect()
@@ -304,15 +347,6 @@ fn valid_commit_id(commit: &str) -> bool {
 
 fn normalized_history_page(skip: u32, limit: u32) -> (u32, u32) {
     (skip, limit.clamp(1, 100))
-}
-
-fn git_output(project: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("git")
-        .args(args)
-        .current_dir(project)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())
 }
 
 fn git_workspace_status_impl(project: &str) -> Result<GitStatusDto, String> {
@@ -396,6 +430,9 @@ fn git_workspace_history_impl(
     project: &str,
     skip: u32,
     limit: u32,
+    query: Option<&str>,
+    author: Option<&str>,
+    reference: Option<&str>,
 ) -> Result<Vec<GitCommitDto>, String> {
     let root = project_root(Path::new(project))?;
     if !git_output(&root, &["rev-parse", "--verify", "HEAD"])?
@@ -407,19 +444,46 @@ fn git_workspace_history_impl(
     let (skip, limit) = normalized_history_page(skip, limit);
     let skip_arg = format!("--skip={skip}");
     let limit_arg = format!("-n{limit}");
-    let output = git_output(
-        &root,
-        &[
-            "log",
-            &skip_arg,
-            &limit_arg,
-            "-z",
-            "--date=iso-strict",
-            "--pretty=format:%H%x1f%h%x1f%an%x1f%aI%x1f%s",
-            "--",
-            ".",
-        ],
-    )?;
+    let mut args = vec![
+        "log".to_string(),
+        skip_arg,
+        limit_arg,
+        "-z".into(),
+        "--date=iso-strict".into(),
+        "--pretty=format:%H%x1f%h%x1f%P%x1f%D%x1f%an%x1f%aI%x1f%s".into(),
+    ];
+    if let Some(value) = query.filter(|value| !value.trim().is_empty()) {
+        args.push(format!("--grep={}", value.trim()));
+    }
+    if let Some(value) = author.filter(|value| !value.trim().is_empty()) {
+        args.push(format!("--author={}", value.trim()));
+    }
+    if let Some(value) = reference.filter(|value| !value.trim().is_empty()) {
+        let value = value.trim();
+        if value.starts_with('-') {
+            return Err("invalid history reference".into());
+        }
+        let commit = format!("{value}^{{commit}}");
+        if !git_output(
+            &root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &commit,
+            ],
+        )?
+        .status
+        .success()
+        {
+            return Err("invalid history reference".into());
+        }
+        args.push(value.to_string());
+    }
+    args.extend(["--".into(), ".".into()]);
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = git_output(&root, &arg_refs)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -467,9 +531,11 @@ fn git_workspace_commit_diff_impl(project: &str, commit: &str) -> Result<FilePre
 pub async fn list_workspace_entries(
     project: String,
     relative_path: String,
-) -> Result<Vec<WorkspaceEntryDto>, String> {
+    offset: usize,
+    limit: usize,
+) -> Result<WorkspaceEntriesPageDto, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        list_workspace_entries_impl(&project, &relative_path)
+        list_workspace_entries_page_impl(&project, &relative_path, offset, limit)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -513,10 +579,22 @@ pub async fn git_workspace_history(
     project: String,
     skip: u32,
     limit: u32,
+    query: Option<String>,
+    author: Option<String>,
+    reference: Option<String>,
 ) -> Result<Vec<GitCommitDto>, String> {
-    tauri::async_runtime::spawn_blocking(move || git_workspace_history_impl(&project, skip, limit))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        git_workspace_history_impl(
+            &project,
+            skip,
+            limit,
+            query.as_deref(),
+            author.as_deref(),
+            reference.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -532,6 +610,7 @@ pub async fn git_workspace_commit_diff(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -577,6 +656,56 @@ mod tests {
     }
 
     #[test]
+    fn limits_the_initial_directory_page_to_one_hundred_entries() {
+        let root = temp_project("listing-page");
+        for index in 0..150 {
+            fs::write(root.join(format!("file-{index:03}.txt")), "x").unwrap();
+        }
+
+        let entries = list_workspace_entries_impl(root.to_str().unwrap(), "").unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(entries.len(), 100);
+        assert_eq!(entries.first().unwrap().name, "file-000.txt");
+        assert_eq!(entries.last().unwrap().name, "file-099.txt");
+    }
+
+    #[test]
+    fn paginates_directory_entries_and_caps_the_result_at_one_thousand() {
+        let root = temp_project("listing-cap");
+        for index in 0..1_100 {
+            fs::write(root.join(format!("file-{index:04}.txt")), "x").unwrap();
+        }
+
+        let second_page = list_workspace_entries_page_impl(
+            root.to_str().unwrap(),
+            "",
+            DIRECTORY_PAGE_SIZE,
+            DIRECTORY_PAGE_SIZE,
+        )
+        .unwrap();
+        let final_page = list_workspace_entries_page_impl(
+            root.to_str().unwrap(),
+            "",
+            MAX_DIRECTORY_ENTRIES - DIRECTORY_PAGE_SIZE,
+            DIRECTORY_PAGE_SIZE,
+        )
+        .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(second_page.entries.len(), 100);
+        assert_eq!(second_page.entries.first().unwrap().name, "file-0100.txt");
+        assert_eq!(second_page.entries.last().unwrap().name, "file-0199.txt");
+        assert!(second_page.has_more);
+        assert!(second_page.capped);
+        assert_eq!(final_page.entries.len(), 100);
+        assert_eq!(final_page.entries.first().unwrap().name, "file-0900.txt");
+        assert_eq!(final_page.entries.last().unwrap().name, "file-0999.txt");
+        assert!(!final_page.has_more);
+        assert!(final_page.capped);
+    }
+
+    #[test]
     fn classifies_text_binary_image_and_oversized_files() {
         let root = temp_project("preview");
         fs::write(root.join("text.txt"), "hello").unwrap();
@@ -617,12 +746,14 @@ mod tests {
 
     #[test]
     fn parses_git_history_records_and_validates_commit_ids() {
-        let raw = b"0123456789abcdef\x1f0123456\x1fAlice\x1f2026-07-24T08:00:00Z\x1fAdd history\0";
+        let raw = b"0123456789abcdef\x1f0123456\x1fabcdef0\x1fHEAD -> main, tag: v1\x1fAlice\x1f2026-07-24T08:00:00Z\x1fAdd history\0";
         let commits = parse_git_log(raw).unwrap();
 
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].short_hash, "0123456");
         assert_eq!(commits[0].author, "Alice");
+        assert_eq!(commits[0].parents, vec!["abcdef0"]);
+        assert_eq!(commits[0].refs, vec!["HEAD -> main", "tag: v1"]);
         assert_eq!(commits[0].subject, "Add history");
         assert!(valid_commit_id("0123456"));
         assert!(!valid_commit_id("--help"));
@@ -632,6 +763,42 @@ mod tests {
     fn normalizes_git_history_pagination() {
         assert_eq!(normalized_history_page(0, 20), (0, 20));
         assert_eq!(normalized_history_page(40, 500), (40, 100));
+    }
+
+    #[test]
+    fn rejects_history_references_that_trim_to_options() {
+        let root = temp_project("history-option");
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "RelayCat Test"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "relaycat@example.test"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        fs::write(root.join("file.txt"), "hello").unwrap();
+        Command::new("git")
+            .args(["add", "file.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--quiet", "-m", "initial"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+
+        let result =
+            git_workspace_history_impl(root.to_str().unwrap(), 0, 20, None, None, Some(" --all"));
+        fs::remove_dir_all(&root).unwrap();
+        assert!(result.unwrap_err().contains("invalid history reference"));
     }
 
     #[test]

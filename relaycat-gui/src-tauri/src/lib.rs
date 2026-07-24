@@ -5,6 +5,7 @@
 //! `PtySession`. This crate is a thin bridge that exposes those as Tauri
 //! commands and streams PTY output to the webview.
 
+mod git;
 mod manager;
 mod relay;
 mod workspace;
@@ -1372,6 +1373,21 @@ pub fn run() {
             build_diagnostics_report,
             write_text_file,
             copy_image_png,
+            git::git_apply_patch,
+            git::git_checkout_ref,
+            git::git_commit_action,
+            git::git_create_commit,
+            git::git_create_branch,
+            git::git_create_tag,
+            git::git_delete_branch,
+            git::git_discard_paths,
+            git::git_list_refs,
+            git::git_remote_operation,
+            git::git_rename_branch,
+            git::git_reset_to,
+            git::git_repository_summary,
+            git::git_stage_paths,
+            git::git_unstage_paths,
             workspace::list_workspace_entries,
             workspace::read_workspace_file,
             workspace::git_workspace_status,

@@ -29,6 +29,11 @@ import {
   createWorkspacePanel,
   type WorkspacePanelController,
 } from "./workspace-panel";
+import {
+  createEmbeddedShellPanel,
+  type EmbeddedShellPanelController,
+} from "./embedded-shell-panel";
+import { toggleTermSidePanel } from "./embedded-shell-model";
 import thirdPartyLicenses from "./third-party-licenses.txt?raw";
 
 type Tool = { name: string; label: string; kind: string };
@@ -84,6 +89,7 @@ interface Tab {
   // layout as the phone (which is what a full-screen TUI drew for). Unset on
   // macOS/Linux and for local sessions, where the terminal just fits the window.
   remoteGrid?: { cols: number; rows: number };
+  sidePanelMode: "files" | "git" | "history" | null;
 }
 
 /* ------------------------------- theming --------------------------------- */
@@ -164,6 +170,7 @@ function applyTheme() {
   // (e.g. opencode) doesn't paint, leaving a two-tone light/dark background.
   // Keeping the terminal dark matches what the tools expect and the phone app.
   for (const tab of tabs) tab.term.options.theme = xtermTheme();
+  embeddedShellPanel?.updateAppearance(xtermTheme(), fontSize());
   const tbtn = document.getElementById("btn-theme");
   // Show the icon of the mode you'd switch *to*: a sun while in dark, a moon
   // while in light.
@@ -246,6 +253,7 @@ let diagTimer: number | null = null;
 let pairCountdownTimer: number | null = null;
 let tabMenuEl: HTMLDivElement | null = null;
 let workspacePanel: WorkspacePanelController | null = null;
+let embeddedShellPanel: EmbeddedShellPanelController | null = null;
 
 const relayCompatibility = createRelayCompatibilityChecker((relayUrl) =>
   invoke<RelayCompatibilityCheck>("check_relay_compatibility", { relayUrl }),
@@ -699,8 +707,10 @@ async function createTab(tool: string, project: string, relay: string) {
     webgl,
     pane,
     tabEl: el("div", "tab") as HTMLDivElement,
+    sidePanelMode: null,
   };
   tabs.push(tab);
+  appendTermToolRail(tab);
   buildTabEl(tab);
   selectTab(tab.id);
   renderEmpty();
@@ -1437,6 +1447,7 @@ function selectTab(id: string) {
   applyLayout();
   const tab = tabs.find((t) => t.id === id);
   workspacePanel?.setProject(tab?.project ?? null);
+  workspacePanel?.show(tab?.sidePanelMode ?? null);
   if (tab) {
     tab.tabEl.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
     tab.term.focus();
@@ -1485,6 +1496,7 @@ async function closeTab(id: string, force = false) {
       activeId = null;
       applyLayout();
       workspacePanel?.setProject(null);
+      workspacePanel?.show(null);
     }
   } else {
     applyLayout();
@@ -1597,13 +1609,60 @@ function syncSplitBtn() {
   ($("#btn-split") as HTMLButtonElement).disabled = tabs.length < 2;
 }
 
-function syncWorkspaceBtn() {
-  ($("#btn-workspace") as HTMLButtonElement).disabled = tabs.length === 0;
+function termToolButton(labelKey: string, svg: string): HTMLButtonElement {
+  const button = el("button", "term-toolbtn") as HTMLButtonElement;
+  button.type = "button";
+  button.title = t(labelKey);
+  button.dataset.i18nTitle = labelKey;
+  button.setAttribute("aria-label", t(labelKey));
+  button.innerHTML = svg;
+  return button;
+}
+
+function appendTermToolRail(tab: Tab) {
+  const rail = el("div") as HTMLDivElement;
+  rail.className = "term-toolrail";
+  const files = termToolButton(
+    "term_tool_files",
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5h6l2 2h10v9H3z"/><path d="M3 6.5v-2h7l2 2"/></svg>',
+  );
+  files.classList.add("files");
+  const git = termToolButton(
+    "term_tool_git",
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M8 15c6 0 8-2 8-6"/></svg>',
+  );
+  git.classList.add("git");
+  const shell = termToolButton(
+    "term_tool_shell",
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 7 4 4-4 4M11 16h7"/></svg>',
+  );
+  shell.classList.add("shell");
+  const focusTab = () => {
+    if (activeId !== tab.id) selectTab(tab.id);
+  };
+  files.onclick = (event) => {
+    event.stopPropagation();
+    focusTab();
+    tab.sidePanelMode = toggleTermSidePanel(tab.sidePanelMode, "files");
+    workspacePanel?.show(tab.sidePanelMode);
+  };
+  git.onclick = (event) => {
+    event.stopPropagation();
+    focusTab();
+    tab.sidePanelMode = toggleTermSidePanel(tab.sidePanelMode, "git");
+    workspacePanel?.show(tab.sidePanelMode);
+  };
+  shell.onclick = (event) => {
+    event.stopPropagation();
+    focusTab();
+    void embeddedShellPanel?.toggleForProject(tab.project);
+  };
+  rail.append(files, git, shell);
+  tab.pane.appendChild(rail);
 }
 
 function renderStatusbar() {
   syncSplitBtn();
-  syncWorkspaceBtn();
   const bar = $("#statusbar");
   const tab = tabs.find((t) => t.id === activeId);
   bar.innerHTML = "";
@@ -2173,6 +2232,7 @@ function applyFontSize(px: number) {
     tab.term.options.fontSize = px;
     refitTab(tab);
   }
+  embeddedShellPanel?.updateAppearance(xtermTheme(), px);
 }
 
 // Settings apply immediately (no Save button): each control persists on change.
@@ -2885,7 +2945,7 @@ function wireUi() {
       await getCurrentWindow().hide();
       return;
     }
-    if (runningTabs() > 0) {
+    if (runningTabs() > 0 || (embeddedShellPanel?.runningCount() ?? 0) > 0) {
       event.preventDefault();
       const ok = await confirmDialog({
         title: t("quit_confirm_title"),
@@ -2910,6 +2970,41 @@ async function init() {
   workspacePanel = createWorkspacePanel({
     translate: t,
     afterLayoutChange: refitVisibleTerminals,
+    confirm: (message) =>
+      confirmDialog({
+        title: t("workspace_git"),
+        message,
+        danger: true,
+      }),
+    onClose: () => {
+      const tab = tabs.find((item) => item.id === activeId);
+      if (tab) tab.sidePanelMode = null;
+    },
+    onModeChange: (mode) => {
+      const tab = tabs.find((item) => item.id === activeId);
+      if (tab) tab.sidePanelMode = mode;
+    },
+  });
+  embeddedShellPanel = createEmbeddedShellPanel({
+    translate: t,
+    terminalOptions: () => ({
+      fontFamily: '"JetBrains Mono", Menlo, Consolas, monospace',
+      fontSize: fontSize(),
+      cursorBlink: true,
+      theme: xtermTheme(),
+      minimumContrastRatio: 4.5,
+      allowProposedApi: true,
+    }),
+    currentProject: () => tabs.find((tab) => tab.id === activeId)?.project.trim() || null,
+    focusMainTerminal: () => tabs.find((tab) => tab.id === activeId)?.term.focus(),
+    afterLayoutChange: refitVisibleTerminals,
+    confirm: (message) =>
+      confirmDialog({
+        title: t("term_tool_shell"),
+        message,
+        okLabel: t("close"),
+        danger: true,
+      }),
   });
   wireUi();
   wireEvents();

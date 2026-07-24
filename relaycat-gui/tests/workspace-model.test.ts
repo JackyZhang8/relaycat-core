@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -13,6 +14,15 @@ import {
   workspaceEntryDecoration,
   workspacePanelWidth,
 } from "../src/workspace-model.ts";
+
+const workspacePanelSource = readFileSync(
+  new URL("../src/workspace-panel.ts", import.meta.url),
+  "utf8",
+);
+const workspaceRustSource = readFileSync(
+  new URL("../src-tauri/src/workspace.rs", import.meta.url),
+  "utf8",
+);
 
 test("groups index and worktree changes into separate sections", () => {
   const result = groupGitChanges([
@@ -108,4 +118,18 @@ test("git history loads twenty commits at a time", () => {
 test("git history loads the next page only near the bottom", () => {
   assert.equal(historyNearBottom(700, 220, 1000), true);
   assert.equal(historyNearBottom(500, 220, 1000), false);
+});
+
+test("workspace directories load one hundred entries per scroll page", () => {
+  assert.match(workspaceRustSource, /const MAX_DIRECTORY_ENTRIES:\s*usize = 1000;/);
+  assert.match(workspaceRustSource, /const DIRECTORY_PAGE_SIZE:\s*usize = 100;/);
+  assert.match(workspaceRustSource, /struct WorkspaceEntriesPageDto/);
+  assert.match(
+    workspacePanelSource,
+    /loadDirectoryPage\("",\s*fileTree,\s*0,\s*activeProject,\s*revision,\s*0,\s*false\)/s,
+  );
+  assert.match(workspacePanelSource, /offset,\s*limit:\s*100/s);
+  assert.match(workspacePanelSource, /new IntersectionObserver/);
+  assert.match(workspacePanelSource, /page\.has_more/);
+  assert.match(workspacePanelSource, /page\.capped/);
 });
