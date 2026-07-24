@@ -2439,6 +2439,7 @@ fn cli_metadata_can_send_before_terminal_resume() {
     assert!(can_send_without_terminal_resume(&PlainMsg::CliMetadata(
         CliMetadata {
             project_path: "/work/project".to_string(),
+            project_id: None,
         },
     )));
     assert!(!can_send_without_terminal_resume(
@@ -2452,6 +2453,25 @@ fn cli_metadata_can_send_before_terminal_resume() {
             ops: Vec::new(),
         }),
     ));
+}
+
+#[test]
+fn workspace_messages_route_and_bypass_terminal_resume_gate() {
+    let request = relaycat_protocol::WorkspaceRequestEnvelope {
+        request_id: "req-1".into(),
+        project_id: "project-1".into(),
+        deadline_unix_ms: u64::MAX,
+        idempotency_key: None,
+        operation: relaycat_protocol::WorkspaceRequest::GitStatus,
+    };
+    assert!(matches!(relay_input_action(PlainMsg::WorkspaceRequest(request)), RelayInputAction::Workspace(_)));
+    let response = PlainMsg::WorkspaceResponse(relaycat_protocol::WorkspaceResponseEnvelope {
+        request_id: "req-1".into(), project_id: "project-1".into(),
+        result: Ok(relaycat_protocol::WorkspaceResponse::Ack),
+    });
+    assert!(can_send_without_terminal_resume(&response));
+    assert!(cli_protocol_capabilities().contains(&ProtocolCapabilityV2::WorkspaceRpc));
+    assert!(!MANDATORY_CAPABILITIES.contains(&ProtocolCapabilityV2::WorkspaceRpc));
 }
 
 #[test]
@@ -2595,6 +2615,7 @@ fn terminal_resume_gate_allows_control_but_blocks_terminal_state() {
         }),
         PlainMsg::CliMetadata(CliMetadata {
             project_path: "/work/project".to_string(),
+            project_id: None,
         }),
         PlainMsg::ProcessExit { code: None },
     ];
@@ -2647,20 +2668,23 @@ fn incremental_attrs_capability_tracks_the_latest_app_hello() {
 
 #[test]
 fn cli_metadata_uses_target_project_directory() {
+    let project = std::env::temp_dir().join(format!(
+        "relaycat-metadata-project-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    fs::create_dir_all(&project).unwrap();
     let target = TargetCommand {
         program: "sh".to_string(),
         args: Vec::new(),
-        cwd: Some(PathBuf::from("/tmp/relaycat-metadata-project")),
+        cwd: Some(project.clone()),
         relay: None,
         session_kind: SessionKind::shell(),
     };
 
-    assert_eq!(
-        cli_metadata_for_target(&target).unwrap(),
-        CliMetadata {
-            project_path: "/tmp/relaycat-metadata-project".to_string(),
-        },
-    );
+    let metadata = cli_metadata_for_target(&target).unwrap();
+    assert_eq!(PathBuf::from(&metadata.project_path), project.canonicalize().unwrap());
+    assert_eq!(metadata.project_id.as_deref(), Some(ProjectRoot::open(&project).unwrap().project_id()));
+    fs::remove_dir_all(project).unwrap();
 }
 
 #[test]

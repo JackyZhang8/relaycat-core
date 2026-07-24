@@ -24,6 +24,7 @@ ratatui = "0.28"
 rand_core = { version = "0.6", features = ["getrandom"] }
 relaycat-crypto = { path = "../crypto" }
 relaycat-protocol.workspace = true
+relaycat-workspace = { path = "../workspace" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls.workspace = true
 semver = "1"

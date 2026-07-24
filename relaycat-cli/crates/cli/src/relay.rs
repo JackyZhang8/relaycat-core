@@ -32,6 +32,7 @@ use relaycat_protocol::{
     RequestTranscriptV2, ResizeEventV2, ResumeAcceptMode, ResumeAcceptedV2, ResumeV2, Role,
     TERMINAL_STATE_PROTOCOL_V2, TerminalColor, decode_frame, encode_frame, encode_plain_msg,
 };
+use relaycat_workspace::{ProjectRoot, WorkspaceService};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
@@ -230,6 +231,7 @@ enum RelayInputAction {
     ResizeEventV2(ResizeEventV2),
     HelloV2(HelloV2),
     EchoHeartbeat,
+    Workspace(relaycat_protocol::WorkspaceRequestEnvelope),
     Ignore,
 }
 
@@ -371,6 +373,7 @@ fn relay_input_action(msg: PlainMsg) -> RelayInputAction {
         PlainMsg::ResizeEventV2(event) => RelayInputAction::ResizeEventV2(event),
         PlainMsg::HelloV2(hello) => RelayInputAction::HelloV2(hello),
         PlainMsg::Heartbeat => RelayInputAction::EchoHeartbeat,
+        PlainMsg::WorkspaceRequest(request) => RelayInputAction::Workspace(request),
         _ => RelayInputAction::Ignore,
     }
 }
@@ -379,7 +382,11 @@ fn cli_metadata_for_target(target: &TargetCommand) -> Result<CliMetadata> {
     let project_dir = project_dir(target.cwd.as_deref())?;
     let canonical = fs::canonicalize(&project_dir).unwrap_or(project_dir);
     let project_path = strip_windows_verbatim_prefix(&canonical.display().to_string());
-    Ok(CliMetadata { project_path })
+    let project_id = ProjectRoot::open(&canonical)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .project_id()
+        .to_string();
+    Ok(CliMetadata { project_path, project_id: Some(project_id) })
 }
 
 /// Drop the Windows extended-length (`\\?\`) prefix that `fs::canonicalize`
@@ -482,6 +489,8 @@ fn can_send_without_terminal_resume(msg: &PlainMsg) -> bool {
             | PlainMsg::HelloAckV2(_)
             | PlainMsg::ProtocolRejectV2(_)
             | PlainMsg::ResumeAcceptedV2(_)
+            | PlainMsg::WorkspaceResponse(_)
+            | PlainMsg::WorkspaceEvent(_)
     )
 }
 
@@ -1533,6 +1542,28 @@ where
     let status_bar_for_resize = status_bar.clone();
     let resize_title_context = chrome_title_context.clone();
     let cli_metadata = cli_metadata_for_target(&target)?;
+    let workspace_root = ProjectRoot::open(Path::new(&cli_metadata.project_path))
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let workspace_service = Arc::new(WorkspaceService::new(workspace_root, 3));
+    let workspace_service_for_input = workspace_service.clone();
+    let workspace_service_for_events = workspace_service.clone();
+    let workspace_event_tx = output_tx.clone();
+    let workspace_event_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(50));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            for event in workspace_service_for_events.drain_events() {
+                if workspace_event_tx
+                    .send(PtyEvent::Plain(PlainMsg::WorkspaceEvent(event)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
     let record_primary_screen_frames = target.session_kind.uses_managed_alt_screen();
     let terminal_diagnostic_session_kind = (target.session_kind.uses_managed_alt_screen()
         || env::var_os("RELAYCAT_TERMINAL_DEBUG").is_some())
@@ -2614,6 +2645,19 @@ where
                     let _ = heartbeat_output_tx_for_input
                         .try_send(PtyEvent::Plain(PlainMsg::Heartbeat));
                 }
+                Some(RelayInputAction::Workspace(request)) => {
+                    let service = workspace_service_for_input.clone();
+                    let output = heartbeat_output_tx_for_input.clone();
+                    tokio::spawn(async move {
+                        let response = tokio::task::spawn_blocking(move || service.execute(request))
+                            .await;
+                        if let Ok(response) = response {
+                            let _ = output
+                                .send(PtyEvent::Plain(PlainMsg::WorkspaceResponse(response)))
+                                .await;
+                        }
+                    });
+                }
                 _ => {}
             }
         }
@@ -2649,6 +2693,8 @@ where
     // and make the process unkillable.
     let output_result = tokio::time::timeout(Duration::from_secs(5), relay_output).await;
     relay_input.abort();
+    workspace_event_task.abort();
+    workspace_service.shutdown();
     local_size_task.abort();
     chrome_refresh_task.abort();
     drop(pty_writer);

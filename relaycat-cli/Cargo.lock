@@ -1499,6 +1499,7 @@ dependencies = [
  "ratatui",
  "relaycat-crypto",
  "relaycat-protocol",
+ "relaycat-workspace",
  "reqwest",
  "rustls",
  "semver",
