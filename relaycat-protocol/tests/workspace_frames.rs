@@ -1,6 +1,7 @@
 use relaycat_protocol::{
-    CliMetadata, PlainMsg, WorkspaceRequest, WorkspaceRequestEnvelope, decode_plain_msg,
-    encode_plain_msg, plain_msg_type, plain_msg_types,
+    CliMetadata, PlainMsg, WorkspaceEvent, WorkspaceEventEnvelope, WorkspaceRequest,
+    WorkspaceRequestEnvelope, decode_plain_msg, encode_plain_msg, plain_msg_type,
+    plain_msg_types,
 };
 
 #[test]
@@ -22,6 +23,35 @@ fn workspace_request_round_trips() {
     assert_eq!(plain_msg_type(&msg), b"workspace_request");
     assert!(plain_msg_types().contains(&b"workspace_response".as_slice()));
     assert!(plain_msg_types().contains(&b"workspace_event".as_slice()));
+}
+
+#[test]
+fn shell_output_matches_checked_in_fixture() {
+    let msg = PlainMsg::WorkspaceEvent(WorkspaceEventEnvelope {
+        project_id: "project-1".to_string(),
+        event_seq: 8,
+        event: WorkspaceEvent::ShellOutput {
+            shell_id: "shell-1".to_string(),
+            output_seq: 7,
+            bytes: vec![0, 27, 91, 65, 255],
+        },
+    });
+    let expected = decode_hex(include_str!("fixtures/workspace_event.msgpack.hex"));
+    assert_eq!(encode_plain_msg(&msg).expect("encode event"), expected);
+    assert_eq!(decode_plain_msg(&expected).expect("decode event"), msg);
+}
+
+fn decode_hex(value: &str) -> Vec<u8> {
+    let digits: Vec<u8> = value.bytes().filter(|byte| !byte.is_ascii_whitespace()).collect();
+    assert_eq!(digits.len() % 2, 0, "fixture hex must have complete bytes");
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16).expect("hex digit");
+            let low = (pair[1] as char).to_digit(16).expect("hex digit");
+            ((high << 4) | low) as u8
+        })
+        .collect()
 }
 
 #[test]
