@@ -7,6 +7,7 @@
 
 mod manager;
 mod relay;
+mod workspace;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1371,6 +1372,12 @@ pub fn run() {
             build_diagnostics_report,
             write_text_file,
             copy_image_png,
+            workspace::list_workspace_entries,
+            workspace::read_workspace_file,
+            workspace::git_workspace_status,
+            workspace::git_workspace_diff,
+            workspace::git_workspace_history,
+            workspace::git_workspace_commit_diff,
         ])
         .run(tauri::generate_context!())
         .expect("error while running RelayCat GUI");

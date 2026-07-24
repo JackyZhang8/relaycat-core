@@ -369,6 +369,14 @@ button {
   position: relative;
   overflow: hidden;
   background: var(--bg);
+  display: flex;
+  min-height: 0;
+}
+.terminal-stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
 .terminals {
   position: absolute;
@@ -397,6 +405,370 @@ button {
   display: flex;
   align-items: flex-start;
   justify-content: flex-start;
+}
+
+/* ========================== workspace sidebar ======================== */
+.workspace-resizer {
+  display: none;
+  width: 5px;
+  flex: none;
+  cursor: col-resize;
+  background: transparent;
+  border-left: 1px solid var(--border);
+  position: relative;
+  z-index: 12;
+}
+.stage.workspace-open .workspace-resizer {
+  display: block;
+}
+.workspace-resizer:hover,
+body.ws-resizing .workspace-resizer {
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
+}
+.workspace-panel {
+  display: none;
+  width: 360px;
+  min-width: 280px;
+  max-width: 720px;
+  height: 100%;
+  flex: none;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  color: var(--text);
+}
+.workspace-panel.open {
+  display: flex;
+}
+.ws-header {
+  height: 42px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 0 12px;
+  border-bottom: 1px solid var(--border);
+}
+.ws-project {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-family: var(--mono);
+  font-weight: 600;
+}
+.ws-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.ws-icon-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 16px;
+}
+.ws-icon-btn:hover {
+  color: var(--text);
+  background: var(--hover-strong);
+}
+.ws-tabs {
+  height: 36px;
+  flex: none;
+  display: flex;
+  border-bottom: 1px solid var(--border);
+}
+.ws-tab {
+  flex: 1;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 12px;
+}
+.ws-tab:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.ws-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.ws-main {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(150px, 44%) minmax(140px, 1fr);
+}
+.ws-browser {
+  min-height: 0;
+  overflow: auto;
+  border-bottom: 1px solid var(--border);
+  padding: 6px 0;
+}
+.ws-browser[hidden] {
+  display: none;
+}
+.ws-tree,
+.ws-git-list,
+.ws-history-list {
+  min-width: max-content;
+}
+.ws-state {
+  padding: 16px 12px;
+  color: var(--dim);
+  font-size: 12px;
+  text-align: center;
+}
+.ws-tree-node {
+  min-width: 100%;
+}
+.ws-tree-row,
+.ws-git-row {
+  width: 100%;
+  min-width: max-content;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.ws-tree-row:hover,
+.ws-git-row:hover {
+  background: var(--hover-strong);
+}
+.ws-tree-arrow {
+  width: 12px;
+  flex: none;
+  color: var(--dim);
+  text-align: center;
+}
+.ws-tree-icon {
+  width: 15px;
+  flex: none;
+  color: var(--dim);
+}
+.ws-tree-name,
+.ws-git-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-tree-children[hidden] {
+  display: none;
+}
+.ws-git-meta {
+  padding: 4px 12px 8px;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-git-section-title {
+  padding: 8px 12px 4px;
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.35px;
+}
+.ws-git-status {
+  width: 18px;
+  flex: none;
+  color: var(--accent);
+  font-weight: 700;
+  text-align: center;
+}
+.ws-history-row {
+  width: 100%;
+  min-width: 260px;
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 8px;
+  padding: 8px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--divider);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.ws-history-row:hover {
+  background: var(--hover-strong);
+}
+.ws-history-hash {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+.ws-history-body {
+  min-width: 0;
+}
+.ws-history-subject {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+.ws-history-meta {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+  font-size: 10px;
+}
+.ws-preview {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.ws-preview-title {
+  height: 34px;
+  flex: none;
+  padding: 9px 12px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  border-bottom: 1px solid var(--divider);
+}
+.ws-preview-notice {
+  display: none;
+  flex: none;
+  padding: 8px 12px;
+  color: var(--yellow);
+  background: rgba(251, 191, 36, 0.08);
+  font-size: 11px;
+}
+.ws-preview-notice.show {
+  display: block;
+}
+.ws-preview-code {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 10px 12px 18px;
+  overflow: auto;
+  color: var(--text);
+  background: transparent;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.ws-preview-code[hidden] {
+  display: none;
+}
+.ws-preview-image {
+  display: block;
+  flex: 1;
+  min-height: 0;
+  max-width: 100%;
+  max-height: 100%;
+  margin: auto;
+  padding: 14px;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.ws-preview-image[hidden] {
+  display: none;
+}
+.ws-code-line {
+  display: block;
+  min-height: 1.55em;
+}
+.ws-token.keyword {
+  color: #c792ea;
+}
+.ws-token.string {
+  color: #ecc48d;
+}
+.ws-token.number {
+  color: #f78c6c;
+}
+.ws-token.comment {
+  color: var(--gray);
+  font-style: italic;
+}
+body[data-theme="light"] .ws-token.keyword {
+  color: #8250df;
+}
+body[data-theme="light"] .ws-token.string {
+  color: #9a6700;
+}
+body[data-theme="light"] .ws-token.number {
+  color: #bc4c00;
+}
+.ws-diff-line {
+  display: block;
+  min-height: 1.55em;
+}
+.ws-diff-line.add {
+  color: var(--green);
+  background: rgba(74, 222, 128, 0.07);
+}
+.ws-diff-line.del {
+  color: var(--red);
+  background: rgba(248, 81, 73, 0.07);
+}
+.ws-diff-line.hunk {
+  color: var(--accent);
+}
+.iconbtn.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+body.ws-resizing {
+  cursor: col-resize;
+}
+body.ws-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+@media (max-width: 760px) {
+  .stage.workspace-open .workspace-resizer {
+    display: none;
+  }
+  .workspace-panel.open {
+    position: absolute;
+    z-index: 11;
+    inset: 0 0 0 auto;
+    width: min(88vw, 420px) !important;
+    min-width: 0;
+    max-width: none;
+    box-shadow: var(--shadow-pop);
+    border-left: 1px solid var(--border);
+  }
 }
 
 /* ============================ empty state ============================= */

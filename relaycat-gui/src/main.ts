@@ -24,6 +24,11 @@ import { tabScrollState } from "./tab-scroll";
 import { shouldApplyRelaySnapshot } from "./relay-state";
 import { projectRowMenuItems } from "./project-row-menu";
 import { restoreTerminalFocusAfterOverlayClose } from "./pairing-focus";
+import { runSplitAction } from "./split-action";
+import {
+  createWorkspacePanel,
+  type WorkspacePanelController,
+} from "./workspace-panel";
 import thirdPartyLicenses from "./third-party-licenses.txt?raw";
 
 type Tool = { name: string; label: string; kind: string };
@@ -215,6 +220,7 @@ function setLanguage(next: Lang) {
   applyI18n();
   for (const tab of tabs) refreshTabEl(tab);
   renderStatusbar();
+  void workspacePanel?.refresh();
 }
 
 /* -------------------------------- state ---------------------------------- */
@@ -239,6 +245,7 @@ let pairingTabId: string | null = null;
 let diagTimer: number | null = null;
 let pairCountdownTimer: number | null = null;
 let tabMenuEl: HTMLDivElement | null = null;
+let workspacePanel: WorkspacePanelController | null = null;
 
 const relayCompatibility = createRelayCompatibilityChecker((relayUrl) =>
   invoke<RelayCompatibilityCheck>("check_relay_compatibility", { relayUrl }),
@@ -1399,7 +1406,7 @@ function applyLayout() {
   }
 }
 
-function toggleSplit() {
+function toggleSplitLayout() {
   if (!splitOn) {
     const i = tabs.findIndex((t) => t.id === activeId);
     if (i < 0) return;
@@ -1415,6 +1422,13 @@ function toggleSplit() {
   renderStatusbar();
 }
 
+function toggleSplit() {
+  runSplitAction(
+    () => workspacePanel?.close(),
+    toggleSplitLayout,
+  );
+}
+
 function selectTab(id: string) {
   // Clicking the secondary pane's tab just moves focus there; swapping the two
   // ids keeps each pane on its current side (sides follow tab order).
@@ -1422,6 +1436,7 @@ function selectTab(id: string) {
   activeId = id;
   applyLayout();
   const tab = tabs.find((t) => t.id === id);
+  workspacePanel?.setProject(tab?.project ?? null);
   if (tab) {
     tab.tabEl.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
     tab.term.focus();
@@ -1469,6 +1484,7 @@ async function closeTab(id: string, force = false) {
     } else {
       activeId = null;
       applyLayout();
+      workspacePanel?.setProject(null);
     }
   } else {
     applyLayout();
@@ -1517,6 +1533,12 @@ function refitTab(tab: Tab) {
   } else {
     tab.fit.fit();
     sendResize(tab);
+  }
+}
+
+function refitVisibleTerminals() {
+  for (const tab of tabs) {
+    if (tab.id === activeId || (splitOn && tab.id === splitId)) refitTab(tab);
   }
 }
 
@@ -1575,8 +1597,13 @@ function syncSplitBtn() {
   ($("#btn-split") as HTMLButtonElement).disabled = tabs.length < 2;
 }
 
+function syncWorkspaceBtn() {
+  ($("#btn-workspace") as HTMLButtonElement).disabled = tabs.length === 0;
+}
+
 function renderStatusbar() {
   syncSplitBtn();
+  syncWorkspaceBtn();
   const bar = $("#statusbar");
   const tab = tabs.find((t) => t.id === activeId);
   bar.innerHTML = "";
@@ -2880,6 +2907,10 @@ async function init() {
   }
   applyI18n();
   applyTheme();
+  workspacePanel = createWorkspacePanel({
+    translate: t,
+    afterLayoutChange: refitVisibleTerminals,
+  });
   wireUi();
   wireEvents();
   await renderEmpty();

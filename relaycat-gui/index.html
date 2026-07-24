@@ -45,6 +45,7 @@
         <div class="right">
           <button class="iconbtn" id="btn-new" data-i18n="nav_new">＋ 新建</button>
           <button class="iconbtn" id="btn-split" data-i18n="nav_split" data-i18n-title="nav_split_title">分屏</button>
+          <button class="iconbtn" id="btn-workspace" data-i18n="nav_workspace" data-i18n-title="nav_workspace_title">工作区</button>
           <button class="iconbtn" id="btn-help" data-i18n="nav_help">帮助</button>
           <button class="iconbtn" id="btn-about" data-i18n="nav_about">关于</button>
           <button class="iconbtn" id="btn-settings" data-i18n="nav_settings">⚙ 设置</button>
@@ -70,14 +71,15 @@
 
       <!-- stage -->
       <div class="stage">
-        <div class="terminals" id="terminals"></div>
+        <div class="terminal-stage" id="terminal-stage">
+          <div class="terminals" id="terminals"></div>
 
-        <div class="empty" id="empty">
-          <div class="lp-actions">
-            <button class="lp-act-btn primary" id="empty-new" data-i18n="empty_new_btn">＋ 新建会话</button>
-            <button class="lp-act-btn" id="empty-recent-btn" data-i18n="recent_label">最近会话</button>
-          </div>
-          <div class="landing">
+          <div class="empty" id="empty">
+            <div class="lp-actions">
+              <button class="lp-act-btn primary" id="empty-new" data-i18n="empty_new_btn">＋ 新建会话</button>
+              <button class="lp-act-btn" id="empty-recent-btn" data-i18n="recent_label">最近会话</button>
+            </div>
+            <div class="landing">
             <!-- hero -->
             <section class="lp-hero">
               <img class="lp-logo" src="/logo.png" alt="RelayCat" />
@@ -141,8 +143,43 @@
               <span class="lp-foot-author" data-i18n="lp_foot_author">作者 JackyZhang</span>
               <a href="#" class="about-link lp-foot-star" data-url="https://github.com/jackyZhang8/relaycat-core" data-i18n="lp_foot_star" data-i18n-title="lp_foot_star_title" title="去 GitHub 点个 Star">★ Star</a>
             </div>
+            </div>
           </div>
         </div>
+
+        <div class="workspace-resizer" id="workspace-resizer" aria-hidden="true"></div>
+        <aside class="workspace-panel" id="workspace-panel" aria-hidden="true">
+          <div class="ws-header">
+            <div class="ws-project" id="workspace-project"></div>
+            <div class="ws-header-actions">
+              <button class="ws-icon-btn" id="workspace-refresh" type="button" data-i18n-title="workspace_refresh" title="刷新">↻</button>
+              <button class="ws-icon-btn" id="workspace-close" type="button" data-i18n-title="close" title="关闭">×</button>
+            </div>
+          </div>
+          <div class="ws-tabs" role="tablist">
+            <button class="ws-tab active" id="workspace-tab-files" type="button" role="tab" aria-selected="true" data-i18n="workspace_files">文件</button>
+            <button class="ws-tab" id="workspace-tab-git" type="button" role="tab" aria-selected="false" data-i18n="workspace_git">Git 更改</button>
+            <button class="ws-tab" id="workspace-tab-history" type="button" role="tab" aria-selected="false" data-i18n="workspace_history">Git 历史</button>
+          </div>
+          <div class="ws-main">
+            <section class="ws-browser" id="workspace-files-view">
+              <div class="ws-tree" id="workspace-file-tree"></div>
+            </section>
+            <section class="ws-browser" id="workspace-git-view" hidden>
+              <div class="ws-git-meta" id="workspace-git-meta"></div>
+              <div class="ws-git-list" id="workspace-git-list"></div>
+            </section>
+            <section class="ws-browser" id="workspace-history-view" hidden>
+              <div class="ws-history-list" id="workspace-history-list"></div>
+            </section>
+            <section class="ws-preview">
+              <div class="ws-preview-title" id="workspace-preview-title" data-i18n="workspace_preview">预览</div>
+              <div class="ws-preview-notice" id="workspace-preview-notice"></div>
+              <img class="ws-preview-image" id="workspace-preview-image" alt="" hidden />
+              <pre class="ws-preview-code" id="workspace-preview-code"></pre>
+            </section>
+          </div>
+        </aside>
       </div>
 
       <!-- status bar -->
