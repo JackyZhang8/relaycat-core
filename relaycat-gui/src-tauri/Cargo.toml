@@ -39,6 +39,8 @@ qrcode = "0.14"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 relaycat-cli = { path = "../../relaycat-cli/crates/cli" }
+relaycat-protocol = { path = "../../relaycat-protocol" }
+relaycat-workspace = { path = "../../relaycat-cli/crates/workspace" }
 semver = "1"
 url = "2"
 

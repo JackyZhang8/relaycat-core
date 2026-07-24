@@ -1,10 +1,10 @@
-use std::fs::File;
-use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::git::runner::git_output;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use relaycat_protocol::{DirectoryPage, FilePreview, ImageVariant};
+use relaycat_workspace::{FileService, ProjectRoot, IMAGE_PREVIEW_LIMIT};
 use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -19,6 +19,24 @@ pub struct WorkspaceEntriesPageDto {
     pub entries: Vec<WorkspaceEntryDto>,
     pub has_more: bool,
     pub capped: bool,
+}
+
+impl From<DirectoryPage> for WorkspaceEntriesPageDto {
+    fn from(page: DirectoryPage) -> Self {
+        Self {
+            entries: page
+                .entries
+                .into_iter()
+                .map(|entry| WorkspaceEntryDto {
+                    name: entry.name,
+                    relative_path: entry.path,
+                    is_dir: entry.is_directory,
+                })
+                .collect(),
+            has_more: page.has_more,
+            capped: page.capped,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -66,50 +84,19 @@ pub struct GitCommitDto {
 const MAX_DIRECTORY_ENTRIES: usize = 1000;
 const DIRECTORY_PAGE_SIZE: usize = 100;
 const MAX_FILE_PREVIEW_BYTES: u64 = 512 * 1024;
-const MAX_IMAGE_PREVIEW_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_DIFF_BYTES: usize = 1024 * 1024;
-const IGNORED_DIRECTORIES: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    ".cache",
-];
 
 fn project_root(project: &Path) -> Result<PathBuf, String> {
-    let root = project.canonicalize().map_err(|e| e.to_string())?;
-    if !root.is_dir() {
-        return Err("project path is not a directory".into());
-    }
-    Ok(root)
+    ProjectRoot::open(project)
+        .map(|root| root.path().to_path_buf())
+        .map_err(|error| error.to_string())
 }
 
-fn validate_relative_path(relative: &str) -> Result<&Path, String> {
-    let path = Path::new(relative);
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        return Err("path escapes project root".into());
-    }
-    Ok(path)
-}
-
+#[cfg(test)]
 fn resolve_project_path(project: &Path, relative: &str) -> Result<PathBuf, String> {
-    let root = project_root(project)?;
-    let relative = validate_relative_path(relative)?;
-    let target = root
-        .join(relative)
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
-    if !target.starts_with(&root) {
-        return Err("path escapes project root".into());
-    }
-    Ok(target)
+    ProjectRoot::open(project)
+        .and_then(|root| root.resolve(relative))
+        .map_err(|error| error.to_string())
 }
 
 fn relative_path_string(root: &Path, path: &Path) -> Result<String, String> {
@@ -135,52 +122,15 @@ fn list_workspace_entries_page_impl(
     offset: usize,
     limit: usize,
 ) -> Result<WorkspaceEntriesPageDto, String> {
-    let root = project_root(Path::new(project))?;
-    let directory = resolve_project_path(&root, relative_path)?;
-    if !directory.is_dir() {
-        return Err("workspace path is not a directory".into());
-    }
-
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&directory).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let file_type = entry.file_type().map_err(|e| e.to_string())?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if file_type.is_dir() && IGNORED_DIRECTORIES.contains(&name.as_str()) {
-            continue;
-        }
-        let path = entry.path();
-        entries.push(WorkspaceEntryDto {
-            name,
-            relative_path: relative_path_string(&root, &path)?,
-            is_dir: file_type.is_dir(),
-        });
-    }
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    let capped = entries.len() > MAX_DIRECTORY_ENTRIES;
-    entries.truncate(MAX_DIRECTORY_ENTRIES);
-    let offset = offset.min(MAX_DIRECTORY_ENTRIES);
-    let limit = limit.clamp(1, DIRECTORY_PAGE_SIZE);
-    let total = entries.len();
-    let page_entries = entries
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>();
-    let has_more = offset + page_entries.len() < total;
-    Ok(WorkspaceEntriesPageDto {
-        entries: page_entries,
-        has_more,
-        capped,
-    })
+    let root = ProjectRoot::open(project).map_err(|error| error.to_string())?;
+    let page = FileService::new(root)
+        .list(
+            relative_path,
+            offset.min(MAX_DIRECTORY_ENTRIES) as u16,
+            limit.clamp(1, DIRECTORY_PAGE_SIZE) as u16,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(page.into())
 }
 
 fn read_workspace_file_impl(
@@ -188,85 +138,45 @@ fn read_workspace_file_impl(
     relative_path: &str,
     max_bytes: u64,
 ) -> Result<FilePreviewDto, String> {
-    let path = resolve_project_path(Path::new(project), relative_path)?;
-    if !path.is_file() {
-        return Err("workspace path is not a file".into());
-    }
-    let size_bytes = path.metadata().map_err(|e| e.to_string())?.len();
-    let cap = max_bytes.clamp(1, MAX_FILE_PREVIEW_BYTES) as usize;
-    let image_extension = path
+    let image_extension = Path::new(relative_path)
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase)
         .filter(|extension| matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"));
-    if image_extension.is_some() {
-        if size_bytes > MAX_IMAGE_PREVIEW_BYTES {
-            return Ok(FilePreviewDto {
-                kind: PreviewKind::TooLarge,
-                content: String::new(),
-                mime_type: None,
-                size_bytes,
-            });
-        }
-        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-        let mime_type = image_mime_type(&bytes);
-        return Ok(match mime_type {
-            Some(mime_type) => FilePreviewDto {
-                kind: PreviewKind::Image,
-                content: format!("data:{mime_type};base64,{}", STANDARD.encode(bytes)),
-                mime_type: Some(mime_type.to_string()),
-                size_bytes,
-            },
-            None => FilePreviewDto {
-                kind: PreviewKind::Binary,
-                content: String::new(),
-                mime_type: None,
-                size_bytes,
-            },
-        });
-    }
-    if size_bytes > cap as u64 {
-        return Ok(FilePreviewDto {
+    let requested = if image_extension.is_some() {
+        IMAGE_PREVIEW_LIMIT
+    } else {
+        max_bytes.clamp(1, MAX_FILE_PREVIEW_BYTES)
+    };
+    let preview = FileService::new(ProjectRoot::open(project).map_err(|error| error.to_string())?)
+        .read(relative_path, requested as u32, ImageVariant::Original)
+        .map_err(|error| error.to_string())?;
+    Ok(match preview {
+        FilePreview::Text { content, .. } => FilePreviewDto {
+            size_bytes: content.len() as u64,
+            kind: PreviewKind::Text,
+            content,
+            mime_type: None,
+        },
+        FilePreview::Image { mime, bytes, .. } => FilePreviewDto {
+            size_bytes: bytes.len() as u64,
+            kind: PreviewKind::Image,
+            content: format!("data:{mime};base64,{}", STANDARD.encode(bytes)),
+            mime_type: Some(mime),
+        },
+        FilePreview::Binary { size, .. } => FilePreviewDto {
+            kind: PreviewKind::Binary,
+            content: String::new(),
+            mime_type: None,
+            size_bytes: size,
+        },
+        FilePreview::TooLarge { size, .. } => FilePreviewDto {
             kind: PreviewKind::TooLarge,
             content: String::new(),
             mime_type: None,
-            size_bytes,
-        });
-    }
-    let mut bytes = Vec::with_capacity(size_bytes as usize);
-    File::open(path)
-        .map_err(|e| e.to_string())?
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    let binary = bytes.contains(&0);
-    Ok(FilePreviewDto {
-        kind: if binary {
-            PreviewKind::Binary
-        } else {
-            PreviewKind::Text
+            size_bytes: size,
         },
-        content: if binary {
-            String::new()
-        } else {
-            String::from_utf8_lossy(&bytes).into_owned()
-        },
-        mime_type: None,
-        size_bytes,
     })
-}
-
-fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
 }
 
 fn parse_porcelain_v1_z(raw: &[u8]) -> Result<Vec<GitChangeDto>, String> {
@@ -399,7 +309,9 @@ fn git_workspace_diff_impl(
     staged: bool,
 ) -> Result<FilePreviewDto, String> {
     let root = project_root(Path::new(project))?;
-    validate_relative_path(relative_path)?;
+    ProjectRoot::open(&root)
+        .and_then(|project| project.lexical_path(relative_path))
+        .map_err(|error| error.to_string())?;
     let mut args = vec!["diff", "--no-ext-diff", "--no-color"];
     if staged {
         args.push("--cached");
@@ -614,6 +526,23 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn shared_directory_page_preserves_gui_contract() {
+        let root = temp_project("shared-page");
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        let shared = relaycat_workspace::FileService::new(ProjectRoot::open(&root).unwrap())
+            .list("", 0, 100)
+            .unwrap();
+
+        let dto = WorkspaceEntriesPageDto::from(shared.clone());
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(dto.entries.len(), shared.entries.len());
+        assert_eq!(dto.entries[0].relative_path, "main.rs");
+        assert_eq!(dto.has_more, shared.has_more);
+        assert_eq!(dto.capped, shared.capped);
+    }
 
     fn temp_project(name: &str) -> PathBuf {
         let nonce = SystemTime::now()

@@ -7,6 +7,15 @@ use std::{cmp::Ordering, fs, path::Path};
 
 pub const TEXT_PREVIEW_LIMIT: u64 = 512 * 1024;
 pub const IMAGE_PREVIEW_LIMIT: u64 = 2 * 1024 * 1024;
+const IGNORED_DIRECTORIES: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+];
 
 #[derive(Debug, Clone)]
 pub struct FileService { root: ProjectRoot }
@@ -23,6 +32,7 @@ impl FileService {
             let resolved = match item.path().canonicalize() { Ok(value) if value.starts_with(self.root.path()) => value, _ => continue };
             let metadata = fs::metadata(&resolved).map_err(WorkspaceServiceError::io)?;
             let name = item.file_name().to_string_lossy().into_owned();
+            if metadata.is_dir() && IGNORED_DIRECTORIES.contains(&name.as_str()) { continue; }
             let relative = resolved.strip_prefix(self.root.path()).map_err(|_| WorkspaceServiceError::outside_project())?;
             entries.push(DirectoryEntry {
                 name,

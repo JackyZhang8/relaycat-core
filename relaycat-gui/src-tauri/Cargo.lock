@@ -3358,6 +3358,7 @@ dependencies = [
  "ratatui",
  "relaycat-crypto",
  "relaycat-protocol",
+ "relaycat-workspace",
  "reqwest 0.12.28",
  "rustls",
  "semver",
@@ -3396,6 +3397,8 @@ dependencies = [
  "qrcode",
  "regex",
  "relaycat-cli",
+ "relaycat-protocol",
+ "relaycat-workspace",
  "reqwest 0.12.28",
  "semver",
  "serde",
@@ -3418,6 +3421,16 @@ dependencies = [
  "flate2",
  "rmp-serde",
  "serde",
+]
+
+[[package]]
+name = "relaycat-workspace"
+version = "0.1.0"
+dependencies = [
+ "portable-pty",
+ "relaycat-protocol",
+ "serde",
+ "sha2",
 ]
 
 [[package]]

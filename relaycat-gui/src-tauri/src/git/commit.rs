@@ -67,9 +67,12 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    static TEMP_REPO_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn temp_repo() -> PathBuf {
         let nonce = SystemTime::now()
@@ -77,8 +80,9 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "relaycat-git-commit-{}-{nonce}",
-            std::process::id()
+            "relaycat-git-commit-{}-{nonce}-{}",
+            std::process::id(),
+            TEMP_REPO_SEQUENCE.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir_all(&path).unwrap();
         Command::new("git")
