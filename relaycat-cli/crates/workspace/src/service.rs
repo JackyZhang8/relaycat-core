@@ -118,7 +118,7 @@ impl WorkspaceService {
             WorkspaceRequest::GitDeleteBranch{name,force}=>self.git.delete_branch(&name,force).map(WorkspaceResponse::GitMutation),
             WorkspaceRequest::GitCreateTag{name,target}=>self.git.create_tag(&name,&target).map(WorkspaceResponse::GitMutation),
             WorkspaceRequest::GitCommit{message,amend,push_after}=>self.git.commit(&message,amend).and_then(|commit|if push_after{self.git.remote(relaycat_protocol::GitRemoteOperation::Push)}else{Ok(commit)}).map(WorkspaceResponse::GitMutation),
-            WorkspaceRequest::GitRemote{kind}=>{let operation_id=format!("{:?}-{}",kind,unix_ms());self.push_event(WorkspaceEvent::GitProgress(GitProgressEvent{operation_id:operation_id.clone(),phase:"starting".into(),message:format!("{:?} started",kind),percent:Some(0),completed:false,success:None}));let result=self.git.remote(kind).map(WorkspaceResponse::GitMutation);let completed_message=match &result{Ok(_)=>"operation completed".into(),Err(error)=>error.to_string()};self.push_event(WorkspaceEvent::GitProgress(GitProgressEvent{operation_id,phase:"completed".into(),message:completed_message,percent:Some(100),completed:true,success:Some(result.is_ok())}));result},
+            WorkspaceRequest::GitRemote{kind}=>self.git_remote(kind),
             WorkspaceRequest::GitCommitAction{kind,oid}=>self.git.commit_action(kind,&oid).map(WorkspaceResponse::GitMutation),
             WorkspaceRequest::GitReset{oid,mode}=>self.git.reset(&oid,mode).map(WorkspaceResponse::GitMutation),
             WorkspaceRequest::ShellList=>Ok(WorkspaceResponse::ShellList(self.shells.list())),
@@ -127,6 +127,21 @@ impl WorkspaceService {
             WorkspaceRequest::ShellClose{shell_id}=>self.shells.close(&shell_id).map(|_|WorkspaceResponse::Ack),
             WorkspaceRequest::ShellCloseAll=>self.shells.close_all().map(|_|WorkspaceResponse::Ack),
         }; result.map_err(Into::into)
+    }
+
+    fn git_remote(&self,kind:relaycat_protocol::GitRemoteOperation)->Result<WorkspaceResponse,WorkspaceServiceError>{
+        let operation_id=format!("{:?}-{}",kind,unix_ms());
+        match self.git.remote_with_summary(kind){
+            Ok(outcome)=>{
+                let last=outcome.messages.len().saturating_sub(1);
+                for(index,message)in outcome.messages.into_iter().enumerate(){let completed=index==last;self.push_event(WorkspaceEvent::GitProgress(GitProgressEvent{operation_id:operation_id.clone(),phase:if completed{"completed"}else{"summary"}.into(),message,percent:completed.then_some(100),completed,success:completed.then_some(true)}));}
+                Ok(WorkspaceResponse::GitMutation(outcome.mutation))
+            }
+            Err(error)=>{
+                self.push_event(WorkspaceEvent::GitProgress(GitProgressEvent{operation_id,phase:"completed".into(),message:format!("[{:?}] FAILED · {}",kind,error),percent:Some(100),completed:true,success:Some(false)}));
+                Err(error)
+            }
+        }
     }
 
     fn cached(&self,key:&str)->Option<std::result::Result<WorkspaceResponse,WorkspaceError>>{let now=Instant::now();let mut cache=self.cache.lock().ok()?;cache.retain(|_,(created,_)|now.duration_since(*created)<IDEMPOTENCY_TTL);cache.get(key).map(|(_,result)|result.clone())}

@@ -6,6 +6,7 @@ use relaycat_protocol::{
 };
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     io::Write,
     process::{Command, Output, Stdio},
@@ -17,6 +18,22 @@ const GIT_ERROR_MESSAGE_LIMIT: usize = 4 * 1024;
 
 #[derive(Clone)]
 pub struct GitService { root: ProjectRoot, mutation: Arc<Mutex<()>> }
+
+pub(crate) struct GitRemoteOutcome {
+    pub mutation: GitMutationResult,
+    pub messages: Vec<String>,
+}
+
+#[derive(Default)]
+struct GitRemoteSnapshot {
+    branch: String,
+    upstream: Option<String>,
+    remote: String,
+    head: Option<String>,
+    upstream_head: Option<String>,
+    ahead: u32,
+    remote_refs: BTreeMap<String, String>,
+}
 
 impl GitService {
     pub fn new(root: ProjectRoot) -> Self { Self { root, mutation: Arc::new(Mutex::new(())) } }
@@ -137,12 +154,39 @@ impl GitService {
     pub fn delete_branch(&self,name:&str,force:bool)->Result<GitMutationResult,WorkspaceServiceError>{self.validate_branch(name)?;self.simple_mutation(&["branch",if force{"-D"}else{"-d"},name])}
     pub fn create_tag(&self,name:&str,target:&str)->Result<GitMutationResult,WorkspaceServiceError>{if name.is_empty()||target.is_empty()||name.starts_with('-')||target.starts_with('-'){return Err(WorkspaceServiceError::invalid("invalid tag"));}self.simple_mutation(&["tag",name,target])}
     pub fn commit(&self,message:&str,amend:bool)->Result<GitMutationResult,WorkspaceServiceError>{if message.trim().is_empty()||message.len()>1024*1024{return Err(WorkspaceServiceError::invalid("invalid commit message"));}let nonce=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();let path=std::env::temp_dir().join(format!("relaycat-workspace-commit-{nonce}.txt"));fs::write(&path,message).map_err(WorkspaceServiceError::io)?;let p=path.to_string_lossy().into_owned();let result=if amend{self.simple_mutation(&["commit","-F",&p,"--amend"])}else{self.simple_mutation(&["commit","-F",&p])};let _=fs::remove_file(path);result}
-    pub fn remote(&self,kind:GitRemoteOperation)->Result<GitMutationResult,WorkspaceServiceError>{let args:&[&str]=match kind{GitRemoteOperation::Fetch=>&["fetch","--progress","--prune"],GitRemoteOperation::Pull=>&["pull","--progress","--ff-only"],GitRemoteOperation::Push=>&["push","--progress"]};self.simple_mutation(args)}
+    pub fn remote(&self,kind:GitRemoteOperation)->Result<GitMutationResult,WorkspaceServiceError>{self.remote_with_summary(kind).map(|outcome|outcome.mutation)}
+    pub(crate) fn remote_with_summary(&self,kind:GitRemoteOperation)->Result<GitRemoteOutcome,WorkspaceServiceError>{
+        let args:&[&str]=match kind{GitRemoteOperation::Fetch=>&["fetch","--progress","--prune"],GitRemoteOperation::Pull=>&["pull","--progress","--ff-only"],GitRemoteOperation::Push=>&["push","--progress"]};
+        let _guard=self.lock_mutation()?;
+        let before=self.remote_snapshot();
+        self.run_success(args)?;
+        let after=self.remote_snapshot();
+        let messages=self.remote_messages(kind,&before,&after);
+        Ok(GitRemoteOutcome{mutation:self.mutation_result()?,messages})
+    }
     pub fn commit_action(&self,kind:GitCommitAction,oid:&str)->Result<GitMutationResult,WorkspaceServiceError>{validate_oid(oid)?;self.simple_mutation(&[match kind{GitCommitAction::Revert=>"revert",GitCommitAction::CherryPick=>"cherry-pick"},oid])}
     pub fn reset(&self,oid:&str,mode:GitResetMode)->Result<GitMutationResult,WorkspaceServiceError>{validate_oid(oid)?;self.simple_mutation(&["reset",match mode{GitResetMode::Soft=>"--soft",GitResetMode::Mixed=>"--mixed",GitResetMode::Hard=>"--hard"},oid])}
 
     fn paths_mutation(&self,prefix:&[&str],paths:&[String])->Result<GitMutationResult,WorkspaceServiceError>{let _guard=self.lock_mutation()?;self.validate_paths(paths)?;let mut args:Vec<&str>=prefix.to_vec();args.push("--");args.extend(paths.iter().map(String::as_str));self.run_success(&args)?;self.mutation_result()}
     fn simple_mutation(&self,args:&[&str])->Result<GitMutationResult,WorkspaceServiceError>{let _guard=self.lock_mutation()?;self.run_success(args)?;self.mutation_result()}
+    fn remote_snapshot(&self)->GitRemoteSnapshot{
+        let branch=self.text(&["branch","--show-current"]).unwrap_or_default().trim().to_string();
+        let upstream=self.output(&["rev-parse","--abbrev-ref","--symbolic-full-name","@{upstream}"]).ok().filter(|output|output.status.success()).map(|output|String::from_utf8_lossy(&output.stdout).trim().to_string()).filter(|value|!value.is_empty());
+        let remote=upstream.as_deref().and_then(|value|value.split('/').next()).filter(|value|!value.is_empty()).map(str::to_string).or_else(||self.text(&["remote"]).ok().and_then(|value|value.lines().next().map(str::to_string))).unwrap_or_else(||"origin".into());
+        let head=self.optional_oid("HEAD");
+        let upstream_head=upstream.as_deref().and_then(|reference|self.optional_oid(reference));
+        let ahead=if upstream.is_some(){self.text(&["rev-list","--count","@{upstream}..HEAD"]).ok().and_then(|value|value.trim().parse().ok()).unwrap_or(0)}else{0};
+        let remote_refs=self.text(&["for-each-ref","--format=%(refname:short)%09%(objectname)","refs/remotes"]).ok().map(|text|text.lines().filter_map(|line|{let(name,oid)=line.split_once('\t')?;Some((name.to_string(),oid.to_string()))}).collect()).unwrap_or_default();
+        GitRemoteSnapshot{branch,upstream,remote,head,upstream_head,ahead,remote_refs}
+    }
+    fn optional_oid(&self,reference:&str)->Option<String>{self.output(&["rev-parse","--verify",reference]).ok().filter(|output|output.status.success()).map(|output|String::from_utf8_lossy(&output.stdout).trim().to_string()).filter(|value|!value.is_empty())}
+    fn remote_messages(&self,kind:GitRemoteOperation,before:&GitRemoteSnapshot,after:&GitRemoteSnapshot)->Vec<String>{
+        match kind{
+            GitRemoteOperation::Fetch=>fetch_messages(before,after),
+            GitRemoteOperation::Pull=>pull_messages(self,before,after),
+            GitRemoteOperation::Push=>push_messages(before),
+        }
+    }
     fn mutation_result(&self)->Result<GitMutationResult,WorkspaceServiceError>{Ok(GitMutationResult{operation_id:format!("git-{}",SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()),summary:self.summary()?})}
     fn lock_mutation(&self)->Result<std::sync::MutexGuard<'_,()>,WorkspaceServiceError>{self.mutation.try_lock().map_err(|_|WorkspaceServiceError::busy())}
     fn validate_paths(&self,paths:&[String])->Result<(),WorkspaceServiceError>{if paths.is_empty(){return Err(WorkspaceServiceError::invalid("at least one path is required"));}for path in paths{self.root.lexical_path(path)?;}Ok(())}
@@ -156,6 +200,58 @@ impl GitService {
 }
 
 fn status_name(code:char)->String{match code{'A'=>"added",'D'=>"deleted",'R'=>"renamed",'C'=>"copied",'U'=>"conflict",_=>"modified"}.into()}
+fn short_oid(oid:&str)->&str{oid.get(..7).unwrap_or(oid)}
+fn plural(count:u32,singular:&str,plural:&str)->String{format!("{count} {}",if count==1{singular}else{plural})}
+fn remote_target(snapshot:&GitRemoteSnapshot)->String{snapshot.upstream.clone().unwrap_or_else(||if snapshot.branch.is_empty(){snapshot.remote.clone()}else{format!("{}/{}",snapshot.remote,snapshot.branch)})}
+fn fetch_messages(before:&GitRemoteSnapshot,after:&GitRemoteSnapshot)->Vec<String>{
+    let target=remote_target(after);
+    let changes:Vec<String>=after.remote_refs.iter().filter_map(|(name,new_oid)|{
+        let old_oid=before.remote_refs.get(name)?;
+        (old_oid!=new_oid).then(||format!("{name} {} → {}",short_oid(old_oid),short_oid(new_oid)))
+    }).take(3).collect();
+    let created=after.remote_refs.keys().filter(|name|!before.remote_refs.contains_key(*name)).count();
+    let changed_total=after.remote_refs.iter().filter(|(name,oid)|before.remote_refs.get(*name)!=Some(*oid)).count();
+    let mut messages=vec![format!("[Fetch] {target}")];
+    if changed_total==0{
+        messages.push("[Fetch] OK · remote refs unchanged".into());
+    }else{
+        let mut detail=changes;
+        if created>0&&detail.len()<3{detail.push(format!("{created} new remote {}",if created==1{"ref"}else{"refs"}));}
+        let suffix=if detail.is_empty(){String::new()}else{format!(" · {}",detail.join("; "))};
+        messages.push(format!("[Fetch] OK · {}{suffix}",plural(changed_total as u32,"remote ref","remote refs")));
+    }
+    messages
+}
+fn pull_messages(git:&GitService,before:&GitRemoteSnapshot,after:&GitRemoteSnapshot)->Vec<String>{
+    let mut messages=vec![format!("[Pull] {}",remote_target(after))];
+    let(Some(old_head),Some(new_head))=(before.head.as_deref(),after.head.as_deref())else{messages.push("[Pull] OK".into());return messages;};
+    if old_head==new_head{messages.push("[Pull] OK · already up to date".into());return messages;}
+    let range=format!("{old_head}..{new_head}");
+    let commits=git.text(&["rev-list","--count",&range]).ok().and_then(|value|value.trim().parse::<u32>().ok()).unwrap_or(0);
+    let (files,insertions,deletions)=git.text(&["diff","--shortstat",old_head,new_head]).ok().map(|value|parse_shortstat(&value)).unwrap_or_default();
+    messages.push(format!("[Pull] OK · {} · {} · +{insertions}/-{deletions}",plural(commits,"commit","commits"),plural(files,"file","files")));
+    if let Ok(log)=git.text(&["log","--format=%h%x09%s","-n","3",&range]){
+        let subjects:Vec<String>=log.lines().filter_map(|line|line.split_once('\t').map(|(oid,subject)|format!("{oid} {subject}"))).collect();
+        if !subjects.is_empty(){let remaining=commits.saturating_sub(subjects.len() as u32);let suffix=if remaining>0{format!("; {remaining} more")}else{String::new()};messages.push(format!("[Pull] {}{suffix}",subjects.join("; ")));}
+    }
+    messages.truncate(3);
+    messages
+}
+fn push_messages(before:&GitRemoteSnapshot)->Vec<String>{
+    let target=remote_target(before);
+    if before.ahead==0{return vec![format!("[Push] {target} · OK · nothing to push")];}
+    let range=match(before.upstream_head.as_deref(),before.head.as_deref()){
+        (Some(old),Some(new))=>format!(" · {} → {}",short_oid(old),short_oid(new)),
+        _=>String::new(),
+    };
+    vec![format!("[Push] {target} · {}{range} · OK",plural(before.ahead,"commit","commits"))]
+}
+fn parse_shortstat(value:&str)->(u32,u32,u32){
+    let mut files=0;let mut insertions=0;let mut deletions=0;
+    let fields:Vec<&str>=value.split_whitespace().collect();
+    for pair in fields.windows(2){let count=pair[0].parse::<u32>().unwrap_or(0);match pair[1].trim_end_matches(','){"file"|"files"|"changed"=>if pair[1].starts_with("file"){files=count},word if word.starts_with("insertion")=>insertions=count,word if word.starts_with("deletion")=>deletions=count,_=>{}}}
+    (files,insertions,deletions)
+}
 fn validate_oid(oid:&str)->Result<(),WorkspaceServiceError>{if(4..=64).contains(&oid.len())&&oid.bytes().all(|b|b.is_ascii_hexdigit()){Ok(())}else{Err(WorkspaceServiceError::invalid("invalid commit id"))}}
 fn parse_history_item(raw:&str)->Option<GitHistoryItem>{let fields:Vec<&str>=raw.trim_matches(['\n','\r']).split('\x1f').collect();if fields.len()<7{return None;}Some(GitHistoryItem{oid:fields[0].into(),short_oid:fields[1].into(),subject:fields[2].into(),author:fields[3].into(),authored_at_unix_ms:fields[4].parse::<u64>().ok()?.saturating_mul(1000),decorations:fields[5].split(',').map(str::trim).filter(|v|!v.is_empty()).map(str::to_string).collect(),parent_oids:fields[6].split_whitespace().map(str::to_string).collect()})}
 fn content_page(bytes:Vec<u8>,cursor:Option<String>,max_bytes:u32)->ContentPage{let start=cursor.as_deref().unwrap_or("0").parse::<usize>().unwrap_or(0).min(bytes.len());let limit=(max_bytes as usize).clamp(1,WORKSPACE_PAYLOAD_BUDGET);let mut end=start.saturating_add(limit).min(bytes.len());while end>start&&std::str::from_utf8(&bytes[start..end]).is_err(){end-=1;}let truncated=end<bytes.len();ContentPage{bytes:bytes[start..end].to_vec(),next_cursor:truncated.then(||end.to_string()),truncated}}
