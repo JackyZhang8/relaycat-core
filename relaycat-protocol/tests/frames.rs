@@ -5,7 +5,8 @@ use relaycat_protocol::{
     RenderAckV2, RequestSnapshotV2, RequestTranscriptV2, ResizeAckV2, ResizeEventV2, ResumeV2,
     Role, SnapshotRequestReason, TerminalCell, TerminalColor, TerminalModes, TerminalPatchV2,
     TerminalRow, TerminalSnapshotV2, TerminalTranscriptEntryKind, TerminalTranscriptEntryV2,
-    TerminalTranscriptFrameFragmentV2, TranscriptChunkV2, decode_frame, decode_plain_msg,
+    TerminalStreamMessageV2, TerminalStreamV2, TerminalTranscriptFrameFragmentV2,
+    TranscriptChunkV2, decode_frame, decode_plain_msg,
     encode_frame, encode_plain_msg, outer_data_frame_encoded_len, plain_msg_encoded_len,
     plain_msg_type, plain_msg_types, terminal_patch_v2_encoded_len, terminal_row_v2_encoded_len,
     terminal_snapshot_v2_encoded_len, terminal_transcript_entry_v2_encoded_len,
@@ -341,6 +342,68 @@ fn terminal_snapshot_v2_round_trips() {
         decode_plain_msg(&encode_plain_msg(&msg).unwrap()).unwrap(),
         msg
     );
+}
+
+#[test]
+fn terminal_stream_v2_snapshot_round_trips() {
+    let snapshot = TerminalSnapshotV2 {
+        terminal_run_id: "workspace-run-1".to_string(),
+        snapshot_id: 9,
+        state_seq: 44,
+        cols: 80,
+        rows: 24,
+        title: "Shell 1".to_string(),
+        cursor: CursorState {
+            row: 3,
+            col: 4,
+            visible: true,
+            style: CursorStyle::Block,
+        },
+        modes: TerminalModes {
+            alt_screen: false,
+            bracketed_paste: true,
+            application_cursor: false,
+        },
+        palette: PaletteState {
+            default_fg: TerminalColor::Indexed(7),
+            default_bg: TerminalColor::Indexed(0),
+            cursor: TerminalColor::Indexed(15),
+            ansi: vec![],
+        },
+        attrs: vec![CellAttr::default()],
+        reset_app_cache: true,
+        scrollback_window: vec![],
+        screen_rows: vec![],
+    };
+    let msg = PlainMsg::TerminalStreamV2(TerminalStreamV2 {
+        stream_id: "workspace_shell".to_string(),
+        message: TerminalStreamMessageV2::Snapshot(snapshot),
+    });
+
+    assert_eq!(
+        decode_plain_msg(&encode_plain_msg(&msg).unwrap()).unwrap(),
+        msg
+    );
+    assert_eq!(plain_msg_type(&msg), b"terminal_stream_v2");
+    assert!(plain_msg_types().contains(&b"terminal_stream_v2".as_slice()));
+}
+
+#[test]
+fn terminal_stream_v2_input_round_trips() {
+    let msg = PlainMsg::TerminalStreamV2(TerminalStreamV2 {
+        stream_id: "workspace_shell".to_string(),
+        message: TerminalStreamMessageV2::Input {
+            input_stream_id: "workspace-input-1".to_string(),
+            input_seq: 7,
+            bytes: b"top\r".to_vec(),
+        },
+    });
+
+    assert_eq!(
+        decode_plain_msg(&encode_plain_msg(&msg).unwrap()).unwrap(),
+        msg
+    );
+    assert_eq!(plain_msg_type(&msg), b"terminal_stream_v2");
 }
 
 #[test]
@@ -920,7 +983,7 @@ fn plain_msg_types_are_unique_and_complete() {
     );
     assert_eq!(
         labels.len(),
-        22,
+        23,
         "label count drifted from PlainMsg variants"
     );
 }

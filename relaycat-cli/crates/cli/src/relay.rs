@@ -30,9 +30,9 @@ use relaycat_protocol::{
     InputEventV2, MAX_OUTER_FRAME_BYTES, OuterFrame, PaletteState, PatchOp, PlainMsg,
     ProtocolCapabilityV2, ProtocolRejectV2, RelayErrorCode, RenderAckV2, RequestSnapshotV2,
     RequestTranscriptV2, ResizeEventV2, ResumeAcceptMode, ResumeAcceptedV2, ResumeV2, Role,
-    TERMINAL_STATE_PROTOCOL_V2, TerminalColor, decode_frame, encode_frame, encode_plain_msg,
+    TERMINAL_STATE_PROTOCOL_V2, TerminalColor, TerminalStreamV2, decode_frame, encode_frame, encode_plain_msg,
 };
-use relaycat_workspace::{ProjectRoot, WorkspaceService};
+use relaycat_workspace::{ProjectRoot, ShellTransportEvent, WorkspaceService};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
@@ -53,6 +53,9 @@ use crate::{
         TerminalCore, TerminalCoreConfig, TerminalFeedBatch, TerminalWireError,
         bounded_terminal_size, dark_terminal_palette, default_terminal_palette,
         xterm_indexed_color,
+    },
+    workspace_terminal::{
+        WORKSPACE_SHELL_STREAM_ID, WorkspaceTerminalAction, WorkspaceTerminalHost,
     },
     ws_url::build_ws_url,
 };
@@ -195,6 +198,7 @@ type SharedSessionKeys = Arc<Mutex<relaycat_crypto::SessionKeys>>;
 enum PtyEvent {
     Output(Vec<u8>),
     Plain(PlainMsg),
+    WorkspaceTransport(ShellTransportEvent),
     Exit(ExitStatus),
 }
 
@@ -229,6 +233,7 @@ enum RelayInputAction {
     RequestSnapshotV2(RequestSnapshotV2),
     RequestTranscriptV2(RequestTranscriptV2),
     ResizeEventV2(ResizeEventV2),
+    TerminalStreamV2(TerminalStreamV2),
     HelloV2(HelloV2),
     EchoHeartbeat,
     Workspace(relaycat_protocol::WorkspaceRequestEnvelope),
@@ -246,6 +251,8 @@ enum TerminalV2Control {
         event: ResizeEventV2,
         pty_size: PtySize,
     },
+    WorkspaceStream(TerminalStreamV2),
+    GuiWorkspace(crate::gui_bridge::GuiWorkspaceTerminalCommand),
     LocalResize {
         pty_size: PtySize,
     },
@@ -371,11 +378,49 @@ fn relay_input_action(msg: PlainMsg) -> RelayInputAction {
         PlainMsg::RequestSnapshotV2(request) => RelayInputAction::RequestSnapshotV2(request),
         PlainMsg::RequestTranscriptV2(request) => RelayInputAction::RequestTranscriptV2(request),
         PlainMsg::ResizeEventV2(event) => RelayInputAction::ResizeEventV2(event),
+        PlainMsg::TerminalStreamV2(stream) => RelayInputAction::TerminalStreamV2(stream),
         PlainMsg::HelloV2(hello) => RelayInputAction::HelloV2(hello),
         PlainMsg::Heartbeat => RelayInputAction::EchoHeartbeat,
         PlainMsg::WorkspaceRequest(request) => RelayInputAction::Workspace(request),
         _ => RelayInputAction::Ignore,
     }
+}
+
+fn workspace_terminal_transport_messages(
+    host: &mut Option<(String, WorkspaceTerminalHost)>,
+    event: ShellTransportEvent,
+) -> Result<Vec<PlainMsg>> {
+    let messages = match event {
+        ShellTransportEvent::Started(descriptor) => {
+            let mut terminal = WorkspaceTerminalHost::new(descriptor.cols, descriptor.rows, TERMINAL_V2_PATCH_RETENTION);
+            let messages = terminal.initial_messages()?;
+            *host = Some((descriptor.shell_id, terminal));
+            messages
+        }
+        ShellTransportEvent::Output { shell_id, bytes } => {
+            let Some((active_shell_id, terminal)) = host.as_mut() else {
+                return Ok(Vec::new());
+            };
+            if *active_shell_id != shell_id {
+                return Ok(Vec::new());
+            }
+            terminal.feed_output(&bytes)?
+        }
+        ShellTransportEvent::Exit { shell_id, code } => {
+            if host
+                .as_ref()
+                .is_none_or(|(active_shell_id, _)| *active_shell_id != shell_id)
+            {
+                return Ok(Vec::new());
+            }
+            *host = None;
+            vec![TerminalStreamV2 {
+                stream_id: WORKSPACE_SHELL_STREAM_ID.to_string(),
+                message: relaycat_protocol::TerminalStreamMessageV2::Exit { code },
+            }]
+        }
+    };
+    Ok(messages.into_iter().map(PlainMsg::TerminalStreamV2).collect())
 }
 
 fn cli_metadata_for_target(target: &TargetCommand) -> Result<CliMetadata> {
@@ -636,6 +681,8 @@ async fn run_plaintext_pty_relay(
         // Plaintext relay has no capability handshake, so attribute tables are
         // always sent in full (legacy semantics).
         Arc::new(AtomicBool::new(false)),
+        // Auxiliary streams require the secure Hello capability negotiation.
+        Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicU64::new(1)),
         Arc::new(Mutex::new(AppResumeGate { resume_ready: true })),
         reconnect,
@@ -673,6 +720,8 @@ async fn run_secure_pty_relay(
     // tail instead of the whole table on growth.
     let incremental_attrs_negotiated = Arc::new(AtomicBool::new(false));
     let incremental_attrs_negotiated_for_decode = incremental_attrs_negotiated.clone();
+    let terminal_streams_negotiated = Arc::new(AtomicBool::new(false));
+    let terminal_streams_negotiated_for_decode = terminal_streams_negotiated.clone();
     let app_join_generation = Arc::new(AtomicU64::new(1));
     let app_join_generation_for_decode = app_join_generation.clone();
     let resume_gate = Arc::new(Mutex::new(AppResumeGate::default()));
@@ -710,6 +759,7 @@ async fn run_secure_pty_relay(
                 SecurePeerJoined::SessionReset => {
                     app_connected_for_decode.store(true, Ordering::Release);
                     incremental_attrs_negotiated_for_decode.store(false, Ordering::Release);
+                    terminal_streams_negotiated_for_decode.store(false, Ordering::Release);
                     app_join_generation_for_decode.fetch_add(1, Ordering::Release);
                     if let Ok(mut gate) = resume_gate_for_decode.lock() {
                         gate.mark_app_rejoined();
@@ -755,12 +805,17 @@ async fn run_secure_pty_relay(
                     incremental_attrs_negotiated_for_decode.as_ref(),
                     hello,
                 );
+                update_terminal_streams_capability(
+                    terminal_streams_negotiated_for_decode.as_ref(),
+                    hello,
+                );
             }
             Ok(decoded)
         },
         || Ok(()),
         app_connected,
         incremental_attrs_negotiated,
+        terminal_streams_negotiated,
         app_join_generation,
         resume_gate,
         reconnect,
@@ -775,6 +830,15 @@ fn update_incremental_attrs_capability(negotiated: &AtomicBool, hello: &HelloV2)
         hello
             .capabilities
             .contains(&ProtocolCapabilityV2::IncrementalAttrs),
+        Ordering::Release,
+    );
+}
+
+fn update_terminal_streams_capability(negotiated: &AtomicBool, hello: &HelloV2) {
+    negotiated.store(
+        hello
+            .capabilities
+            .contains(&ProtocolCapabilityV2::TerminalStreams),
         Ordering::Release,
     );
 }
@@ -914,6 +978,7 @@ async fn run_pty_relay<Encode, Decode>(
     // terminal model so its patches send only the appended attribute-table tail
     // (instead of the whole table) once the peer can append it.
     incremental_attrs: Arc<AtomicBool>,
+    terminal_streams: Arc<AtomicBool>,
     app_join_generation: Arc<AtomicU64>,
     resume_gate: Arc<Mutex<AppResumeGate>>,
     reconnect: Arc<RelayTransportReconnect>,
@@ -1532,6 +1597,8 @@ where
     let resume_gate_for_input = resume_gate.clone();
     let heartbeat_output_tx_for_input = output_tx.clone();
     let terminal_v2_control_tx_for_input = terminal_v2_control_tx.clone();
+    let terminal_streams_for_input = terminal_streams.clone();
+    let terminal_streams_for_output = terminal_streams.clone();
     let reconnect_signal_tx_for_output = reconnect_signal_tx.clone();
     let reconnect_signal_tx_for_input_gap = reconnect_signal_tx.clone();
     let pty_work_mode_for_input = pty_work_mode.clone();
@@ -1547,16 +1614,44 @@ where
     let workspace_service = Arc::new(WorkspaceService::new(workspace_root, 3));
     let workspace_service_for_input = workspace_service.clone();
     let workspace_service_for_events = workspace_service.clone();
+    let workspace_service_for_terminal = workspace_service.clone();
     let workspace_event_tx = output_tx.clone();
     let workspace_event_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(50));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
+            for event in workspace_service_for_events.drain_shell_transport_events() {
+                if workspace_event_tx
+                    .send(PtyEvent::WorkspaceTransport(event))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
             for event in workspace_service_for_events.drain_events() {
                 if workspace_event_tx
                     .send(PtyEvent::Plain(PlainMsg::WorkspaceEvent(event)))
                     .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+    let gui_workspace_control_tx = terminal_v2_control_tx.clone();
+    let gui_workspace_command_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            while let Some(command) =
+                crate::gui_bridge::try_recv_gui_workspace_terminal_command()
+            {
+                if gui_workspace_control_tx
+                    .send(TerminalV2Control::GuiWorkspace(command))
                     .is_err()
                 {
                     return;
@@ -1587,6 +1682,7 @@ where
         );
         terminal_core.set_record_primary_screen_frames(record_primary_screen_frames);
         terminal_core.set_incremental_attrs_flag(incremental_attrs.clone());
+        let mut workspace_terminal_host: Option<(String, WorkspaceTerminalHost)> = None;
         // Sampling process CPU/memory can block: on Windows `collect_cli_status`
         // shells out to PowerShell, whose cold start may take ~1s — longer than a
         // fast Unix `ps`. Run it on a dedicated task and the blocking pool so a
@@ -1898,6 +1994,79 @@ where
                             terminal_core.transcript_chunk(&request),
                         )]
                     }
+                    TerminalV2Control::WorkspaceStream(stream) => {
+                        if !terminal_streams_for_output.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        if workspace_terminal_host.is_none()
+                            && let Some(descriptor) = workspace_service_for_terminal
+                                .shell_descriptors()
+                                .into_iter()
+                                .next()
+                        {
+                            let _ = workspace_terminal_transport_messages(
+                                &mut workspace_terminal_host,
+                                ShellTransportEvent::Started(descriptor),
+                            )?;
+                        }
+                        let Some((_, terminal)) = workspace_terminal_host.as_mut() else {
+                            continue;
+                        };
+                        let result = terminal.handle_message(stream)?;
+                        for action in result.actions {
+                            match action {
+                                WorkspaceTerminalAction::Write(bytes) => {
+                                    workspace_service_for_terminal
+                                        .write_workspace_shell(bytes)
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                }
+                                WorkspaceTerminalAction::Resize { cols, rows } => {
+                                    workspace_service_for_terminal
+                                        .resize_workspace_shell(cols, rows)
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                }
+                                WorkspaceTerminalAction::Close => {
+                                    workspace_service_for_terminal
+                                        .close_workspace_shell()
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                }
+                            }
+                        }
+                        result
+                            .outbound
+                            .into_iter()
+                            .map(PlainMsg::TerminalStreamV2)
+                            .collect()
+                    }
+                    TerminalV2Control::GuiWorkspace(command) => {
+                        use crate::gui_bridge::{
+                            GuiWorkspaceTerminalCommand,
+                        };
+                        match command {
+                            GuiWorkspaceTerminalCommand::Attach => {
+                                let _ = workspace_service_for_terminal
+                                    .ensure_workspace_shell(80, 24)
+                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                            }
+                            GuiWorkspaceTerminalCommand::Detach => {}
+                            GuiWorkspaceTerminalCommand::Input { bytes } => {
+                                workspace_service_for_terminal
+                                    .write_workspace_shell(bytes)
+                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                            }
+                            GuiWorkspaceTerminalCommand::Resize { cols, rows } => {
+                                workspace_service_for_terminal
+                                    .resize_workspace_shell(cols, rows)
+                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                            }
+                            GuiWorkspaceTerminalCommand::Close => {
+                                workspace_service_for_terminal
+                                    .close_workspace_shell()
+                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                            }
+                        }
+                        Vec::new()
+                    }
                     TerminalV2Control::Resize { event, pty_size } => {
                         let mut msgs = flush_pending_output(
                             &mut pending_output,
@@ -2015,6 +2184,40 @@ where
                 }
                 RelayOutputEvent::Output(event) => match event {
                     PtyEvent::Plain(msg) => vec![msg],
+                    PtyEvent::WorkspaceTransport(event) => {
+                        match &event {
+                            ShellTransportEvent::Started(descriptor) => {
+                                crate::gui_bridge::publish_gui_workspace_terminal_event(
+                                    crate::gui_bridge::GuiWorkspaceTerminalEvent::Started {
+                                        shell_id: descriptor.shell_id.clone(),
+                                    },
+                                );
+                            }
+                            ShellTransportEvent::Output { bytes, .. } => {
+                                crate::gui_bridge::publish_gui_workspace_terminal_event(
+                                    crate::gui_bridge::GuiWorkspaceTerminalEvent::Output {
+                                        bytes: bytes.clone(),
+                                    },
+                                );
+                            }
+                            ShellTransportEvent::Exit { code, .. } => {
+                                crate::gui_bridge::publish_gui_workspace_terminal_event(
+                                    crate::gui_bridge::GuiWorkspaceTerminalEvent::Exit {
+                                        code: *code,
+                                    },
+                                );
+                            }
+                        }
+                        let messages = workspace_terminal_transport_messages(
+                            &mut workspace_terminal_host,
+                            event,
+                        )?;
+                        if terminal_streams_for_output.load(Ordering::Acquire) {
+                            messages
+                        } else {
+                            Vec::new()
+                        }
+                    }
                     PtyEvent::Output(bytes) => {
                         pending_output.extend_from_slice(&bytes);
                         deferred_history_thaw.observe_pty_output(Instant::now());
@@ -2620,6 +2823,12 @@ where
                         }
                     }
                 }
+                Some(RelayInputAction::TerminalStreamV2(stream)) => {
+                    if terminal_streams_for_input.load(Ordering::Acquire) {
+                        let _ = terminal_v2_control_tx_for_input
+                            .send(TerminalV2Control::WorkspaceStream(stream));
+                    }
+                }
                 Some(RelayInputAction::HelloV2(hello)) => {
                     // Outbound (CLI->App) compression is enabled in the decode
                     // path the moment the Hello is read; here we just answer
@@ -2704,6 +2913,7 @@ where
     let output_result = tokio::time::timeout(Duration::from_secs(5), relay_output).await;
     relay_input.abort();
     workspace_event_task.abort();
+    gui_workspace_command_task.abort();
     workspace_service.shutdown();
     local_size_task.abort();
     chrome_refresh_task.abort();

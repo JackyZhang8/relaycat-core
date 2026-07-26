@@ -8,6 +8,7 @@ const stylesSource = readFileSync(
   "utf8",
 );
 const mainSource = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+const i18nSource = readFileSync(new URL("../src/i18n.ts", import.meta.url), "utf8");
 const workspaceSource = readFileSync(
   new URL("../src/workspace-panel.ts", import.meta.url),
   "utf8",
@@ -56,15 +57,40 @@ test("embedded Shell tabs live inside the unified workspace sidebar", () => {
   assert.doesNotMatch(html, /id="embedded-shell-resizer"/);
   assert.match(html, /id="embedded-shell-tabs"/);
   assert.match(html, /id="embedded-shell-terminals"/);
+  assert.doesNotMatch(html, /id="embedded-shell-close-all"/);
 });
 
-test("embedded Shells use their own local PTY collection", () => {
+test("embedded Shell keeps Shell 1 shared and creates Shell 2 to 5 locally", () => {
   assert.match(panelSource, /const shells: EmbeddedShellTab\[\] = \[\]/);
-  assert.match(panelSource, /embedded-shell-/);
+  assert.match(panelSource, /session\.mode !== "relay"/);
+  assert.match(panelSource, /kind:\s*"shared" \| "local"/);
+  assert.match(panelSource, /ownerSessionId:\s*string/);
+  assert.match(panelSource, /number:\s*number/);
+  assert.match(panelSource, /const id = session\.id/);
+  assert.match(panelSource, /nextLocalShellNumber\(session\.id, shells\)/);
+  assert.match(panelSource, /workspace-local:\$\{session\.id\}/);
+  assert.match(panelSource, /invoke<WorkspaceTerminalSnapshot>\("attach_workspace_terminal"/);
+  assert.match(panelSource, /invoke<SessionInfo>\("create_session"/);
   assert.match(panelSource, /tool:\s*"shell"/);
   assert.match(panelSource, /relay:\s*null/);
-  assert.match(panelSource, /MAX_EMBEDDED_SHELLS = 8/);
   assert.doesNotMatch(panelSource, /pairingTabId|pairUrl|splitId/);
+});
+
+test("the per-session Shell limit uses the shared in-app dialog", () => {
+  assert.match(panelSource, /notice:\s*\(message: string\) => Promise<void>/);
+  assert.match(panelSource, /await options\.notice\(t\("embedded_shell_limit"\)\)/);
+  assert.match(panelSource, /addBtn\.disabled = !activeOwnerSessionId;/);
+  assert.doesNotMatch(panelSource, /term\.writeln\(`\\r\\n\\x1b\[33m\$\{t\("embedded_shell_limit"\)\}/);
+  assert.match(mainSource, /hideCancel\?:\s*boolean/);
+  assert.match(mainSource, /cancelBtn\.hidden = !!opts\.hideCancel/);
+  assert.match(mainSource, /notice:\s*async \(message\) =>[\s\S]*?hideCancel:\s*true/);
+});
+
+test("the add button recreates a missing APP Shell before enforcing the limit", () => {
+  assert.match(panelSource, /embeddedShellCreateKind\(session\.id, shells\)/);
+  assert.match(panelSource, /case "shared":[\s\S]*?createForProject/);
+  assert.match(panelSource, /case "local":[\s\S]*?createLocalForProject/);
+  assert.match(panelSource, /case "limit":[\s\S]*?embedded_shell_limit/);
 });
 
 test("embedded Shells follow appearance settings and protect running processes on quit", () => {
@@ -72,29 +98,66 @@ test("embedded Shells follow appearance settings and protect running processes o
   assert.match(panelSource, /setVisible\(visible: boolean\): void/);
   assert.match(panelSource, /runningCount\(\): number/);
   assert.match(panelSource, /updateAppearance\(theme: ITheme, fontSize: number\): void/);
+  assert.match(panelSource, /closeForSession\(sessionId: string\): Promise<void>/);
   assert.match(mainSource, /embeddedShellPanel\?\.updateAppearance\(xtermTheme\(\), fontSize\(\)\)/);
   assert.match(mainSource, /embeddedShellPanel\?\.runningCount\(\)/);
+  assert.match(mainSource, /await embeddedShellPanel\?\.closeForSession\(id\)/);
 });
 
-test("closing one or all embedded Shells requires confirmation", () => {
+test("closing routes shared and local Shells to their own transports", () => {
   assert.match(panelSource, /await options\.confirm\(t\("embedded_shell_close_confirm"/);
-  assert.match(panelSource, /await options\.confirm\(t\("embedded_shell_close_all_confirm"/);
+  assert.match(panelSource, /if \(!confirmed\) return;\s*await closeShell\(id, true, true\)/);
+  assert.match(panelSource, /terminate \? "close_workspace_terminal" : "detach_workspace_terminal"/);
+  assert.match(panelSource, /invoke\("close_session", \{ id: shell\.id \}\)/);
+  assert.match(panelSource, /invoke\("write_session", \{ id: shell\.id, data \}\)/);
+  assert.match(panelSource, /invoke\("resize_session"/);
+  assert.doesNotMatch(panelSource, /embedded_shell_close_all_confirm/);
   assert.match(mainSource, /confirm:\s*\(message\) =>/);
+  assert.match(i18nSource, /embedded_shell_close_confirm:\s*"确定关闭共享终端“\{0\}”吗？其中正在运行的命令将被终止。"/);
+  assert.match(i18nSource, /Close shared terminal "\{0\}"\? Any command running in it will be terminated\./);
 });
 
-test("Shell launch and close are serialized without bulk-close focus races", () => {
+test("APP closing the shared Shell removes its GUI tab and shows a notice", () => {
+  assert.match(panelSource, /event\.payload\.kind === "exit"/);
+  assert.match(panelSource, /finalizeShellRemoval\(shell\.id, true\)/);
+  assert.match(panelSource, /options\.notice\(t\("embedded_shell_closed_in_app"\)\)/);
+  assert.match(mainSource, /notice:\s*async \(message\) =>[\s\S]*?hideCancel:\s*true/);
+  assert.match(i18nSource, /embedded_shell_closed_in_app:\s*"该共享终端已在 APP 端关闭"/);
+  assert.match(i18nSource, /embedded_shell_closed_in_app:\s*"The shared terminal was closed in the APP\."/);
+});
+
+test("an APP-created shared Shell automatically adds the matching GUI tab", () => {
+  assert.match(panelSource, /if \(!shell\) \{[\s\S]*?event\.payload\.kind !== "started"/);
+  assert.match(panelSource, /const session = options\.currentSession\(\)/);
+  assert.match(panelSource, /session\.id !== event\.payload\.id/);
+  assert.match(panelSource, /void createForProject\(session\.project\)/);
+  assert.doesNotMatch(panelSource, /event\.payload\.kind === "started"[\s\S]*?setVisible\(true\)/);
+});
+
+test("Shell groups remember ownership and serialize attach and close", () => {
   assert.match(panelSource, /state:\s*"launching" \| "running" \| "exited"/);
   assert.match(panelSource, /ready:\s*Promise<void>/);
   assert.match(panelSource, /closing:\s*boolean/);
   assert.match(panelSource, /await shell\.ready/);
-  assert.match(panelSource, /closeShell\(id, false\)/);
+  assert.match(panelSource, /activeOwnerSessionId/);
+  assert.match(panelSource, /activeShellByOwner/);
+  assert.match(panelSource, /shell\.ownerSessionId === activeOwnerSessionId/);
   assert.doesNotMatch(panelSource, /for \(const shell of \[\.\.\.shells\]\) removeShell/);
 });
 
-test("PTY command failures are handled instead of becoming unhandled rejections", () => {
-  assert.match(panelSource, /invoke\("resize_session"[\s\S]*?\.catch\(\(\) => \{\}\)/);
-  assert.match(panelSource, /invoke\("write_session"[\s\S]*?\.catch\(\(\) => \{\}\)/);
-  assert.match(panelSource, /invoke\("close_session"[\s\S]*?\.catch\(\(\) => \{\}\)/);
+test("workspace terminal command failures are handled instead of becoming unhandled rejections", () => {
+  assert.match(panelSource, /invoke\("resize_workspace_terminal"[\s\S]*?\.catch\(\(\) => \{\}\)/);
+  assert.match(panelSource, /invoke\("write_workspace_terminal"[\s\S]*?\.catch\(\(\) => \{\}\)/);
+  assert.match(panelSource, /invoke\(terminate \? "close_workspace_terminal" : "detach_workspace_terminal"[\s\S]*?\.catch\(\(\) => \{\}\)/);
+  assert.match(panelSource, /listen<OutputEvent>\("session:\/\/output"/);
+  assert.match(panelSource, /listen<StatusEvent>\("session:\/\/status"/);
+});
+
+test("workspace terminal attach orders replay before newer live output", () => {
+  assert.match(panelSource, /last_output_seq:\s*number/);
+  assert.match(panelSource, /output_seq\?:\s*number/);
+  assert.match(panelSource, /pendingOutput/);
+  assert.match(panelSource, /output_seq > snapshot\.last_output_seq/);
 });
 
 test("Term tool buttons stay bright without a right-side indicator", () => {

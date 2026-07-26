@@ -7,15 +7,17 @@
 //! so the GUI never needs to locate or spawn a separately compiled `relaycat`
 //! executable.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::FromArgMatches;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -65,6 +67,86 @@ pub const GUI_SESSION_ID_ENV: &str = "RELAYCAT_GUI_SESSION_ID";
 pub const GUI_RELAY_STATE_ADDR_ENV: &str = "RELAYCAT_GUI_STATE_ADDR";
 /// Per-session bearer token required on every relay state message.
 pub const GUI_RELAY_STATE_TOKEN_ENV: &str = "RELAYCAT_GUI_STATE_TOKEN";
+/// Loopback endpoint and bearer token for the GUI's shared workspace terminal.
+pub const GUI_WORKSPACE_TERMINAL_ADDR_ENV: &str = "RELAYCAT_GUI_WORKSPACE_TERMINAL_ADDR";
+pub const GUI_WORKSPACE_TERMINAL_TOKEN_ENV: &str = "RELAYCAT_GUI_WORKSPACE_TERMINAL_TOKEN";
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GuiWorkspaceTerminalCommand {
+    Attach,
+    Detach,
+    Input {
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+    },
+    Resize { cols: u16, rows: u16 },
+    Close,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GuiWorkspaceTerminalEvent {
+    Ready,
+    Started { shell_id: String },
+    Output {
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+    },
+    Exit { code: Option<i32> },
+    Heartbeat,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "direction", content = "payload", rename_all = "snake_case")]
+pub enum GuiWorkspaceTerminalMessage {
+    Command(GuiWorkspaceTerminalCommand),
+    Event(GuiWorkspaceTerminalEvent),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct GuiWorkspaceTerminalEnvelope {
+    pub token: String,
+    pub message: GuiWorkspaceTerminalMessage,
+}
+
+pub fn encode_gui_workspace_terminal_line(
+    token: &str,
+    message: &GuiWorkspaceTerminalMessage,
+) -> serde_json::Result<String> {
+    let mut line = serde_json::to_string(&GuiWorkspaceTerminalEnvelope {
+        token: token.to_string(),
+        message: message.clone(),
+    })?;
+    line.push('\n');
+    Ok(line)
+}
+
+pub fn decode_gui_workspace_terminal_line(
+    line: &str,
+) -> serde_json::Result<GuiWorkspaceTerminalEnvelope> {
+    serde_json::from_str(line.trim_end())
+}
+
+mod base64_bytes {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Relay lifecycle states reported by a GUI-hosted relay child over its
 /// dedicated control channel. Terminal bytes continue to use the PTY/pipe.
@@ -161,6 +243,11 @@ pub fn decode_gui_relay_state_line(line: &str) -> serde_json::Result<GuiRelaySta
 
 static GUI_RELAY_STATE_SENDER: OnceLock<Sender<GuiRelayStateSnapshot>> = OnceLock::new();
 static GUI_RELAY_STATE_REVISION: AtomicU64 = AtomicU64::new(0);
+static GUI_WORKSPACE_TERMINAL_EVENT_SENDER: OnceLock<SyncSender<GuiWorkspaceTerminalEvent>> =
+    OnceLock::new();
+static GUI_WORKSPACE_TERMINAL_COMMAND_RECEIVER: OnceLock<
+    Mutex<Receiver<GuiWorkspaceTerminalCommand>>,
+> = OnceLock::new();
 
 /// Generate a per-session token for authenticating the loopback state stream.
 pub fn new_gui_relay_state_token() -> String {
@@ -229,6 +316,163 @@ pub fn publish_gui_relay_error(code: String, retryable: bool, message: String) {
     let _ = sender.send(GuiRelayStateSnapshot::error(
         revision, code, retryable, message,
     ));
+}
+
+/// Start the authenticated duplex workspace-terminal bridge supplied by the
+/// GUI parent. Standalone CLI processes simply leave this disabled.
+pub fn init_gui_workspace_terminal_bridge() {
+    if GUI_WORKSPACE_TERMINAL_EVENT_SENDER.get().is_some() {
+        return;
+    }
+    let Some(address) = std::env::var(GUI_WORKSPACE_TERMINAL_ADDR_ENV)
+        .ok()
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+    else {
+        return;
+    };
+    let Ok(token) = std::env::var(GUI_WORKSPACE_TERMINAL_TOKEN_ENV) else {
+        return;
+    };
+    if token.is_empty() {
+        return;
+    }
+
+    let (event_sender, event_receiver) = sync_channel(64);
+    let (command_sender, command_receiver) = channel();
+    if GUI_WORKSPACE_TERMINAL_EVENT_SENDER
+        .set(event_sender)
+        .is_err()
+        || GUI_WORKSPACE_TERMINAL_COMMAND_RECEIVER
+            .set(Mutex::new(command_receiver))
+            .is_err()
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        gui_workspace_terminal_bridge_loop(address, token, event_receiver, command_sender)
+    });
+}
+
+pub fn publish_gui_workspace_terminal_event(event: GuiWorkspaceTerminalEvent) {
+    init_gui_workspace_terminal_bridge();
+    let Some(sender) = GUI_WORKSPACE_TERMINAL_EVENT_SENDER.get() else {
+        return;
+    };
+    let _ = sender.try_send(event);
+}
+
+pub fn try_recv_gui_workspace_terminal_command() -> Option<GuiWorkspaceTerminalCommand> {
+    let receiver = GUI_WORKSPACE_TERMINAL_COMMAND_RECEIVER.get()?;
+    receiver.lock().ok()?.try_recv().ok()
+}
+
+fn gui_workspace_terminal_bridge_loop(
+    address: SocketAddr,
+    token: String,
+    event_receiver: Receiver<GuiWorkspaceTerminalEvent>,
+    command_sender: Sender<GuiWorkspaceTerminalCommand>,
+) {
+    let mut pending = None;
+    loop {
+        let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(500)) {
+            Ok(stream) => stream,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        let Ok(reader_stream) = stream.try_clone() else {
+            continue;
+        };
+        let reader_token = token.clone();
+        let reader_commands = command_sender.clone();
+        std::thread::spawn(move || {
+            receive_gui_workspace_terminal_commands(
+                reader_stream,
+                &reader_token,
+                &reader_commands,
+            )
+        });
+
+        if write_gui_workspace_terminal_message(
+            &mut stream,
+            &token,
+            &GuiWorkspaceTerminalMessage::Event(GuiWorkspaceTerminalEvent::Ready),
+        )
+        .is_err()
+        {
+            continue;
+        }
+
+        loop {
+            let event = if let Some(event) = pending.take() {
+                event
+            } else {
+                match event_receiver.recv_timeout(Duration::from_secs(1)) {
+                    Ok(event) => event,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        GuiWorkspaceTerminalEvent::Heartbeat
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            };
+            let message = GuiWorkspaceTerminalMessage::Event(event.clone());
+            if write_gui_workspace_terminal_message(&mut stream, &token, &message).is_err() {
+                if !matches!(event, GuiWorkspaceTerminalEvent::Heartbeat) {
+                    pending = Some(event);
+                }
+                break;
+            }
+        }
+    }
+}
+
+fn receive_gui_workspace_terminal_commands(
+    stream: TcpStream,
+    token: &str,
+    commands: &Sender<GuiWorkspaceTerminalCommand>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return,
+            Ok(_) => {
+                if line.len() > 512 * 1024 {
+                    return;
+                }
+                let Ok(envelope) = decode_gui_workspace_terminal_line(&line) else {
+                    continue;
+                };
+                if envelope.token != token {
+                    return;
+                }
+                if let GuiWorkspaceTerminalMessage::Command(command) = envelope.message {
+                    let _ = commands.send(command);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+fn write_gui_workspace_terminal_message(
+    stream: &mut TcpStream,
+    token: &str,
+    message: &GuiWorkspaceTerminalMessage,
+) -> std::io::Result<()> {
+    let line = encode_gui_workspace_terminal_line(token, message)
+        .map_err(std::io::Error::other)?;
+    stream.write_all(line.as_bytes())?;
+    stream.flush()
 }
 
 fn gui_relay_state_writer_loop(
@@ -389,6 +633,7 @@ pub fn parse_resize_line(contents: &str) -> Option<(u16, u16)> {
 pub fn run_relay_child(args: &[String]) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     init_gui_relay_state_reporter();
+    init_gui_workspace_terminal_bridge();
     // The GUI renders the pairing QR / URL / hints in a native popup, so keep
     // the embedded terminal clean by suppressing the human-facing pairing block
     // (the URL is still handed to the GUI host via a private OSC sequence).
@@ -496,5 +741,42 @@ mod tests {
         let envelope = decode_gui_relay_state_line(&line).unwrap();
         assert_eq!(envelope.token, "secret-token");
         assert_eq!(envelope.snapshot, expected);
+    }
+
+    #[test]
+    fn workspace_terminal_event_round_trips_binary_output() {
+        let message = GuiWorkspaceTerminalMessage::Event(
+            GuiWorkspaceTerminalEvent::Output {
+                bytes: vec![0, 1, 2, 0xff],
+            },
+        );
+
+        let line = encode_gui_workspace_terminal_line("workspace-token", &message).unwrap();
+        let decoded = decode_gui_workspace_terminal_line(&line).unwrap();
+
+        assert!(line.ends_with('\n'));
+        assert_eq!(decoded.token, "workspace-token");
+        assert_eq!(decoded.message, message);
+        assert!(line.contains("AAEC/w=="));
+    }
+
+    #[test]
+    fn workspace_terminal_commands_round_trip_attach_input_resize_detach_and_close() {
+        let commands = [
+            GuiWorkspaceTerminalCommand::Attach,
+            GuiWorkspaceTerminalCommand::Input {
+                bytes: b"top\r".to_vec(),
+            },
+            GuiWorkspaceTerminalCommand::Resize { cols: 100, rows: 30 },
+            GuiWorkspaceTerminalCommand::Detach,
+            GuiWorkspaceTerminalCommand::Close,
+        ];
+
+        for command in commands {
+            let message = GuiWorkspaceTerminalMessage::Command(command.clone());
+            let line = encode_gui_workspace_terminal_line("workspace-token", &message).unwrap();
+            let decoded = decode_gui_workspace_terminal_line(&line).unwrap();
+            assert_eq!(decoded.message, message);
+        }
     }
 }

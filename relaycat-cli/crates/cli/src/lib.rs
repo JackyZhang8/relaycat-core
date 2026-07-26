@@ -12,6 +12,7 @@ pub mod relay;
 pub mod secure;
 pub mod session;
 pub mod terminal_core;
+pub mod workspace_terminal;
 pub mod tui;
 pub mod update;
 pub mod ws_url;

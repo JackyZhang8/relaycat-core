@@ -5,6 +5,7 @@ pub const WORKSPACE_DIRECTORY_PAGE_SIZE: u16 = 100;
 pub const WORKSPACE_DIRECTORY_ENTRY_LIMIT: u16 = 1000;
 pub const WORKSPACE_GIT_HISTORY_PAGE_SIZE: u16 = 20;
 pub const WORKSPACE_APP_SHELL_LIMIT: u8 = 3;
+pub const WORKSPACE_ARCHIVE_ENTRY_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceRequestEnvelope { pub request_id: String, pub project_id: String, pub deadline_unix_ms: u64, pub idempotency_key: Option<String>, pub operation: WorkspaceRequest }
@@ -59,7 +60,14 @@ pub struct WorkspaceError { pub code: WorkspaceErrorCode, pub message: String, p
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceCapabilities { pub files: bool, pub git_read: bool, pub git_write: bool, pub shell: bool, pub directory_page_size: u16, pub directory_entry_limit: u16, pub git_history_page_size: u16, pub text_preview_limit: u32, pub image_preview_limit: u32, pub shell_limit: u8 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DirectoryEntry { pub name: String, pub path: String, pub is_directory: bool, pub size: u64 }
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
+    pub is_directory: bool,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_unix_seconds: Option<u64>,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryPage { pub path: String, pub entries: Vec<DirectoryEntry>, pub next_offset: Option<u16>, pub has_more: bool, pub capped: bool }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,7 +78,16 @@ pub enum ImageVariant { Thumbnail, Original }
 pub enum FilePreview {
     Text { path: String, language: String, content: String, truncated: bool },
     Image { path: String, mime: String, width: u32, height: u32, bytes: Vec<u8>, truncated: bool },
+    Archive { path: String, format: String, entries: Vec<ArchiveEntry>, has_more: bool },
     Binary { path: String, size: u64 }, TooLarge { path: String, size: u64, limit: u64 },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveEntry {
+    pub path: String,
+    pub is_directory: bool,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_unix_seconds: Option<u64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitSummary { pub branch: String, pub upstream: Option<String>, pub ahead: u32, pub behind: u32, pub staged_count: u32, pub unstaged_count: u32, pub untracked_count: u32, pub fingerprint: String }

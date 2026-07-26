@@ -22,7 +22,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use relaycat_cli::gui_bridge::{
-    GuiRelayStateEnvelope, GuiRelayStateSnapshot, decode_gui_relay_state_line,
+    GuiRelayStateEnvelope, GuiRelayStateSnapshot, GuiWorkspaceTerminalCommand,
+    GuiWorkspaceTerminalEvent, GuiWorkspaceTerminalMessage,
+    decode_gui_relay_state_line, decode_gui_workspace_terminal_line,
+    encode_gui_workspace_terminal_line,
 };
 use relaycat_cli::session::PtySession;
 use serde::Serialize;
@@ -122,6 +125,79 @@ struct LiveSession {
     alive: Arc<AtomicBool>,
     /// Latest authenticated state received from this relay child.
     relay_state: Option<Arc<Mutex<Option<GuiRelayStateSnapshot>>>>,
+    workspace_terminal: Option<Arc<Mutex<WorkspaceTerminalState>>>,
+}
+
+const WORKSPACE_TERMINAL_REPLAY_LIMIT: usize = 2 * 1024 * 1024;
+
+struct WorkspaceTerminalState {
+    token: String,
+    writer: Option<std::net::TcpStream>,
+    writer_generation: Option<u64>,
+    next_connection_generation: u64,
+    shell_id: Option<String>,
+    replay: Vec<u8>,
+    output_seq: u64,
+    exited: bool,
+    exit_code: Option<i32>,
+}
+
+impl WorkspaceTerminalState {
+    fn new(token: String) -> Self {
+        Self {
+            token,
+            writer: None,
+            writer_generation: None,
+            next_connection_generation: 1,
+            shell_id: None,
+            replay: Vec::new(),
+            output_seq: 0,
+            exited: false,
+            exit_code: None,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct WorkspaceTerminalSnapshot {
+    pub available: bool,
+    pub shell_id: Option<String>,
+    pub data: Vec<u8>,
+    pub last_output_seq: u64,
+    pub exited: bool,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Clone, Serialize)]
+struct WorkspaceTerminalEvent {
+    id: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shell_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<i32>,
+}
+
+pub struct WorkspaceTerminalBridge {
+    listener: TcpListener,
+    address: String,
+    token: String,
+}
+
+impl WorkspaceTerminalBridge {
+    pub fn bind(token: String) -> Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .context("failed to bind workspace terminal listener")?;
+        let address = listener
+            .local_addr()
+            .context("failed to read workspace terminal listener address")?
+            .to_string();
+        Ok(Self { listener, address, token })
+    }
 }
 
 /// GUI-owned state channel bound before the relay child starts. Binding first
@@ -160,6 +236,7 @@ pub struct RelayContext {
     /// file name and child-side diagnostics to this tab.
     pub gui_session_id: String,
     pub state_bridge: RelayStateBridge,
+    pub workspace_terminal_bridge: WorkspaceTerminalBridge,
 }
 
 #[derive(Default)]
@@ -282,6 +359,14 @@ impl SessionManager {
                     relaycat_cli::gui_bridge::GUI_RELAY_STATE_TOKEN_ENV,
                     context.state_bridge.token.clone(),
                 ),
+                (
+                    relaycat_cli::gui_bridge::GUI_WORKSPACE_TERMINAL_ADDR_ENV,
+                    context.workspace_terminal_bridge.address.clone(),
+                ),
+                (
+                    relaycat_cli::gui_bridge::GUI_WORKSPACE_TERMINAL_TOKEN_ENV,
+                    context.workspace_terminal_bridge.token.clone(),
+                ),
             ],
             None => Vec::new(),
         };
@@ -348,6 +433,14 @@ impl SessionManager {
                 relaycat_cli::gui_bridge::GUI_RELAY_STATE_TOKEN_ENV,
                 &relay.state_bridge.token,
             )
+            .env(
+                relaycat_cli::gui_bridge::GUI_WORKSPACE_TERMINAL_ADDR_ENV,
+                &relay.workspace_terminal_bridge.address,
+            )
+            .env(
+                relaycat_cli::gui_bridge::GUI_WORKSPACE_TERMINAL_TOKEN_ENV,
+                &relay.workspace_terminal_bridge.token,
+            )
             .env(crate::GUI_PARENT_PID_ENV, std::process::id().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -398,6 +491,13 @@ impl SessionManager {
         let relay_state = relay
             .as_ref()
             .map(|_| Arc::new(Mutex::new(Some(GuiRelayStateSnapshot::wait(0)))));
+        let workspace_terminal = relay
+            .as_ref()
+            .map(|relay| {
+                Arc::new(Mutex::new(WorkspaceTerminalState::new(
+                    relay.workspace_terminal_bridge.token.clone(),
+                )))
+            });
         let control_for_reader = control.clone();
         let alive_for_reader = alive.clone();
         let reader_app = app.clone();
@@ -454,6 +554,16 @@ impl SessionManager {
                     .clone(),
                 alive.clone(),
             );
+            spawn_workspace_terminal_listener(
+                app.clone(),
+                id.clone(),
+                relay.workspace_terminal_bridge,
+                workspace_terminal
+                    .as_ref()
+                    .expect("workspace terminal initialized")
+                    .clone(),
+                alive.clone(),
+            );
             spawn_pairing_url_poll(app, id.clone(), relay.pairing_url_path, alive.clone());
         }
 
@@ -464,6 +574,7 @@ impl SessionManager {
                 control,
                 alive,
                 relay_state,
+                workspace_terminal,
             },
         );
     }
@@ -498,6 +609,81 @@ impl SessionManager {
     pub fn relay_state(&self, id: &str) -> Option<GuiRelayStateSnapshot> {
         let state = self.sessions.lock().ok()?.get(id)?.relay_state.clone()?;
         state.lock().ok()?.clone()
+    }
+
+    pub fn workspace_terminal_attach(&self, id: &str) -> Result<WorkspaceTerminalSnapshot> {
+        self.send_workspace_terminal_command(id, GuiWorkspaceTerminalCommand::Attach)?;
+        self.workspace_terminal_snapshot(id)
+    }
+
+    pub fn workspace_terminal_detach(&self, id: &str) -> Result<()> {
+        self.send_workspace_terminal_command(id, GuiWorkspaceTerminalCommand::Detach)
+    }
+
+    pub fn workspace_terminal_write(&self, id: &str, bytes: Vec<u8>) -> Result<()> {
+        self.send_workspace_terminal_command(
+            id,
+            GuiWorkspaceTerminalCommand::Input { bytes },
+        )
+    }
+
+    pub fn workspace_terminal_resize(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
+        self.send_workspace_terminal_command(
+            id,
+            GuiWorkspaceTerminalCommand::Resize {
+                cols: cols.max(1),
+                rows: rows.max(1),
+            },
+        )
+    }
+
+    pub fn workspace_terminal_close(&self, id: &str) -> Result<()> {
+        self.send_workspace_terminal_command(id, GuiWorkspaceTerminalCommand::Close)
+    }
+
+    fn workspace_terminal_snapshot(&self, id: &str) -> Result<WorkspaceTerminalSnapshot> {
+        let state = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow!("session map poisoned"))?
+            .get(id)
+            .and_then(|session| session.workspace_terminal.clone())
+            .ok_or_else(|| anyhow!("session {id} has no workspace terminal bridge"))?;
+        let state = state
+            .lock()
+            .map_err(|_| anyhow!("workspace terminal state poisoned"))?;
+        Ok(WorkspaceTerminalSnapshot {
+            available: state.writer.is_some(),
+            shell_id: state.shell_id.clone(),
+            data: state.replay.clone(),
+            last_output_seq: state.output_seq,
+            exited: state.exited,
+            exit_code: state.exit_code,
+        })
+    }
+
+    fn send_workspace_terminal_command(
+        &self,
+        id: &str,
+        command: GuiWorkspaceTerminalCommand,
+    ) -> Result<()> {
+        let state = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow!("session map poisoned"))?
+            .get(id)
+            .and_then(|session| session.workspace_terminal.clone())
+            .ok_or_else(|| anyhow!("session {id} has no workspace terminal bridge"))?;
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("workspace terminal state poisoned"))?;
+        let token = state.token.clone();
+        let writer = state
+            .writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("workspace terminal bridge is not ready"))?;
+        let message = GuiWorkspaceTerminalMessage::Command(command);
+        write_workspace_terminal_command(writer, &token, &message)
     }
 }
 
@@ -591,6 +777,205 @@ fn configure_relay_state_stream(stream: &std::net::TcpStream) -> std::io::Result
     // idle `read_line` return WouldBlock immediately and spin at full CPU.
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_millis(250)))
+}
+
+fn spawn_workspace_terminal_listener(
+    app: AppHandle,
+    id: String,
+    bridge: WorkspaceTerminalBridge,
+    current: Arc<Mutex<WorkspaceTerminalState>>,
+    alive: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        if bridge.listener.set_nonblocking(true).is_err() {
+            return;
+        }
+        while alive.load(Ordering::Acquire) {
+            match bridge.listener.accept() {
+                Ok((stream, _)) => receive_workspace_terminal_connection(
+                    &app,
+                    &id,
+                    stream,
+                    &bridge.token,
+                    &current,
+                    &alive,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn receive_workspace_terminal_connection(
+    app: &AppHandle,
+    id: &str,
+    stream: std::net::TcpStream,
+    token: &str,
+    current: &Arc<Mutex<WorkspaceTerminalState>>,
+    alive: &Arc<AtomicBool>,
+) {
+    if configure_relay_state_stream(&stream).is_err() {
+        return;
+    }
+    let Ok(command_writer) = stream.try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::new(stream);
+    let connection_generation = match current.lock() {
+        Ok(mut state) => {
+            let generation = state.next_connection_generation;
+            state.next_connection_generation = state.next_connection_generation.saturating_add(1);
+            generation
+        }
+        Err(_) => return,
+    };
+    let mut line = String::new();
+    let mut authenticated = false;
+    while alive.load(Ordering::Acquire) {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if line.len() > 512 * 1024 {
+                    break;
+                }
+                let Ok(envelope) = decode_gui_workspace_terminal_line(&line) else {
+                    continue;
+                };
+                if envelope.token != token {
+                    break;
+                }
+                authenticated = true;
+                let GuiWorkspaceTerminalMessage::Event(event) = envelope.message else {
+                    continue;
+                };
+                apply_workspace_terminal_event(
+                    app,
+                    id,
+                    current,
+                    event,
+                    &command_writer,
+                    connection_generation,
+                );
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
+    if authenticated
+        && let Ok(mut state) = current.lock()
+    {
+        clear_workspace_terminal_writer(&mut state, connection_generation);
+    }
+}
+
+fn apply_workspace_terminal_event(
+    app: &AppHandle,
+    id: &str,
+    current: &Arc<Mutex<WorkspaceTerminalState>>,
+    event: GuiWorkspaceTerminalEvent,
+    command_writer: &std::net::TcpStream,
+    connection_generation: u64,
+) {
+    let mut emitted = None;
+    if let Ok(mut state) = current.lock() {
+        match event {
+            GuiWorkspaceTerminalEvent::Ready => {
+                state.writer = command_writer.try_clone().ok();
+                state.writer_generation = state.writer.as_ref().map(|_| connection_generation);
+                emitted = Some(WorkspaceTerminalEvent {
+                    id: id.to_string(),
+                    kind: "ready".to_string(),
+                    shell_id: state.shell_id.clone(),
+                    data: None,
+                    output_seq: None,
+                    code: None,
+                });
+            }
+            GuiWorkspaceTerminalEvent::Started { shell_id } => {
+                state.shell_id = Some(shell_id.clone());
+                state.replay.clear();
+                state.exited = false;
+                state.exit_code = None;
+                emitted = Some(WorkspaceTerminalEvent {
+                    id: id.to_string(),
+                    kind: "started".to_string(),
+                    shell_id: Some(shell_id),
+                    data: None,
+                    output_seq: None,
+                    code: None,
+                });
+            }
+            GuiWorkspaceTerminalEvent::Output { bytes } => {
+                let output_seq = record_workspace_terminal_output(&mut state, &bytes);
+                emitted = Some(WorkspaceTerminalEvent {
+                    id: id.to_string(),
+                    kind: "output".to_string(),
+                    shell_id: state.shell_id.clone(),
+                    data: Some(bytes),
+                    output_seq: Some(output_seq),
+                    code: None,
+                });
+            }
+            GuiWorkspaceTerminalEvent::Exit { code } => {
+                state.exited = true;
+                state.exit_code = code;
+                emitted = Some(WorkspaceTerminalEvent {
+                    id: id.to_string(),
+                    kind: "exit".to_string(),
+                    shell_id: state.shell_id.clone(),
+                    data: None,
+                    output_seq: None,
+                    code,
+                });
+            }
+            GuiWorkspaceTerminalEvent::Heartbeat => {}
+        }
+    }
+    if let Some(event) = emitted {
+        let _ = app.emit("session://workspace-terminal", event);
+    }
+}
+
+fn clear_workspace_terminal_writer(state: &mut WorkspaceTerminalState, generation: u64) {
+    if state.writer_generation == Some(generation) {
+        state.writer = None;
+        state.writer_generation = None;
+    }
+}
+
+fn record_workspace_terminal_output(state: &mut WorkspaceTerminalState, bytes: &[u8]) -> u64 {
+    state.output_seq = state.output_seq.saturating_add(1);
+    append_workspace_terminal_replay(&mut state.replay, bytes);
+    state.output_seq
+}
+
+fn append_workspace_terminal_replay(replay: &mut Vec<u8>, bytes: &[u8]) {
+    replay.extend_from_slice(bytes);
+    if replay.len() > WORKSPACE_TERMINAL_REPLAY_LIMIT {
+        let excess = replay.len() - WORKSPACE_TERMINAL_REPLAY_LIMIT;
+        replay.drain(..excess);
+    }
+}
+
+fn write_workspace_terminal_command(
+    writer: &mut std::net::TcpStream,
+    token: &str,
+    message: &GuiWorkspaceTerminalMessage,
+) -> Result<()> {
+    let line = encode_gui_workspace_terminal_line(token, message)
+        .context("failed to encode workspace terminal command")?;
+    writer
+        .write_all(line.as_bytes())
+        .context("failed to write workspace terminal command")?;
+    writer.flush().context("failed to flush workspace terminal command")
 }
 
 fn accept_relay_snapshot(
@@ -811,5 +1196,27 @@ mod tests {
             "secret-token",
         ));
         assert_eq!(current, Some(initial));
+    }
+
+    #[test]
+    fn workspace_terminal_output_sequences_snapshot_and_live_events() {
+        let mut state = WorkspaceTerminalState::new("secret-token".to_string());
+
+        assert_eq!(record_workspace_terminal_output(&mut state, b"first"), 1);
+        assert_eq!(record_workspace_terminal_output(&mut state, b"second"), 2);
+        assert_eq!(state.output_seq, 2);
+        assert_eq!(state.replay, b"firstsecond");
+    }
+
+    #[test]
+    fn stale_workspace_terminal_connection_cannot_clear_current_writer() {
+        let mut state = WorkspaceTerminalState::new("secret-token".to_string());
+        state.writer_generation = Some(2);
+
+        clear_workspace_terminal_writer(&mut state, 1);
+        assert_eq!(state.writer_generation, Some(2));
+
+        clear_workspace_terminal_writer(&mut state, 2);
+        assert_eq!(state.writer_generation, None);
     }
 }

@@ -331,6 +331,7 @@ function confirmDialog(opts: {
   message: string;
   okLabel?: string;
   danger?: boolean;
+  hideCancel?: boolean;
 }): Promise<boolean> {
   return new Promise((resolve) => {
     const ov = $("#ov-confirm");
@@ -340,6 +341,7 @@ function confirmDialog(opts: {
     const cancelBtn = $("#confirm-cancel") as HTMLButtonElement;
     okBtn.textContent = opts.okLabel ?? t("confirm_ok");
     cancelBtn.textContent = t("cancel");
+    cancelBtn.hidden = !!opts.hideCancel;
     okBtn.className = `btn ${opts.danger ? "danger" : "primary"}`;
 
     const onBackdrop = (ev: MouseEvent) => {
@@ -359,6 +361,7 @@ function confirmDialog(opts: {
       ov.classList.remove("show");
       okBtn.onclick = null;
       cancelBtn.onclick = null;
+      cancelBtn.hidden = false;
       ov.removeEventListener("click", onBackdrop);
       window.removeEventListener("keydown", onKey, true);
       resolve(val);
@@ -1486,6 +1489,7 @@ async function closeTab(id: string, force = false) {
     idx = tabs.findIndex((t) => t.id === id);
     if (idx < 0) return;
   }
+  await embeddedShellPanel?.closeForSession(id);
   tabs.splice(idx, 1);
   if (tab.id && !tab.id.startsWith("failed-"))
     invoke("close_session", { id: tab.id }).catch(() => {});
@@ -3010,6 +3014,10 @@ async function init() {
       allowProposedApi: true,
     }),
     currentProject: () => tabs.find((tab) => tab.id === activeId)?.project.trim() || null,
+    currentSession: () => {
+      const tab = tabs.find((item) => item.id === activeId);
+      return tab ? { id: tab.id, mode: tab.mode, project: tab.project } : null;
+    },
     focusMainTerminal: () => tabs.find((tab) => tab.id === activeId)?.term.focus(),
     afterLayoutChange: refitVisibleTerminals,
     confirm: (message) =>
@@ -3019,6 +3027,14 @@ async function init() {
         okLabel: t("close"),
         danger: true,
       }),
+    notice: async (message) => {
+      await confirmDialog({
+        title: t("term_tool_shell"),
+        message,
+        okLabel: t("confirm_ok"),
+        hideCancel: true,
+      });
+    },
     onRequestClose: () => workspacePanel?.close(),
   });
   wireUi();

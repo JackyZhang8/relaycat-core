@@ -12,6 +12,8 @@ pub struct WorkspaceEntryDto {
     pub name: String,
     pub relative_path: String,
     pub is_dir: bool,
+    pub size_bytes: u64,
+    pub modified_unix_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -31,6 +33,8 @@ impl From<DirectoryPage> for WorkspaceEntriesPageDto {
                     name: entry.name,
                     relative_path: entry.path,
                     is_dir: entry.is_directory,
+                    size_bytes: entry.size,
+                    modified_unix_seconds: entry.modified_unix_seconds,
                 })
                 .collect(),
             has_more: page.has_more,
@@ -44,6 +48,7 @@ impl From<DirectoryPage> for WorkspaceEntriesPageDto {
 pub enum PreviewKind {
     Text,
     Image,
+    Archive,
     Binary,
     TooLarge,
 }
@@ -151,7 +156,11 @@ fn read_workspace_file_impl(
     let preview = FileService::new(ProjectRoot::open(project).map_err(|error| error.to_string())?)
         .read(relative_path, requested as u32, ImageVariant::Original)
         .map_err(|error| error.to_string())?;
-    Ok(match preview {
+    Ok(file_preview_dto(preview))
+}
+
+fn file_preview_dto(preview: FilePreview) -> FilePreviewDto {
+    match preview {
         FilePreview::Text { content, .. } => FilePreviewDto {
             size_bytes: content.len() as u64,
             kind: PreviewKind::Text,
@@ -164,6 +173,33 @@ fn read_workspace_file_impl(
             content: format!("data:{mime};base64,{}", STANDARD.encode(bytes)),
             mime_type: Some(mime),
         },
+        FilePreview::Archive {
+            format,
+            entries,
+            has_more,
+            ..
+        } => {
+            let mut lines = entries
+                .into_iter()
+                .map(|entry| {
+                    let metadata = if entry.is_directory {
+                        "DIR".to_string()
+                    } else {
+                        format!("{} B", entry.size)
+                    };
+                    format!("{metadata}\t{}", entry.path)
+                })
+                .collect::<Vec<_>>();
+            if has_more {
+                lines.push("… Showing the first 50 items".into());
+            }
+            FilePreviewDto {
+                kind: PreviewKind::Archive,
+                content: lines.join("\n"),
+                mime_type: Some(format),
+                size_bytes: 0,
+            }
+        }
         FilePreview::Binary { size, .. } => FilePreviewDto {
             kind: PreviewKind::Binary,
             content: String::new(),
@@ -176,7 +212,7 @@ fn read_workspace_file_impl(
             mime_type: None,
             size_bytes: size,
         },
-    })
+    }
 }
 
 fn parse_porcelain_v1_z(raw: &[u8]) -> Result<Vec<GitChangeDto>, String> {
@@ -657,6 +693,39 @@ mod tests {
         assert_eq!(image.kind, PreviewKind::Image);
         assert_eq!(image.mime_type.as_deref(), Some("image/png"));
         assert!(image.content.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn converts_archive_preview_to_read_only_text_listing() {
+        let preview = FilePreview::Archive {
+            path: "bundle.zip".into(),
+            format: "zip".into(),
+            entries: vec![
+                relaycat_protocol::ArchiveEntry {
+                    path: "src/".into(),
+                    is_directory: true,
+                    size: 0,
+                    modified_unix_seconds: None,
+                },
+                relaycat_protocol::ArchiveEntry {
+                    path: "src/main.rs".into(),
+                    is_directory: false,
+                    size: 42,
+                    modified_unix_seconds: Some(1_700_000_000),
+                },
+            ],
+            has_more: true,
+        };
+
+        let dto = file_preview_dto(preview);
+
+        assert_eq!(dto.kind, PreviewKind::Archive);
+        assert_eq!(dto.mime_type.as_deref(), Some("zip"));
+        assert_eq!(dto.size_bytes, 0);
+        assert_eq!(
+            dto.content,
+            "DIR\tsrc/\n42 B\tsrc/main.rs\n… Showing the first 50 items"
+        );
     }
 
     #[test]

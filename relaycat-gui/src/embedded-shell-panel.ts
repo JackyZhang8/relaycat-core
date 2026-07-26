@@ -4,13 +4,24 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal, type ITheme } from "@xterm/xterm";
 
-import { embeddedShellAction } from "./embedded-shell-model";
+import {
+  MAX_EMBEDDED_SHELLS_PER_SESSION,
+  embeddedShellCreateKind,
+  nextLocalShellNumber,
+} from "./embedded-shell-model";
 import { tabScrollState } from "./tab-scroll";
+
+interface ActiveRelaySession {
+  id: string;
+  mode: string;
+  project: string;
+}
 
 interface SessionInfo {
   id: string;
   title: string;
   mode: string;
+  log_path: string | null;
 }
 
 interface OutputEvent {
@@ -24,13 +35,36 @@ interface StatusEvent {
   code?: number;
 }
 
+interface WorkspaceTerminalSnapshot {
+  available: boolean;
+  shell_id?: string;
+  data: number[];
+  last_output_seq: number;
+  exited: boolean;
+  exit_code?: number;
+}
+
+interface WorkspaceTerminalEvent {
+  id: string;
+  kind: "ready" | "started" | "output" | "exit";
+  shell_id?: string;
+  data?: number[];
+  output_seq?: number;
+  code?: number;
+}
+
 interface EmbeddedShellTab {
   id: string;
+  ownerSessionId: string;
+  kind: "shared" | "local";
+  number: number;
   project: string;
   title: string;
   state: "launching" | "running" | "exited";
   ready: Promise<void>;
   closing: boolean;
+  snapshotApplied: boolean;
+  pendingOutput: Array<{ output_seq: number; data: number[] }>;
   term: Terminal;
   fit: FitAddon;
   pane: HTMLDivElement;
@@ -41,22 +75,24 @@ interface EmbeddedShellPanelOptions {
   translate: (key: string, ...args: (string | number)[]) => string;
   terminalOptions: () => ConstructorParameters<typeof Terminal>[0];
   currentProject: () => string | null;
+  currentSession: () => ActiveRelaySession | null;
   focusMainTerminal: () => void;
   afterLayoutChange: () => void;
   confirm: (message: string) => Promise<boolean>;
+  notice: (message: string) => Promise<void>;
   onRequestClose: () => void;
 }
 
 export interface EmbeddedShellPanelController {
   activateForProject(project: string | null): Promise<void>;
   createForProject(project: string | null): Promise<void>;
+  closeForSession(sessionId: string): Promise<void>;
   setVisible(visible: boolean): void;
   refit(): void;
   runningCount(): number;
   updateAppearance(theme: ITheme, fontSize: number): void;
 }
 
-const MAX_EMBEDDED_SHELLS = 8;
 export function createEmbeddedShellPanel(
   options: EmbeddedShellPanelOptions,
 ): EmbeddedShellPanelController {
@@ -67,28 +103,48 @@ export function createEmbeddedShellPanel(
   const scrollLeftBtn = document.querySelector("#embedded-shell-scroll-left") as HTMLButtonElement;
   const scrollRightBtn = document.querySelector("#embedded-shell-scroll-right") as HTMLButtonElement;
   const addBtn = document.querySelector("#embedded-shell-add") as HTMLButtonElement;
-  const closeAllBtn = document.querySelector("#embedded-shell-close-all") as HTMLButtonElement;
 
   const shells: EmbeddedShellTab[] = [];
-  let activeShellId: string | null = null;
+  const activeShellByOwner = new Map<string, string>();
+  let activeOwnerSessionId: string | null = null;
+  let localSequence = 0;
   let opened = false;
 
   function shellById(id: string | null) {
     return shells.find((shell) => shell.id === id);
   }
 
+  function shellsForOwner(ownerSessionId: string) {
+    return shells
+      .filter((shell) => shell.ownerSessionId === ownerSessionId)
+      .sort((left, right) => left.number - right.number);
+  }
+
+  function activeShell() {
+    if (!activeOwnerSessionId) return undefined;
+    return shellById(activeShellByOwner.get(activeOwnerSessionId) ?? null);
+  }
+
   function sendResize(shell: EmbeddedShellTab) {
     if (shell.state === "exited") return;
-    void invoke("resize_session", {
-      id: shell.id,
-      rows: shell.term.rows,
-      cols: shell.term.cols,
-    }).catch(() => {});
+    if (shell.kind === "shared") {
+      void invoke("resize_workspace_terminal", {
+        id: shell.id,
+        rows: shell.term.rows,
+        cols: shell.term.cols,
+      }).catch(() => {});
+    } else {
+      void invoke("resize_session", {
+        id: shell.id,
+        rows: shell.term.rows,
+        cols: shell.term.cols,
+      }).catch(() => {});
+    }
   }
 
   function refit() {
     if (!opened) return;
-    const shell = shellById(activeShellId);
+    const shell = activeShell();
     if (!shell) return;
     shell.fit.fit();
     sendResize(shell);
@@ -107,10 +163,17 @@ export function createEmbeddedShellPanel(
   }
 
   function renderTabs() {
+    const activeId = activeOwnerSessionId
+      ? activeShellByOwner.get(activeOwnerSessionId) ?? null
+      : null;
     for (const shell of shells) {
-      shell.tabEl.classList.toggle("active", shell.id === activeShellId);
+      const visible = shell.ownerSessionId === activeOwnerSessionId;
+      shell.tabEl.hidden = !visible;
+      shell.tabEl.classList.toggle("active", visible && shell.id === activeId);
       shell.tabEl.classList.toggle("exited", shell.state === "exited");
+      shell.pane.classList.toggle("active", visible && shell.id === activeId);
     }
+    addBtn.disabled = !activeOwnerSessionId;
     requestAnimationFrame(updateShellTabScrollControls);
   }
 
@@ -131,16 +194,32 @@ export function createEmbeddedShellPanel(
 
   function selectShell(id: string) {
     const selected = shellById(id);
-    if (!selected) return;
-    activeShellId = id;
-    for (const shell of shells) shell.pane.classList.toggle("active", shell.id === id);
+    if (!selected || selected.ownerSessionId !== activeOwnerSessionId) return;
+    activeShellByOwner.set(selected.ownerSessionId, id);
     renderTabs();
     requestAnimationFrame(() => {
-      if (shellById(id) !== selected || activeShellId !== id) return;
+      if (!opened) return;
+      if (
+        shellById(id) !== selected ||
+        activeShellByOwner.get(selected.ownerSessionId) !== id ||
+        activeOwnerSessionId !== selected.ownerSessionId
+      ) return;
       selected.tabEl.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
       refit();
       selected.term.focus();
     });
+  }
+
+  function setActiveOwner(sessionId: string) {
+    activeOwnerSessionId = sessionId;
+    const owned = shellsForOwner(sessionId);
+    const remembered = shellById(activeShellByOwner.get(sessionId) ?? null);
+    if (!remembered || remembered.ownerSessionId !== sessionId) {
+      const fallback = owned[0];
+      if (fallback) activeShellByOwner.set(sessionId, fallback.id);
+      else activeShellByOwner.delete(sessionId);
+    }
+    renderTabs();
   }
 
   function setVisible(visible: boolean) {
@@ -148,11 +227,8 @@ export function createEmbeddedShellPanel(
     opened = visible;
     panel.setAttribute("aria-hidden", String(!visible));
     options.afterLayoutChange();
-    if (visible) {
-      requestAnimationFrame(refit);
-    } else {
-      options.focusMainTerminal();
-    }
+    if (visible) requestAnimationFrame(refit);
+    else options.focusMainTerminal();
   }
 
   function finalizeShellRemoval(id: string, selectNext: boolean) {
@@ -162,22 +238,32 @@ export function createEmbeddedShellPanel(
     shell.term.dispose();
     shell.pane.remove();
     shell.tabEl.remove();
-    requestAnimationFrame(updateShellTabScrollControls);
-    if (activeShellId === id) {
-      activeShellId = null;
-      if (!selectNext) return;
-      const next = shells[index] || shells[index - 1];
-      if (next) selectShell(next.id);
-      else options.onRequestClose();
+
+    if (activeShellByOwner.get(shell.ownerSessionId) === id) {
+      activeShellByOwner.delete(shell.ownerSessionId);
+      if (selectNext) {
+        const next = shellsForOwner(shell.ownerSessionId)[0];
+        if (next) activeShellByOwner.set(shell.ownerSessionId, next.id);
+        else if (activeOwnerSessionId === shell.ownerSessionId) options.onRequestClose();
+      }
     }
+    renderTabs();
+    const nextId = activeOwnerSessionId
+      ? activeShellByOwner.get(activeOwnerSessionId) ?? null
+      : null;
+    if (selectNext && nextId) selectShell(nextId);
   }
 
-  async function closeShell(id: string, selectNext = true) {
+  async function closeShell(id: string, selectNext = true, terminate = false) {
     const shell = shellById(id);
     if (!shell || shell.closing) return;
     shell.closing = true;
     await shell.ready;
-    if (shell.state === "running") {
+    if (shell.kind === "shared") {
+      await invoke(terminate ? "close_workspace_terminal" : "detach_workspace_terminal", {
+        id: shell.id,
+      }).catch(() => {});
+    } else {
       await invoke("close_session", { id: shell.id }).catch(() => {});
     }
     finalizeShellRemoval(id, selectNext);
@@ -186,30 +272,25 @@ export function createEmbeddedShellPanel(
   async function requestCloseShell(id: string) {
     const shell = shellById(id);
     if (!shell) return;
-    const confirmed = await options.confirm(t("embedded_shell_close_confirm", shell.title));
-    if (confirmed) await closeShell(id);
-  }
-
-  async function requestCloseAllShells() {
-    if (shells.length === 0) return;
-    const ids = shells.map((shell) => shell.id);
-    const confirmed = await options.confirm(t("embedded_shell_close_all_confirm", ids.length));
-    if (!confirmed) return;
-    await Promise.all(ids.map((id) => closeShell(id, false)));
-    activeShellId = null;
-    const remaining = shells[0];
-    if (remaining) selectShell(remaining.id);
-    else options.onRequestClose();
-  }
-
-  async function createForProject(project: string | null) {
-    const normalized = project?.trim();
-    if (!normalized) return;
-    if (shells.length >= MAX_EMBEDDED_SHELLS) {
-      shellById(activeShellId)?.term.writeln(`\r\n\x1b[33m${t("embedded_shell_limit")}\x1b[0m`);
+    if (shell.kind === "shared") {
+      const confirmed = await options.confirm(t("embedded_shell_close_confirm", shell.title));
+      if (!confirmed) return;
+      await closeShell(id, true, true);
       return;
     }
-    const id = `embedded-shell-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    const confirmed = shell.state === "exited" || await options.confirm(
+      t("embedded_shell_close_local_confirm", shell.title),
+    );
+    if (confirmed) await closeShell(id, true, true);
+  }
+
+  function createShellTab(
+    session: ActiveRelaySession,
+    project: string,
+    id: string,
+    kind: "shared" | "local",
+    number: number,
+  ): EmbeddedShellTab {
     const term = new Terminal(options.terminalOptions());
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -219,27 +300,35 @@ export function createEmbeddedShellPanel(
     terminalsEl.appendChild(pane);
     term.open(pane);
 
-    const basename = normalized.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || normalized;
-    const number = shells.filter((shell) => shell.project === normalized).length + 1;
-    const title = number === 1 ? basename : `${basename} ${number}`;
+    const title = `Shell ${number}`;
     const tabEl = document.createElement("button");
     tabEl.type = "button";
     tabEl.className = "embedded-shell-tab";
     const label = document.createElement("span");
     label.textContent = title;
+    const badge = document.createElement("span");
+    badge.className = `embedded-shell-tab-kind ${kind}`;
+    badge.textContent = t(
+      kind === "shared" ? "embedded_shell_shared_badge" : "embedded_shell_local_badge",
+    );
     const close = document.createElement("span");
     close.className = "embedded-shell-tab-close";
     close.textContent = "×";
-    tabEl.append(label, close);
+    tabEl.append(label, badge, close);
     tabsEl.appendChild(tabEl);
 
     const shell: EmbeddedShellTab = {
       id,
-      project: normalized,
+      ownerSessionId: session.id,
+      kind,
+      number,
+      project,
       title,
       state: "launching",
       ready: Promise.resolve(),
       closing: false,
+      snapshotApplied: kind === "local",
+      pendingOutput: [],
       term,
       fit,
       pane,
@@ -251,34 +340,67 @@ export function createEmbeddedShellPanel(
       event.stopPropagation();
       void requestCloseShell(id);
     };
-    term.onData((data) => {
+    return shell;
+  }
+
+  async function createForProject(project: string | null) {
+    const session = options.currentSession();
+    const normalized = session?.project.trim() || project?.trim();
+    if (!session || session.mode !== "relay" || !normalized) return;
+    setActiveOwner(session.id);
+    const existing = shells.find(
+      (shell) => shell.ownerSessionId === session.id && shell.kind === "shared",
+    );
+    if (existing) {
+      selectShell(activeShellByOwner.get(session.id) ?? existing.id);
+      return;
+    }
+    if (shellsForOwner(session.id).length >= MAX_EMBEDDED_SHELLS_PER_SESSION) return;
+
+    const id = session.id;
+    const shell = createShellTab(session, normalized, id, "shared", 1);
+    shell.term.onData((data) => {
       if (shell.state === "running") {
-        void invoke("write_session", { id, data }).catch(() => {});
+        void invoke("write_workspace_terminal", {
+          id: shell.id,
+          data: Array.from(new TextEncoder().encode(data)),
+        }).catch(() => {});
       }
     });
+    activeShellByOwner.set(session.id, id);
     selectShell(id);
 
     shell.ready = (async () => {
       try {
-        fit.fit();
-        await invoke<SessionInfo>("create_session", {
-          opts: {
-            id,
-            tool: "shell",
-            project: normalized,
-            relay: null,
-            rows: term.rows,
-            cols: term.cols,
-          },
-        });
-        if (shell.state !== "exited") shell.state = "running";
-        if (shell.closing || shell.state === "exited") return;
+        shell.fit.fit();
+        let snapshot: WorkspaceTerminalSnapshot | null = null;
+        for (let attempt = 0; attempt < 20 && !snapshot; attempt += 1) {
+          snapshot = await invoke<WorkspaceTerminalSnapshot>("attach_workspace_terminal", { id })
+            .catch(() => null);
+          if (!snapshot) await new Promise((resolve) => window.setTimeout(resolve, 100));
+        }
+        if (!snapshot) throw new Error(t("embedded_shell_bridge_unavailable"));
+        if (shell.closing || shellById(id) !== shell) return;
+        if (snapshot.data.length > 0) shell.term.write(new Uint8Array(snapshot.data));
+        shell.snapshotApplied = true;
+        for (const pending of shell.pendingOutput) {
+          if (pending.output_seq > snapshot.last_output_seq) {
+            shell.term.write(new Uint8Array(pending.data));
+          }
+        }
+        shell.pendingOutput = [];
+        if (snapshot.exited) {
+          shell.state = "exited";
+          renderTabs();
+          return;
+        }
+        shell.state = "running";
         sendResize(shell);
-        if (activeShellId === id) term.focus();
+        if (activeShell() === shell) shell.term.focus();
       } catch (error) {
         shell.state = "exited";
         if (!shell.closing && shellById(id) === shell) {
-          term.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`);
+          shell.term.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`);
           renderTabs();
         }
       }
@@ -286,30 +408,144 @@ export function createEmbeddedShellPanel(
     await shell.ready;
   }
 
-  async function activateForProject(project: string | null) {
-    const action = embeddedShellAction(project, shells);
-    if (action.kind === "disabled") return;
-    setVisible(true);
-    if (action.kind === "select") {
-      selectShell(action.id);
+  async function createLocalForProject(project: string | null) {
+    const session = options.currentSession();
+    const normalized = session?.project.trim() || project?.trim();
+    if (!session || session.mode !== "relay" || !normalized) return;
+    setActiveOwner(session.id);
+    const number = nextLocalShellNumber(session.id, shells);
+    if (number === null) {
+      await options.notice(t("embedded_shell_limit"));
       return;
     }
-    await createForProject(action.project);
+
+    const id = `workspace-local:${session.id}:${number}:${++localSequence}`;
+    const shell = createShellTab(session, normalized, id, "local", number);
+    shell.term.onData((data) => {
+      if (shell.state === "running") {
+        void invoke("write_session", { id: shell.id, data }).catch(() => {});
+      }
+    });
+    activeShellByOwner.set(session.id, id);
+    selectShell(id);
+
+    shell.ready = (async () => {
+      try {
+        shell.fit.fit();
+        await invoke<SessionInfo>("create_session", {
+          opts: {
+            id: shell.id,
+            tool: "shell",
+            project: normalized,
+            relay: null,
+            rows: shell.term.rows,
+            cols: shell.term.cols,
+          },
+        });
+        if (shell.closing || shellById(id) !== shell) return;
+        shell.state = "running";
+        sendResize(shell);
+        if (activeShell() === shell) shell.term.focus();
+      } catch (error) {
+        shell.state = "exited";
+        if (!shell.closing && shellById(id) === shell) {
+          shell.term.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`);
+          renderTabs();
+        }
+      }
+    })();
+    await shell.ready;
   }
 
-  addBtn.onclick = () => void createForProject(options.currentProject());
-  closeAllBtn.onclick = () => void requestCloseAllShells();
+  async function createNextForProject(project: string | null) {
+    const session = options.currentSession();
+    if (!session || session.mode !== "relay") return;
+    switch (embeddedShellCreateKind(session.id, shells)) {
+      case "shared":
+        await createForProject(project);
+        return;
+      case "local":
+        await createLocalForProject(project);
+        return;
+      case "limit":
+        await options.notice(t("embedded_shell_limit"));
+    }
+  }
+
+  async function activateForProject(project: string | null) {
+    const session = options.currentSession();
+    if (!session || session.mode !== "relay") return;
+    setActiveOwner(session.id);
+    setVisible(true);
+    const shared = shells.find(
+      (shell) => shell.ownerSessionId === session.id && shell.kind === "shared",
+    );
+    if (shared) {
+      selectShell(activeShellByOwner.get(session.id) ?? shared.id);
+      return;
+    }
+    await createForProject(project);
+  }
+
+  async function closeForSession(sessionId: string): Promise<void> {
+    const owned = shellsForOwner(sessionId);
+    await Promise.all(owned.map((shell) => closeShell(shell.id, false, false)));
+    activeShellByOwner.delete(sessionId);
+    if (activeOwnerSessionId === sessionId) activeOwnerSessionId = null;
+    renderTabs();
+  }
+
+  addBtn.onclick = () => void createNextForProject(options.currentProject());
   scrollLeftBtn.onclick = () => scrollShellTabs(-1);
   scrollRightBtn.onclick = () => scrollShellTabs(1);
   tabsEl.addEventListener("scroll", updateShellTabScrollControls, { passive: true });
 
   new ResizeObserver(refit).observe(terminalsEl);
   new ResizeObserver(updateShellTabScrollControls).observe(tabsEl);
-  void listen<OutputEvent>("session://output", (event) => {
-    shellById(event.payload.id)?.term.write(new Uint8Array(event.payload.data));
+
+  void listen<WorkspaceTerminalEvent>("session://workspace-terminal", (event) => {
+    const shell = shells.find(
+      (candidate) => candidate.kind === "shared" && candidate.id === event.payload.id,
+    );
+    if (!shell) {
+      if (event.payload.kind !== "started") return;
+      const session = options.currentSession();
+      if (!session || session.mode !== "relay" || session.id !== event.payload.id) return;
+      void createForProject(session.project);
+      return;
+    }
+    if (event.payload.kind === "output" && event.payload.data) {
+      const output_seq = event.payload.output_seq ?? 0;
+      if (!shell.snapshotApplied) {
+        shell.pendingOutput.push({ output_seq, data: event.payload.data });
+        return;
+      }
+      shell.term.write(new Uint8Array(event.payload.data));
+      return;
+    }
+    if (event.payload.kind === "started") {
+      shell.state = "running";
+      renderTabs();
+      return;
+    }
+    if (event.payload.kind === "exit") {
+      if (shell.closing) return;
+      finalizeShellRemoval(shell.id, true);
+      void options.notice(t("embedded_shell_closed_in_app"));
+    }
   }).catch(() => {});
+
+  void listen<OutputEvent>("session://output", (event) => {
+    const shell = shells.find(
+      (candidate) => candidate.kind === "local" && candidate.id === event.payload.id,
+    );
+    if (shell) shell.term.write(new Uint8Array(event.payload.data));
+  }).catch(() => {});
+
   void listen<StatusEvent>("session://status", (event) => {
-    const shell = shellById(event.payload.id);
+    const shell = shells.find(
+      (candidate) => candidate.kind === "local" && candidate.id === event.payload.id,
+    );
     if (!shell || event.payload.state !== "exited") return;
     shell.state = "exited";
     if (!shell.closing) {
@@ -323,6 +559,7 @@ export function createEmbeddedShellPanel(
   return {
     activateForProject,
     createForProject,
+    closeForSession,
     setVisible,
     refit,
     runningCount,

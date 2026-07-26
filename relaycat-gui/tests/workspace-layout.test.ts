@@ -49,6 +49,22 @@ test("the Git changes toolbar omits low-frequency branch management buttons", ()
   assert.doesNotMatch(html, /id="workspace-delete-branch"/);
 });
 
+test("Git commit form collapses behind a bottom-right launcher", () => {
+  assert.match(html, /id="workspace-commit-launcher"[^>]*hidden/);
+  assert.match(html, /id="workspace-commit-box"[^>]*hidden/);
+  assert.match(html, /id="workspace-commit-close"/);
+  assert.match(css, /#workspace-git-view:not\(\[hidden\]\)\s*{[^}]*position:\s*relative;[^}]*overflow:\s*hidden;/s);
+  assert.match(css, /\.ws-git-list\s*{[^}]*overflow:\s*auto;/s);
+  assert.match(css, /\.ws-commit-launcher\s*{[^}]*position:\s*absolute;[^}]*right:[^;]+;[^}]*bottom:[^;]+;[^}]*border-radius:\s*50%;/s);
+  assert.match(workspacePanel, /workspaceCommitPresentation\(stagedCount,\s*commitExpanded\)/);
+});
+
+test("file rows reserve a compact metadata column", () => {
+  assert.match(css, /\.ws-tree-meta\s*{[^}]*white-space:\s*nowrap;/s);
+  assert.match(workspacePanel, /formatWorkspaceEntrySize\(entry\.size_bytes,\s*entry\.is_dir\)/);
+  assert.match(workspacePanel, /formatWorkspaceModifiedTime\(entry\.modified_unix_seconds/);
+});
+
 test("file previews own their horizontal and vertical scrolling", () => {
   assert.match(
     css,

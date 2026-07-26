@@ -71,6 +71,8 @@ pub enum ProtocolCapabilityV2 {
     IncrementalAttrs,
     /// Project-scoped file, Git and auxiliary shell RPC.
     WorkspaceRpc,
+    /// Named auxiliary terminal streams using the Terminal V2 semantic model.
+    TerminalStreams,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,6 +502,37 @@ pub struct ResizeAckV2 {
     pub resize_seq: u64,
 }
 
+/// A named auxiliary terminal stream carried over the same secure connection
+/// as the primary terminal. Keeping the stream identifier outside the nested
+/// terminal message preserves the existing primary-terminal wire format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalStreamV2 {
+    pub stream_id: String,
+    pub message: TerminalStreamMessageV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalStreamMessageV2 {
+    Snapshot(TerminalSnapshotV2),
+    Patch(TerminalPatchV2),
+    RenderAck(RenderAckV2),
+    RequestSnapshot(RequestSnapshotV2),
+    Resume(ResumeV2),
+    ResumeAccepted(ResumeAcceptedV2),
+    Input {
+        input_stream_id: String,
+        input_seq: u64,
+        bytes: Vec<u8>,
+    },
+    InputAck(InputAckV2),
+    Resize(ResizeEventV2),
+    ResizeAck(ResizeAckV2),
+    Exit {
+        code: Option<i32>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliMetadata {
     pub project_path: String,
@@ -744,6 +777,7 @@ pub enum PlainMsg {
     InputAckV2(InputAckV2),
     ResizeEventV2(ResizeEventV2),
     ResizeAckV2(ResizeAckV2),
+    TerminalStreamV2(TerminalStreamV2),
     Heartbeat,
     CliStatus(CliStatus),
     CliMetadata(CliMetadata),
@@ -1031,6 +1065,7 @@ pub fn plain_msg_type(msg: &PlainMsg) -> &'static [u8] {
         PlainMsg::InputAckV2(_) => b"input_ack_v2",
         PlainMsg::ResizeEventV2(_) => b"resize_event_v2",
         PlainMsg::ResizeAckV2(_) => b"resize_ack_v2",
+        PlainMsg::TerminalStreamV2(_) => b"terminal_stream_v2",
         PlainMsg::Heartbeat => b"heartbeat",
         PlainMsg::CliStatus(_) => b"cli_status",
         PlainMsg::CliMetadata(_) => b"cli_metadata",
@@ -1056,6 +1091,7 @@ pub fn plain_msg_types() -> &'static [&'static [u8]] {
         b"terminal_snapshot_v2",
         b"resize_event_v2",
         b"resize_ack_v2",
+        b"terminal_stream_v2",
         b"request_snapshot_v2",
         b"request_transcript_v2",
         b"transcript_chunk_v2",

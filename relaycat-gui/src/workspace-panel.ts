@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
+import { renderSafeMarkdown } from "./markdown-preview";
+
 import {
   canCommit,
   buildSelectedLinesPatch,
@@ -16,10 +18,16 @@ import {
   gitHistoryPage,
   gitStatusFingerprint,
   historyNearBottom,
+  canRenderMarkdown,
+  formatWorkspaceEntrySize,
+  formatWorkspaceModifiedTime,
+  isMarkdownPreviewPath,
   previewLanguage,
   projectBasename,
   storedWorkspacePanelWidth,
+  tokenizeDiffLine,
   tokenizePreviewLine,
+  workspaceCommitPresentation,
   workspacePanelWidth,
   workspaceEntryDecoration,
   workspacePreviewStartsCollapsed,
@@ -99,6 +107,9 @@ export function createWorkspacePanel(
   const stageAllBtn = document.querySelector("#workspace-stage-all") as HTMLButtonElement;
   const unstageAllBtn = document.querySelector("#workspace-unstage-all") as HTMLButtonElement;
   const commitMessage = document.querySelector("#workspace-commit-message") as HTMLTextAreaElement;
+  const commitLauncher = document.querySelector("#workspace-commit-launcher") as HTMLButtonElement;
+  const commitBox = document.querySelector("#workspace-commit-box") as HTMLElement;
+  const commitClose = document.querySelector("#workspace-commit-close") as HTMLButtonElement;
   const amendInput = document.querySelector("#workspace-amend") as HTMLInputElement;
   const commitBtn = document.querySelector("#workspace-commit") as HTMLButtonElement;
   const commitPushBtn = document.querySelector("#workspace-commit-push") as HTMLButtonElement;
@@ -113,6 +124,7 @@ export function createWorkspacePanel(
   const previewActions = document.querySelector("#workspace-preview-actions") as HTMLElement;
   const previewNotice = document.querySelector("#workspace-preview-notice") as HTMLElement;
   const previewImage = document.querySelector("#workspace-preview-image") as HTMLImageElement;
+  const markdownPreview = document.querySelector("#workspace-markdown-preview") as HTMLElement;
   const previewCode = document.querySelector("#workspace-preview-code") as HTMLElement;
 
   let project: string | null = null;
@@ -133,6 +145,7 @@ export function createWorkspacePanel(
   let historyRequestSequence = 0;
   let appliedHistoryFilters = historyFilterArgs("", "", "");
   let stagedCount = 0;
+  let commitExpanded = false;
   let repositoryAhead = 0;
   let repositoryBehind = 0;
   let gitOperationRunning = false;
@@ -140,6 +153,10 @@ export function createWorkspacePanel(
   let stagedPaths: string[] = [];
   let unstagedPaths: string[] = [];
   let previewCollapsed = workspacePreviewStartsCollapsed(mode);
+  let markdownDisplayMode: "preview" | "source" = "preview";
+  let markdownSource: string | null = null;
+  let markdownSourcePath = "";
+  let markdownRenderedHtml = "";
   const directoryObservers = new Set<IntersectionObserver>();
 
   panel.classList.add("files-mode");
@@ -200,9 +217,55 @@ export function createWorkspacePanel(
     previewNotice.classList.remove("show");
     previewImage.hidden = true;
     previewImage.removeAttribute("src");
+    markdownPreview.hidden = true;
+    markdownPreview.innerHTML = "";
     previewCode.hidden = false;
     previewCode.textContent = "";
     previewActions.innerHTML = "";
+  }
+
+  function resetMarkdownPreview() {
+    markdownDisplayMode = "preview";
+    markdownSource = null;
+    markdownSourcePath = "";
+    markdownRenderedHtml = "";
+    markdownPreview.hidden = true;
+    markdownPreview.innerHTML = "";
+  }
+
+  function renderMarkdownActions(enabled: boolean) {
+    previewActions.innerHTML = "";
+    const group = document.createElement("div");
+    group.className = "ws-markdown-toggle";
+    for (const value of ["preview", "source"] as const) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ws-small-btn";
+      button.textContent = t(
+        value === "preview" ? "workspace_markdown_preview" : "workspace_markdown_source",
+      );
+      button.disabled = !enabled;
+      button.classList.toggle("active", markdownDisplayMode === value);
+      button.onclick = () => setMarkdownDisplayMode(value);
+      group.appendChild(button);
+    }
+    previewActions.appendChild(group);
+  }
+
+  function setMarkdownDisplayMode(value: "preview" | "source") {
+    if (markdownSource === null) return;
+    markdownDisplayMode = value;
+    renderMarkdownActions(true);
+    if (value === "preview") {
+      previewCode.hidden = true;
+      markdownPreview.innerHTML = markdownRenderedHtml;
+      markdownPreview.hidden = false;
+    } else {
+      markdownPreview.hidden = true;
+      markdownPreview.innerHTML = "";
+      previewCode.hidden = false;
+      renderHighlightedText(markdownSource, markdownSourcePath);
+    }
   }
 
   function setPreviewCollapsed(collapsed: boolean) {
@@ -265,12 +328,39 @@ export function createWorkspacePanel(
     }
   }
 
+  function renderHighlightedDiff(content: string, sourcePath: string) {
+    previewCode.innerHTML = "";
+    let activePath = sourcePath;
+    for (const line of content.split("\n")) {
+      const nextPath = line.match(/^\+\+\+ b\/(.+)$/)?.[1];
+      if (nextPath) activePath = nextPath;
+      const rendered = tokenizeDiffLine(line, activePath);
+      const lineEl = document.createElement("span");
+      lineEl.className = `ws-diff-line ${rendered.kind}`;
+      if (rendered.prefix) {
+        const prefix = document.createElement("span");
+        prefix.className = "ws-diff-prefix";
+        prefix.textContent = rendered.prefix;
+        lineEl.appendChild(prefix);
+      }
+      for (const token of rendered.tokens) {
+        const tokenEl = document.createElement("span");
+        tokenEl.className = `ws-token ${token.kind}`;
+        tokenEl.textContent = token.text;
+        lineEl.appendChild(tokenEl);
+      }
+      previewCode.appendChild(lineEl);
+    }
+  }
+
   function renderPreview(
     title: string,
     preview: FilePreview,
     diff: boolean,
     sourcePath = title,
   ) {
+    resetMarkdownPreview();
+    previewActions.innerHTML = "";
     previewTitle.textContent = title;
     previewImage.hidden = true;
     previewImage.removeAttribute("src");
@@ -294,22 +384,31 @@ export function createWorkspacePanel(
       previewCode.textContent = diff ? t("workspace_diff_empty") : "";
       return;
     }
+    if (!diff && preview.kind === "text" && isMarkdownPreviewPath(sourcePath)) {
+      markdownSource = preview.content;
+      markdownSourcePath = sourcePath;
+      if (canRenderMarkdown(preview.size_bytes)) {
+        markdownRenderedHtml = renderSafeMarkdown(preview.content);
+        setMarkdownDisplayMode("preview");
+      } else {
+        markdownDisplayMode = "source";
+        renderMarkdownActions(false);
+        previewNotice.textContent = t("workspace_markdown_too_large");
+        previewNotice.classList.add("show");
+        renderHighlightedText(preview.content, sourcePath);
+      }
+      return;
+    }
     if (!diff) {
       renderHighlightedText(preview.content, sourcePath);
       return;
     }
-    for (const line of preview.content.split("\n")) {
-      const lineEl = document.createElement("span");
-      lineEl.className = "ws-diff-line";
-      if (line.startsWith("+") && !line.startsWith("+++")) lineEl.classList.add("add");
-      else if (line.startsWith("-") && !line.startsWith("---")) lineEl.classList.add("del");
-      else if (line.startsWith("@@")) lineEl.classList.add("hunk");
-      lineEl.textContent = line || " ";
-      previewCode.appendChild(lineEl);
-    }
+    renderHighlightedDiff(preview.content, sourcePath);
   }
 
-  function showPreviewLoading(title: string) {
+  function showPreviewLoading(title: string, sourcePath = title) {
+    resetMarkdownPreview();
+    previewActions.innerHTML = "";
     setPreviewCollapsed(false);
     previewTitle.textContent = title;
     previewNotice.textContent = "";
@@ -318,6 +417,7 @@ export function createWorkspacePanel(
     previewImage.removeAttribute("src");
     previewCode.hidden = false;
     previewCode.textContent = t("workspace_loading");
+    if (isMarkdownPreviewPath(sourcePath)) renderMarkdownActions(false);
   }
 
   function renderLoadError(container: HTMLElement, error: unknown) {
@@ -328,7 +428,7 @@ export function createWorkspacePanel(
     if (!project) return;
     const activeProject = project;
     const revision = projectRevision;
-    showPreviewLoading(title);
+    showPreviewLoading(title, relativePath);
     try {
       const preview = await invoke<FilePreview>("read_workspace_file", {
         project: activeProject,
@@ -374,9 +474,15 @@ export function createWorkspacePanel(
       const name = document.createElement("span");
       name.className = "ws-tree-name";
       name.textContent = entry.name;
+      const metadata = document.createElement("span");
+      metadata.className = "ws-tree-meta";
+      const size = formatWorkspaceEntrySize(entry.size_bytes, entry.is_dir);
+      const modified = formatWorkspaceModifiedTime(entry.modified_unix_seconds);
+      metadata.textContent = [size, modified].filter(Boolean).join(" · ");
       row.append(arrow);
       if (decoration.icon) row.append(icon);
       row.append(name);
+      if (metadata.textContent) row.append(metadata);
       node.appendChild(row);
 
       if (entry.is_dir) {
@@ -661,6 +767,14 @@ export function createWorkspacePanel(
     const enabled = canCommit(commitMessage.value, stagedCount, amendInput.checked);
     commitBtn.disabled = gitOperationRunning || !enabled;
     commitPushBtn.disabled = gitOperationRunning || !enabled;
+    updateCommitPresentation();
+  }
+
+  function updateCommitPresentation() {
+    if (stagedCount === 0) commitExpanded = false;
+    const presentation = workspaceCommitPresentation(stagedCount, commitExpanded);
+    commitLauncher.hidden = !presentation.showLauncher;
+    commitBox.hidden = !presentation.showForm;
   }
 
   async function runGitMutation(
@@ -865,6 +979,10 @@ export function createWorkspacePanel(
       if (fingerprint === lastGitFingerprint) return true;
       lastGitFingerprint = fingerprint;
       if (!status.is_repo) {
+        stagedPaths = [];
+        unstagedPaths = [];
+        stagedCount = 0;
+        updateGitControls();
         repositoryAhead = 0;
         repositoryBehind = 0;
         gitMeta.textContent = "";
@@ -1320,6 +1438,7 @@ export function createWorkspacePanel(
     if (!ok) return;
     commitMessage.value = "";
     amendInput.checked = false;
+    commitExpanded = false;
     setOperation(t("workspace_commit_success"));
     updateGitControls();
     await refreshHistory(true);
@@ -1327,6 +1446,16 @@ export function createWorkspacePanel(
   };
   commitBtn.onclick = () => void createCommit(false);
   commitPushBtn.onclick = () => void createCommit(true);
+  commitLauncher.onclick = () => {
+    commitExpanded = true;
+    updateCommitPresentation();
+    commitMessage.focus();
+  };
+  commitClose.onclick = () => {
+    commitExpanded = false;
+    commitMessage.blur();
+    updateCommitPresentation();
+  };
   commitMessage.oninput = updateGitControls;
   amendInput.onchange = updateGitControls;
   historyFilterBtn.onclick = () => void refreshHistory(true);
@@ -1417,11 +1546,13 @@ export function createWorkspacePanel(
       stagedPaths = [];
       unstagedPaths = [];
       stagedCount = 0;
+      commitExpanded = false;
       const labels = gitSyncButtonLabels(0, 0);
       pullBtn.textContent = labels.pull;
       pushBtn.textContent = labels.push;
       commitMessage.value = "";
       amendInput.checked = false;
+      updateGitControls();
       setOperation("", false);
       closeCommitMenu();
       projectLabel.textContent = project ? projectBasename(project) : "";

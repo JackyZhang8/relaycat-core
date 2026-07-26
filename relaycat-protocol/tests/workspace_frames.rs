@@ -1,7 +1,7 @@
 use relaycat_protocol::{
-    CliMetadata, PlainMsg, WorkspaceEvent, WorkspaceEventEnvelope, WorkspaceRequest,
-    WorkspaceRequestEnvelope, decode_plain_msg, encode_plain_msg, plain_msg_type,
-    plain_msg_types,
+    ArchiveEntry, CliMetadata, FilePreview, PlainMsg, WorkspaceEvent, WorkspaceEventEnvelope,
+    WorkspaceRequest, WorkspaceRequestEnvelope, WorkspaceResponse, WorkspaceResponseEnvelope,
+    decode_plain_msg, encode_plain_msg, plain_msg_type, plain_msg_types,
 };
 
 #[test]
@@ -23,6 +23,36 @@ fn workspace_request_round_trips() {
     assert_eq!(plain_msg_type(&msg), b"workspace_request");
     assert!(plain_msg_types().contains(&b"workspace_response".as_slice()));
     assert!(plain_msg_types().contains(&b"workspace_event".as_slice()));
+}
+
+#[test]
+fn archive_file_preview_round_trips_with_partial_listing() {
+    let msg = PlainMsg::WorkspaceResponse(WorkspaceResponseEnvelope {
+        request_id: "req-archive".to_string(),
+        project_id: "project-1".to_string(),
+        result: Ok(WorkspaceResponse::File(FilePreview::Archive {
+            path: "release.zip".to_string(),
+            format: "zip".to_string(),
+            entries: vec![
+                ArchiveEntry {
+                    path: "dist/".to_string(),
+                    is_directory: true,
+                    size: 0,
+                    modified_unix_seconds: None,
+                },
+                ArchiveEntry {
+                    path: "dist/app.js".to_string(),
+                    is_directory: false,
+                    size: 12_345,
+                    modified_unix_seconds: Some(1_700_000_000),
+                },
+            ],
+            has_more: true,
+        })),
+    });
+
+    let encoded = encode_plain_msg(&msg).expect("encode archive preview");
+    assert_eq!(decode_plain_msg(&encoded).expect("decode archive preview"), msg);
 }
 
 #[test]

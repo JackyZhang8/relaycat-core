@@ -15,7 +15,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use manager::{RelayContext, RelayEvent, RelayStateBridge, SessionManager};
+use manager::{
+    RelayContext, RelayEvent, RelayStateBridge, SessionManager, WorkspaceTerminalBridge,
+    WorkspaceTerminalSnapshot,
+};
 use relaycat_cli::command::{SessionKind, TargetCommand};
 use relaycat_cli::config::{self, Config, CustomTool};
 use relaycat_cli::pairing_store;
@@ -826,11 +829,15 @@ fn create_relay_session(
     let state_bridge =
         RelayStateBridge::bind(relaycat_cli::gui_bridge::new_gui_relay_state_token())
             .map_err(|e| e.to_string())?;
+    let workspace_terminal_bridge =
+        WorkspaceTerminalBridge::bind(relaycat_cli::gui_bridge::new_gui_relay_state_token())
+            .map_err(|e| e.to_string())?;
     let context = RelayContext {
         pairing_url_path,
         resize_file,
         gui_session_id,
         state_bridge,
+        workspace_terminal_bridge,
     };
 
     state
@@ -869,6 +876,47 @@ fn record_recent(target: &TargetCommand) {
 #[tauri::command]
 fn write_session(state: State<SessionManager>, id: String, data: String) -> Result<(), String> {
     state.write(&id, data.as_bytes()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn attach_workspace_terminal(
+    state: State<SessionManager>,
+    id: String,
+) -> Result<WorkspaceTerminalSnapshot, String> {
+    state.workspace_terminal_attach(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn detach_workspace_terminal(state: State<SessionManager>, id: String) -> Result<(), String> {
+    state.workspace_terminal_detach(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn write_workspace_terminal(
+    state: State<SessionManager>,
+    id: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    state
+        .workspace_terminal_write(&id, data)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn resize_workspace_terminal(
+    state: State<SessionManager>,
+    id: String,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    state
+        .workspace_terminal_resize(&id, cols, rows)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn close_workspace_terminal(state: State<SessionManager>, id: String) -> Result<(), String> {
+    state.workspace_terminal_close(&id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1362,6 +1410,11 @@ pub fn run() {
             clear_sensitive_data,
             check_relay_compatibility,
             create_session,
+            attach_workspace_terminal,
+            detach_workspace_terminal,
+            write_workspace_terminal,
+            resize_workspace_terminal,
+            close_workspace_terminal,
             write_session,
             resize_session,
             close_session,

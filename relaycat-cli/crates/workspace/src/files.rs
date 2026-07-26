@@ -6,7 +6,7 @@ use relaycat_protocol::{
 use std::{cmp::Ordering, fs, path::Path};
 
 pub const TEXT_PREVIEW_LIMIT: u64 = 512 * 1024;
-pub const IMAGE_PREVIEW_LIMIT: u64 = 2 * 1024 * 1024;
+pub const IMAGE_PREVIEW_LIMIT: u64 = 1024 * 1024;
 const IGNORED_DIRECTORIES: &[&str] = &[
     ".git",
     "node_modules",
@@ -39,6 +39,9 @@ impl FileService {
                 path: slash_path(relative),
                 is_directory: metadata.is_dir(),
                 size: if metadata.is_file() { metadata.len() } else { 0 },
+                modified_unix_seconds: metadata.modified().ok()
+                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|value| value.as_secs()),
             });
         }
         entries.sort_by(|left, right| match (left.is_directory, right.is_directory) {
@@ -61,10 +64,11 @@ impl FileService {
         })
     }
 
-    pub fn read(&self, path: &str, max_bytes: u32, _variant: ImageVariant) -> Result<FilePreview, WorkspaceServiceError> {
+    pub fn read(&self, path: &str, max_bytes: u32, variant: ImageVariant) -> Result<FilePreview, WorkspaceServiceError> {
         let resolved = self.root.resolve(path)?;
         let metadata = fs::metadata(&resolved).map_err(WorkspaceServiceError::io)?;
         if !metadata.is_file() { return Err(WorkspaceServiceError::invalid("path is not a file")); }
+        if let Some(preview) = crate::archive::preview(&resolved, path, metadata.len())? { return Ok(preview); }
         let image = image_kind(&resolved);
         let ceiling = if image.is_some() { IMAGE_PREVIEW_LIMIT } else { TEXT_PREVIEW_LIMIT };
         let limit = u64::from(max_bytes.max(1)).min(ceiling);
@@ -74,6 +78,15 @@ impl FileService {
         let bytes = fs::read(&resolved).map_err(WorkspaceServiceError::io)?;
         if let Some(mime) = image {
             let (width, height) = image_dimensions(mime, &bytes).unwrap_or((0, 0));
+            if variant == ImageVariant::Thumbnail && (width > 512 || height > 512) {
+                if let Some((thumbnail, thumbnail_width, thumbnail_height)) = thumbnail_jpeg(&bytes) {
+                    return Ok(FilePreview::Image {
+                        path: path.to_string(), mime: "image/jpeg".to_string(),
+                        width: thumbnail_width, height: thumbnail_height,
+                        bytes: thumbnail, truncated: false,
+                    });
+                }
+            }
             return Ok(FilePreview::Image {
                 path: path.to_string(), mime: mime.to_string(), width, height, bytes, truncated: false,
             });
@@ -85,6 +98,18 @@ impl FileService {
             _ => Ok(FilePreview::Binary { path: path.to_string(), size: metadata.len() }),
         }
     }
+}
+
+fn thumbnail_jpeg(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let resized = decoded.resize(512, 512, image::imageops::FilterType::Lanczos3);
+    let width = resized.width();
+    let height = resized.height();
+    let mut output = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 82)
+        .encode_image(&resized)
+        .ok()?;
+    Some((output, width, height))
 }
 
 fn slash_path(path: &Path) -> String { path.to_string_lossy().replace('\\', "/") }

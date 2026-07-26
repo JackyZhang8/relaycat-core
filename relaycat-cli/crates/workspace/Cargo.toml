@@ -9,3 +9,11 @@ relaycat-protocol.workspace = true
 serde.workspace = true
 sha2 = "0.10"
 portable-pty.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+flate2 = "1.1"
+tar = "0.4"
+zip = { version = "4.6", default-features = false }
+sevenz-rust2 = { version = "0.20", default-features = false }
+
+[dev-dependencies]
+sevenz-rust2 = { version = "0.20", default-features = false, features = ["compress", "util"] }

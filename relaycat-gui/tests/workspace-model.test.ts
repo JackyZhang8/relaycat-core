@@ -7,10 +7,17 @@ import {
   gitStatusFingerprint,
   gitHistoryPage,
   historyNearBottom,
+  canRenderMarkdown,
+  isMarkdownPreviewPath,
+  MARKDOWN_RENDER_LIMIT,
+  formatWorkspaceEntrySize,
+  formatWorkspaceModifiedTime,
   previewLanguage,
   projectBasename,
   storedWorkspacePanelWidth,
   tokenizePreviewLine,
+  tokenizeDiffLine,
+  workspaceCommitPresentation,
   workspaceEntryDecoration,
   workspacePanelWidth,
 } from "../src/workspace-model.ts";
@@ -74,6 +81,40 @@ test("detects common source languages from file names", () => {
   assert.equal(previewLanguage("LICENSE"), null);
 });
 
+test("detects mainstream native and JVM source languages", () => {
+  assert.equal(previewLanguage("Sources/App.swift"), "swift");
+  assert.equal(previewLanguage("native/main.c"), "c");
+  assert.equal(previewLanguage("native/view.mm"), "objective-c");
+  assert.equal(previewLanguage("native/engine.cpp"), "cpp");
+  assert.equal(previewLanguage("App.cs"), "csharp");
+  assert.equal(previewLanguage("Main.java"), "java");
+  assert.equal(previewLanguage("Main.kt"), "kotlin");
+  assert.equal(previewLanguage("index.php"), "php");
+  assert.equal(previewLanguage("tool.rb"), "ruby");
+});
+
+test("detects Markdown preview files case-insensitively", () => {
+  assert.equal(isMarkdownPreviewPath("README.md"), true);
+  assert.equal(isMarkdownPreviewPath("docs/GUIDE.MARKDOWN"), true);
+  assert.equal(isMarkdownPreviewPath("src/markdown.ts"), false);
+});
+
+test("GUI renders Markdown up to the existing 512 KiB text limit", () => {
+  assert.equal(MARKDOWN_RENDER_LIMIT, 512 * 1024);
+  assert.equal(canRenderMarkdown(MARKDOWN_RENDER_LIMIT), true);
+  assert.equal(canRenderMarkdown(MARKDOWN_RENDER_LIMIT + 1), false);
+});
+
+test("Markdown preview switches locally without requesting the file again", () => {
+  assert.match(workspacePanelSource, /renderSafeMarkdown/);
+  assert.match(workspacePanelSource, /workspace-markdown-preview/);
+  assert.match(workspacePanelSource, /setMarkdownDisplayMode/);
+  const setter = workspacePanelSource.match(
+    /function setMarkdownDisplayMode[\s\S]*?\n  }/,
+  )?.[0] ?? "";
+  assert.doesNotMatch(setter, /invoke\s*</);
+});
+
 test("tokenizes source lines into safe syntax-color segments", () => {
   assert.deepEqual(
     tokenizePreviewLine('const value = "x"; // note', "typescript"),
@@ -85,6 +126,61 @@ test("tokenizes source lines into safe syntax-color segments", () => {
       { text: "// note", kind: "comment" },
     ],
   );
+});
+
+test("tokenizes Swift keywords strings and comments", () => {
+  assert.deepEqual(
+    tokenizePreviewLine('let title = "RelayCat" // note', "swift"),
+    [
+      { text: "let", kind: "keyword" },
+      { text: " title = ", kind: "plain" },
+      { text: '"RelayCat"', kind: "string" },
+      { text: " ", kind: "plain" },
+      { text: "// note", kind: "comment" },
+    ],
+  );
+});
+
+test("formats workspace entry metadata compactly", () => {
+  assert.equal(formatWorkspaceEntrySize(0, true), "");
+  assert.equal(formatWorkspaceEntrySize(999, false), "999 B");
+  assert.equal(formatWorkspaceEntrySize(1536, false), "1.5 KB");
+  assert.equal(formatWorkspaceEntrySize(2 * 1024 * 1024, false), "2 MB");
+  assert.equal(formatWorkspaceModifiedTime(null), "");
+  assert.match(formatWorkspaceModifiedTime(1_700_000_000), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+});
+
+test("commit presentation hides empty state and collapses behind a launcher", () => {
+  assert.deepEqual(workspaceCommitPresentation(0, false), {
+    showLauncher: false,
+    showForm: false,
+  });
+  assert.deepEqual(workspaceCommitPresentation(2, false), {
+    showLauncher: true,
+    showForm: false,
+  });
+  assert.deepEqual(workspaceCommitPresentation(2, true), {
+    showLauncher: false,
+    showForm: true,
+  });
+});
+
+test("diff syntax keeps prefixes while highlighting source tokens", () => {
+  assert.deepEqual(tokenizeDiffLine('+let title = "RelayCat"', "App.swift"), {
+    kind: "add",
+    prefix: "+",
+    tokens: [
+      { text: "let", kind: "keyword" },
+      { text: " title = ", kind: "plain" },
+      { text: '"RelayCat"', kind: "string" },
+    ],
+  });
+  assert.deepEqual(tokenizeDiffLine("@@ -1 +1 @@", "App.swift"), {
+    kind: "hunk",
+    prefix: "",
+    tokens: [{ text: "@@ -1 +1 @@", kind: "plain" }],
+  });
+  assert.equal(tokenizeDiffLine("+++ b/App.swift", "App.swift").kind, "header");
 });
 
 test("git status fingerprint changes only when repository state changes", () => {
@@ -133,4 +229,9 @@ test("workspace directories load one hundred entries per scroll page", () => {
   assert.match(workspacePanelSource, /new IntersectionObserver/);
   assert.match(workspacePanelSource, /page\.has_more/);
   assert.match(workspacePanelSource, /page\.capped/);
+  assert.match(workspaceRustSource, /size_bytes:\s*entry\.size/);
+  assert.match(
+    workspaceRustSource,
+    /modified_unix_seconds:\s*entry\.modified_unix_seconds/,
+  );
 });

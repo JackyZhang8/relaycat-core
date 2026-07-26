@@ -14,6 +14,7 @@ pub(crate) fn cli_protocol_capabilities() -> Vec<ProtocolCapabilityV2> {
         ProtocolCapabilityV2::Compression,
         ProtocolCapabilityV2::IncrementalAttrs,
         ProtocolCapabilityV2::WorkspaceRpc,
+        ProtocolCapabilityV2::TerminalStreams,
     ]
 }
 

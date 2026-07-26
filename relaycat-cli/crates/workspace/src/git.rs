@@ -13,6 +13,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+const GIT_ERROR_MESSAGE_LIMIT: usize = 4 * 1024;
+
 #[derive(Clone)]
 pub struct GitService { root: ProjectRoot, mutation: Arc<Mutex<()>> }
 
@@ -150,10 +152,98 @@ impl GitService {
     fn output(&self,args:&[&str])->Result<Output,WorkspaceServiceError>{self.command().args(args).output().map_err(WorkspaceServiceError::io)}
     fn text(&self,args:&[&str])->Result<String,WorkspaceServiceError>{let output=self.output(args)?;self.success(&output)?;Ok(String::from_utf8_lossy(&output.stdout).into_owned())}
     fn run_success(&self,args:&[&str])->Result<(),WorkspaceServiceError>{let output=self.output(args)?;self.success(&output)}
-    fn success(&self,output:&Output)->Result<(),WorkspaceServiceError>{if output.status.success(){Ok(())}else{let message=String::from_utf8_lossy(&output.stderr).trim().to_string();Err(WorkspaceServiceError::new(WorkspaceErrorCode::Conflict,if message.is_empty(){"Git command failed".into()}else{message},false))}}
+    fn success(&self,output:&Output)->Result<(),WorkspaceServiceError>{if output.status.success(){Ok(())}else{let message=sanitize_git_error_message(&String::from_utf8_lossy(&output.stderr));Err(WorkspaceServiceError::new(WorkspaceErrorCode::Conflict,message,false))}}
 }
 
 fn status_name(code:char)->String{match code{'A'=>"added",'D'=>"deleted",'R'=>"renamed",'C'=>"copied",'U'=>"conflict",_=>"modified"}.into()}
 fn validate_oid(oid:&str)->Result<(),WorkspaceServiceError>{if(4..=64).contains(&oid.len())&&oid.bytes().all(|b|b.is_ascii_hexdigit()){Ok(())}else{Err(WorkspaceServiceError::invalid("invalid commit id"))}}
 fn parse_history_item(raw:&str)->Option<GitHistoryItem>{let fields:Vec<&str>=raw.trim_matches(['\n','\r']).split('\x1f').collect();if fields.len()<7{return None;}Some(GitHistoryItem{oid:fields[0].into(),short_oid:fields[1].into(),subject:fields[2].into(),author:fields[3].into(),authored_at_unix_ms:fields[4].parse::<u64>().ok()?.saturating_mul(1000),decorations:fields[5].split(',').map(str::trim).filter(|v|!v.is_empty()).map(str::to_string).collect(),parent_oids:fields[6].split_whitespace().map(str::to_string).collect()})}
 fn content_page(bytes:Vec<u8>,cursor:Option<String>,max_bytes:u32)->ContentPage{let start=cursor.as_deref().unwrap_or("0").parse::<usize>().unwrap_or(0).min(bytes.len());let limit=(max_bytes as usize).clamp(1,WORKSPACE_PAYLOAD_BUDGET);let mut end=start.saturating_add(limit).min(bytes.len());while end>start&&std::str::from_utf8(&bytes[start..end]).is_err(){end-=1;}let truncated=end<bytes.len();ContentPage{bytes:bytes[start..end].to_vec(),next_cursor:truncated.then(||end.to_string()),truncated}}
+
+fn sanitize_git_error_message(raw: &str) -> String {
+    let mut clean = String::with_capacity(raw.len().min(GIT_ERROR_MESSAGE_LIMIT));
+    let mut chars = raw.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            if chars.next_if_eq(&'[').is_some() {
+                for code in chars.by_ref() {
+                    if ('@'..='~').contains(&code) { break; }
+                }
+            } else {
+                let _ = chars.next();
+            }
+            continue;
+        }
+        match character {
+            '\r' => {
+                let _ = chars.next_if_eq(&'\n');
+                if clean.chars().last() != Some('\n') { clean.push('\n'); }
+            }
+            '\n' | '\t' => clean.push(character),
+            value if value.is_control() => {}
+            value => clean.push(value),
+        }
+    }
+
+    let normalized = clean
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut message = redact_url_credentials(normalized.trim());
+    if message.is_empty() { return "Git command failed".into(); }
+    if message.len() > GIT_ERROR_MESSAGE_LIMIT {
+        let suffix = '…';
+        let mut end = GIT_ERROR_MESSAGE_LIMIT.saturating_sub(suffix.len_utf8());
+        while !message.is_char_boundary(end) { end = end.saturating_sub(1); }
+        message.truncate(end);
+        while message.ends_with(char::is_whitespace) { message.pop(); }
+        message.push(suffix);
+    }
+    message
+}
+
+fn redact_url_credentials(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(relative_scheme) = input[cursor..].find("://") {
+        let authority_start = cursor + relative_scheme + 3;
+        output.push_str(&input[cursor..authority_start]);
+        let authority_end = input[authority_start..]
+            .char_indices()
+            .find_map(|(index, character)| {
+                (character == '/' || character == '?' || character == '#' || character.is_whitespace() || character == '\'' || character == '"')
+                    .then_some(authority_start + index)
+            })
+            .unwrap_or(input.len());
+        let authority = &input[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            output.push_str("[redacted]@");
+            output.push_str(&authority[at + 1..]);
+        } else {
+            output.push_str(authority);
+        }
+        cursor = authority_end;
+    }
+    output.push_str(&input[cursor..]);
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_error_message_is_sanitized_redacted_and_bounded() {
+        let raw = format!(
+            "\u{1b}[31mfatal:\u{1b}[0m unable to access 'https://alice:secret-token@example.com/repo'\r\n{}",
+            "remote hook output\n".repeat(400)
+        );
+        let message = sanitize_git_error_message(&raw);
+        assert!(message.starts_with("fatal: unable to access 'https://[redacted]@example.com/repo'"));
+        assert!(!message.contains("secret-token"));
+        assert!(!message.contains('\u{1b}'));
+        assert!(message.len() <= GIT_ERROR_MESSAGE_LIMIT);
+        assert!(message.ends_with('…'));
+    }
+}

@@ -3183,6 +3183,126 @@ fn relay_compatibility_builds_health_url_from_websocket_relay_url() {
     );
 }
 
+#[test]
+fn terminal_stream_v2_routes_to_workspace_without_changing_main_terminal_routing() {
+    let stream = relaycat_protocol::TerminalStreamV2 {
+        stream_id: "workspace_shell".to_string(),
+        message: relaycat_protocol::TerminalStreamMessageV2::Input {
+            input_stream_id: "workspace-input-1".to_string(),
+            input_seq: 1,
+            bytes: b"pwd\r".to_vec(),
+        },
+    };
+    assert_eq!(
+        relay_input_action(PlainMsg::TerminalStreamV2(stream.clone())),
+        RelayInputAction::TerminalStreamV2(stream)
+    );
+
+    assert!(matches!(
+        relay_input_action(PlainMsg::InputEventV2(InputEventV2 {
+            input_stream_id: "main-input-1".to_string(),
+            input_seq: 1,
+            bytes: b"pwd\r".to_vec(),
+        })),
+        RelayInputAction::InputEventV2 { .. }
+    ));
+}
+
+#[test]
+fn shell_transport_events_become_wrapped_terminal_stream_messages() {
+    let descriptor = relaycat_protocol::ShellDescriptor {
+        shell_id: "shell-1".to_string(),
+        title: "Shell 1".to_string(),
+        cols: 80,
+        rows: 24,
+        last_output_seq: 0,
+        exited: false,
+        exit_code: None,
+    };
+    let mut host = None;
+    let started = workspace_terminal_transport_messages(
+        &mut host,
+        relaycat_workspace::ShellTransportEvent::Started(descriptor),
+    )
+    .expect("start workspace terminal");
+    assert!(matches!(
+        started.as_slice(),
+        [PlainMsg::TerminalStreamV2(relaycat_protocol::TerminalStreamV2 {
+            message: relaycat_protocol::TerminalStreamMessageV2::Snapshot(_),
+            ..
+        })]
+    ));
+
+    let output = workspace_terminal_transport_messages(
+        &mut host,
+        relaycat_workspace::ShellTransportEvent::Output {
+            shell_id: "shell-1".to_string(),
+            bytes: b"relay-marker\r\n".to_vec(),
+        },
+    )
+    .expect("feed workspace terminal output");
+    assert!(output.iter().any(|message| matches!(
+        message,
+        PlainMsg::TerminalStreamV2(relaycat_protocol::TerminalStreamV2 {
+            message: relaycat_protocol::TerminalStreamMessageV2::Patch(_),
+            ..
+        })
+    )));
+
+    let exit = workspace_terminal_transport_messages(
+        &mut host,
+        relaycat_workspace::ShellTransportEvent::Exit {
+            shell_id: "shell-1".to_string(),
+            code: Some(0),
+        },
+    )
+    .expect("exit workspace terminal");
+    assert!(matches!(
+        exit.as_slice(),
+        [PlainMsg::TerminalStreamV2(relaycat_protocol::TerminalStreamV2 {
+            message: relaycat_protocol::TerminalStreamMessageV2::Exit { code: Some(0) },
+            ..
+        })]
+    ));
+    assert!(host.is_none());
+}
+
+#[test]
+fn app_close_keeps_workspace_terminal_host_until_transport_exit() {
+    let relay_source = include_str!("../relay.rs");
+    let close_branch = relay_source
+        .split("WorkspaceTerminalAction::Close => {")
+        .nth(1)
+        .and_then(|source| source.split("}").next())
+        .expect("workspace terminal close branch");
+    assert!(
+        !close_branch.contains("workspace_terminal_host = None"),
+        "APP close must retain the host until ShellTransportEvent::Exit emits the peer exit frame"
+    );
+}
+
+#[test]
+fn terminal_stream_routing_is_enabled_only_after_capability_negotiation() {
+    let negotiated = AtomicBool::new(false);
+    update_terminal_streams_capability(
+        &negotiated,
+        &HelloV2 {
+            protocol_versions: vec![2],
+            capabilities: vec![ProtocolCapabilityV2::TerminalStreams],
+        },
+    );
+    assert!(negotiated.load(Ordering::Acquire));
+
+    update_terminal_streams_capability(
+        &negotiated,
+        &HelloV2 {
+            protocol_versions: vec![2],
+            capabilities: vec![ProtocolCapabilityV2::WorkspaceRpc],
+        },
+    );
+    assert!(!negotiated.load(Ordering::Acquire));
+}
+
 #[tokio::test]
 async fn relay_compatibility_marks_invalid_health_urls_as_unverified() {
     let result = probe_relay_compatibility("not a URL", "0.1.2").await;
