@@ -913,24 +913,30 @@ fn apply_workspace_terminal_event(
                     code: None,
                 });
             }
-            GuiWorkspaceTerminalEvent::Output { bytes } => {
+            GuiWorkspaceTerminalEvent::Output { shell_id, bytes } => {
+                if !workspace_terminal_event_is_current(&state, &shell_id) {
+                    return;
+                }
                 let output_seq = record_workspace_terminal_output(&mut state, &bytes);
                 emitted = Some(WorkspaceTerminalEvent {
                     id: id.to_string(),
                     kind: "output".to_string(),
-                    shell_id: state.shell_id.clone(),
+                    shell_id: Some(shell_id),
                     data: Some(bytes),
                     output_seq: Some(output_seq),
                     code: None,
                 });
             }
-            GuiWorkspaceTerminalEvent::Exit { code } => {
+            GuiWorkspaceTerminalEvent::Exit { shell_id, code } => {
+                if !workspace_terminal_event_is_current(&state, &shell_id) {
+                    return;
+                }
                 state.exited = true;
                 state.exit_code = code;
                 emitted = Some(WorkspaceTerminalEvent {
                     id: id.to_string(),
                     kind: "exit".to_string(),
-                    shell_id: state.shell_id.clone(),
+                    shell_id: Some(shell_id),
                     data: None,
                     output_seq: None,
                     code,
@@ -949,6 +955,10 @@ fn clear_workspace_terminal_writer(state: &mut WorkspaceTerminalState, generatio
         state.writer = None;
         state.writer_generation = None;
     }
+}
+
+fn workspace_terminal_event_is_current(state: &WorkspaceTerminalState, shell_id: &str) -> bool {
+    state.shell_id.as_deref() == Some(shell_id)
 }
 
 fn record_workspace_terminal_output(state: &mut WorkspaceTerminalState, bytes: &[u8]) -> u64 {
@@ -1218,5 +1228,14 @@ mod tests {
 
         clear_workspace_terminal_writer(&mut state, 2);
         assert_eq!(state.writer_generation, None);
+    }
+
+    #[test]
+    fn delayed_workspace_terminal_event_cannot_target_a_replacement_shell() {
+        let mut state = WorkspaceTerminalState::new("secret-token".to_string());
+        state.shell_id = Some("shell-2".to_string());
+
+        assert!(!workspace_terminal_event_is_current(&state, "shell-1"));
+        assert!(workspace_terminal_event_is_current(&state, "shell-2"));
     }
 }

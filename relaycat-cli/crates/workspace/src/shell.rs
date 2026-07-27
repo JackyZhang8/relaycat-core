@@ -55,12 +55,9 @@ impl ShellManager {
         let shells = self.shells.lock().expect("shell map poisoned");
         let mut list: Vec<_> = shells
             .values()
-            .map(|shell| {
-                shell
-                    .descriptor
-                    .lock()
-                    .expect("descriptor poisoned")
-                    .clone()
+            .filter_map(|shell| {
+                let descriptor = shell.descriptor.lock().expect("descriptor poisoned");
+                (!descriptor.exited).then(|| descriptor.clone())
             })
             .collect();
         list.sort_by(|a, b| a.title.cmp(&b.title));
@@ -68,12 +65,14 @@ impl ShellManager {
     }
 
     pub fn active_shell_id(&self) -> Option<String> {
-        self.shells
-            .lock()
-            .ok()?
-            .keys()
-            .next()
-            .cloned()
+        self.shells.lock().ok()?.iter().find_map(|(id, shell)| {
+            shell
+                .descriptor
+                .lock()
+                .ok()
+                .is_some_and(|descriptor| !descriptor.exited)
+                .then(|| id.clone())
+        })
     }
 
     pub fn create(&self, cols: u16, rows: u16) -> Result<ShellSnapshot, WorkspaceServiceError> {
@@ -81,7 +80,13 @@ impl ShellManager {
             .shells
             .lock()
             .map_err(|_| WorkspaceServiceError::busy())?;
-        if !shells.is_empty() {
+        if shells.values().any(|shell| {
+            shell
+                .descriptor
+                .lock()
+                .map(|descriptor| !descriptor.exited)
+                .unwrap_or(true)
+        }) {
             return Err(WorkspaceServiceError::busy());
         }
 
@@ -163,11 +168,26 @@ impl ShellManager {
             .lock()
             .map(|mut pending| pending.drain(..).collect())
             .unwrap_or_default();
-        let shells: Vec<Arc<Shell>> = self
+        let mut shells: Vec<Arc<Shell>> = self
             .shells
             .lock()
             .map(|shells| shells.values().cloned().collect())
             .unwrap_or_default();
+        shells.sort_by_key(|shell| {
+            let exited = shell
+                .descriptor
+                .lock()
+                .ok()
+                .is_some_and(|descriptor| descriptor.exited);
+            if exited {
+                0
+            } else if shell.transport_started.load(Ordering::Acquire) {
+                1
+            } else {
+                2
+            }
+        });
+        let mut exited_shell_ids = Vec::new();
         for shell in shells {
             let descriptor = match shell.descriptor.lock() {
                 Ok(descriptor) => descriptor.clone(),
@@ -187,13 +207,30 @@ impl ShellManager {
                     }
                 }
             }
-            if descriptor.exited
-                && !shell.transport_exit_sent.swap(true, Ordering::AcqRel)
-            {
+            if descriptor.exited && !shell.transport_exit_sent.swap(true, Ordering::AcqRel) {
                 events.push(ShellTransportEvent::Exit {
-                    shell_id: descriptor.shell_id,
+                    shell_id: descriptor.shell_id.clone(),
                     code: descriptor.exit_code,
                 });
+            }
+            if descriptor.exited && shell.transport_exit_sent.load(Ordering::Acquire) {
+                exited_shell_ids.push(descriptor.shell_id);
+            }
+        }
+        if !exited_shell_ids.is_empty()
+            && let Ok(mut shells) = self.shells.lock()
+        {
+            for shell_id in exited_shell_ids {
+                if shells.get(&shell_id).is_some_and(|shell| {
+                    shell.transport_exit_sent.load(Ordering::Acquire)
+                        && shell
+                            .descriptor
+                            .lock()
+                            .ok()
+                            .is_some_and(|descriptor| descriptor.exited)
+                }) {
+                    shells.remove(&shell_id);
+                }
             }
         }
         events

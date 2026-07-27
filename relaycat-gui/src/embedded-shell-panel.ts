@@ -55,6 +55,7 @@ interface WorkspaceTerminalEvent {
 
 interface EmbeddedShellTab {
   id: string;
+  remoteShellId?: string;
   ownerSessionId: string;
   kind: "shared" | "local";
   number: number;
@@ -343,7 +344,7 @@ export function createEmbeddedShellPanel(
     return shell;
   }
 
-  async function createForProject(project: string | null) {
+  async function createForProject(project: string | null, remoteShellId?: string) {
     const session = options.currentSession();
     const normalized = session?.project.trim() || project?.trim();
     if (!session || session.mode !== "relay" || !normalized) return;
@@ -359,6 +360,7 @@ export function createEmbeddedShellPanel(
 
     const id = session.id;
     const shell = createShellTab(session, normalized, id, "shared", 1);
+    shell.remoteShellId = remoteShellId;
     shell.term.onData((data) => {
       if (shell.state === "running") {
         void invoke("write_workspace_terminal", {
@@ -381,6 +383,7 @@ export function createEmbeddedShellPanel(
         }
         if (!snapshot) throw new Error(t("embedded_shell_bridge_unavailable"));
         if (shell.closing || shellById(id) !== shell) return;
+        shell.remoteShellId = snapshot.shell_id;
         if (snapshot.data.length > 0) shell.term.write(new Uint8Array(snapshot.data));
         shell.snapshotApplied = true;
         for (const pending of shell.pendingOutput) {
@@ -511,9 +514,15 @@ export function createEmbeddedShellPanel(
       if (event.payload.kind !== "started") return;
       const session = options.currentSession();
       if (!session || session.mode !== "relay" || session.id !== event.payload.id) return;
-      void createForProject(session.project);
+      void createForProject(session.project, event.payload.shell_id);
       return;
     }
+    if (
+      event.payload.kind !== "started" &&
+      event.payload.shell_id &&
+      shell.remoteShellId &&
+      event.payload.shell_id !== shell.remoteShellId
+    ) return;
     if (event.payload.kind === "output" && event.payload.data) {
       const output_seq = event.payload.output_seq ?? 0;
       if (!shell.snapshotApplied) {
@@ -524,6 +533,7 @@ export function createEmbeddedShellPanel(
       return;
     }
     if (event.payload.kind === "started") {
+      shell.remoteShellId = event.payload.shell_id;
       shell.state = "running";
       renderTabs();
       return;

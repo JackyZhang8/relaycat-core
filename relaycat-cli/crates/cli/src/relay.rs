@@ -2193,16 +2193,18 @@ where
                                     },
                                 );
                             }
-                            ShellTransportEvent::Output { bytes, .. } => {
+                            ShellTransportEvent::Output { shell_id, bytes } => {
                                 crate::gui_bridge::publish_gui_workspace_terminal_event(
                                     crate::gui_bridge::GuiWorkspaceTerminalEvent::Output {
+                                        shell_id: shell_id.clone(),
                                         bytes: bytes.clone(),
                                     },
                                 );
                             }
-                            ShellTransportEvent::Exit { code, .. } => {
+                            ShellTransportEvent::Exit { shell_id, code } => {
                                 crate::gui_bridge::publish_gui_workspace_terminal_event(
                                     crate::gui_bridge::GuiWorkspaceTerminalEvent::Exit {
+                                        shell_id: shell_id.clone(),
                                         code: *code,
                                     },
                                 );

@@ -90,10 +90,11 @@ pub enum GuiWorkspaceTerminalEvent {
     Ready,
     Started { shell_id: String },
     Output {
+        shell_id: String,
         #[serde(with = "base64_bytes")]
         bytes: Vec<u8>,
     },
-    Exit { code: Option<i32> },
+    Exit { shell_id: String, code: Option<i32> },
     Heartbeat,
 }
 
@@ -747,6 +748,7 @@ mod tests {
     fn workspace_terminal_event_round_trips_binary_output() {
         let message = GuiWorkspaceTerminalMessage::Event(
             GuiWorkspaceTerminalEvent::Output {
+                shell_id: "shell-2".to_string(),
                 bytes: vec![0, 1, 2, 0xff],
             },
         );

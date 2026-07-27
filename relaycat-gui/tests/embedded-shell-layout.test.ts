@@ -130,7 +130,10 @@ test("an APP-created shared Shell automatically adds the matching GUI tab", () =
   assert.match(panelSource, /if \(!shell\) \{[\s\S]*?event\.payload\.kind !== "started"/);
   assert.match(panelSource, /const session = options\.currentSession\(\)/);
   assert.match(panelSource, /session\.id !== event\.payload\.id/);
-  assert.match(panelSource, /void createForProject\(session\.project\)/);
+  assert.match(
+    panelSource,
+    /void createForProject\(session\.project,\s*event\.payload\.shell_id\)/,
+  );
   assert.doesNotMatch(panelSource, /event\.payload\.kind === "started"[\s\S]*?setVisible\(true\)/);
 });
 
@@ -158,6 +161,12 @@ test("workspace terminal attach orders replay before newer live output", () => {
   assert.match(panelSource, /output_seq\?:\s*number/);
   assert.match(panelSource, /pendingOutput/);
   assert.match(panelSource, /output_seq > snapshot\.last_output_seq/);
+});
+
+test("delayed events from an exited shared Shell cannot close its replacement", () => {
+  assert.match(panelSource, /remoteShellId\?:\s*string/);
+  assert.match(panelSource, /shell\.remoteShellId = snapshot\.shell_id/);
+  assert.match(panelSource, /event\.payload\.shell_id !== shell\.remoteShellId/);
 });
 
 test("Term tool buttons stay bright without a right-side indicator", () => {
