@@ -43,12 +43,13 @@ impl FileService {
             let item = item.map_err(WorkspaceServiceError::io)?;
             let resolved = match item.path().canonicalize() { Ok(value) if value.starts_with(self.root.path()) => value, _ => continue };
             let metadata = fs::metadata(&resolved).map_err(WorkspaceServiceError::io)?;
-            let name = item.file_name().to_string_lossy().into_owned();
+            let file_name = item.file_name();
+            let name = file_name.to_string_lossy().into_owned();
             if metadata.is_dir() && IGNORED_DIRECTORIES.contains(&name.as_str()) { continue; }
-            let relative = resolved.strip_prefix(self.root.path()).map_err(|_| WorkspaceServiceError::outside_project())?;
+            let logical_path = Path::new(path).join(file_name);
             entries.push(DirectoryEntry {
                 name,
-                path: slash_path(relative),
+                path: slash_path(&logical_path),
                 is_directory: metadata.is_dir(),
                 size: if metadata.is_file() { metadata.len() } else { 0 },
                 modified_unix_seconds: metadata.modified().ok()

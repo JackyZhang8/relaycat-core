@@ -9,6 +9,7 @@ import {
   historyNearBottom,
   canRenderMarkdown,
   isMarkdownPreviewPath,
+  LOCAL_PREVIEW_LIMITS,
   MARKDOWN_RENDER_LIMIT,
   formatWorkspaceEntrySize,
   formatWorkspaceModifiedTime,
@@ -17,6 +18,7 @@ import {
   storedWorkspacePanelWidth,
   tokenizePreviewLine,
   tokenizeDiffLine,
+  uniqueWorkspaceEntries,
   workspaceCommitPresentation,
   workspaceEntryDecoration,
   workspacePanelWidth,
@@ -80,6 +82,23 @@ test("uses wider local preview limits by development file category", () => {
   assert.equal(workspaceLocalPreviewLimit("diagram.png"), 20 * 1024 * 1024);
   assert.equal(workspaceLocalPreviewLimit("cache.sqlite"), 512 * 1024 * 1024);
   assert.equal(workspaceLocalPreviewLimit("src/main.swift"), 4 * 1024 * 1024);
+});
+
+test("GUI preview limits match the Rust backend contract", () => {
+  const rustLimit = (kind: "TEXT" | "MARKDOWN" | "IMAGE" | "DATABASE") => {
+    const match = workspaceRustSource.match(
+      new RegExp(`const MAX_LOCAL_${kind}_PREVIEW_BYTES: u64 = (\\d+) \\* 1024 \\* 1024;`),
+    );
+    assert.ok(match, `missing Rust ${kind.toLowerCase()} preview limit`);
+    return Number(match[1]) * 1024 * 1024;
+  };
+
+  assert.deepEqual(LOCAL_PREVIEW_LIMITS, {
+    text: rustLimit("TEXT"),
+    markdown: rustLimit("MARKDOWN"),
+    image: rustLimit("IMAGE"),
+    database: rustLimit("DATABASE"),
+  });
 });
 
 test("detects common source languages from file names", () => {
@@ -270,5 +289,20 @@ test("workspace directories load one hundred entries per scroll page", () => {
   assert.match(
     workspaceRustSource,
     /modified_unix_seconds:\s*entry\.modified_unix_seconds/,
+  );
+});
+
+test("appended workspace directory pages skip paths already rendered", () => {
+  assert.deepEqual(
+    uniqueWorkspaceEntries(new Set(["src/a.ts"]), [
+      { relative_path: "src/a.ts", name: "a.ts" },
+      { relative_path: "src/b.ts", name: "b.ts" },
+      { relative_path: "src/b.ts", name: "b duplicate.ts" },
+      { relative_path: "src/c.ts", name: "c.ts" },
+    ]),
+    [
+      { relative_path: "src/b.ts", name: "b.ts" },
+      { relative_path: "src/c.ts", name: "c.ts" },
+    ],
   );
 });

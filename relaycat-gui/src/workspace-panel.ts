@@ -33,6 +33,7 @@ import {
   storedWorkspacePanelWidth,
   tokenizeDiffLine,
   tokenizePreviewLine,
+  uniqueWorkspaceEntries,
   workspaceCommitPresentation,
   workspacePanelWidth,
   workspaceLocalPreviewLimit,
@@ -564,9 +565,19 @@ export function createWorkspacePanel(
       renderState(container, t("workspace_empty_dir"));
       return;
     }
-    for (const entry of entries) {
+    const existingPaths = new Set<string>();
+    if (append) {
+      for (const child of Array.from(container.children)) {
+        if (child instanceof HTMLElement && child.classList.contains("ws-tree-node")) {
+          const path = child.dataset.workspacePath;
+          if (path) existingPaths.add(path);
+        }
+      }
+    }
+    for (const entry of uniqueWorkspaceEntries(existingPaths, entries)) {
       const node = document.createElement("div");
       node.className = "ws-tree-node";
+      node.dataset.workspacePath = entry.relative_path;
       const row = document.createElement("button");
       row.type = "button";
       row.className = "ws-tree-row";

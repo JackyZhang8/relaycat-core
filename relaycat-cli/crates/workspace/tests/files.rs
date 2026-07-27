@@ -93,6 +93,32 @@ fn windows_style_filename_survives_list_to_read_round_trip() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn internal_symlink_keeps_alias_path_through_list_and_read() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let actual = fixture.root.join("actual-source");
+    fs::create_dir(&actual).unwrap();
+    fs::write(actual.join("nested.rs"), "fn linked() {}\n").unwrap();
+    symlink(&actual, fixture.root.join("linked-source")).unwrap();
+    let service = FileService::new(ProjectRoot::open(&fixture.root).unwrap());
+
+    let root_page = service.list("", 0, 100).unwrap();
+    let alias = root_page.entries.iter().find(|entry| entry.name == "linked-source").unwrap();
+    assert_eq!(alias.path, "linked-source");
+
+    let linked_page = service.list(&alias.path, 0, 100).unwrap();
+    let nested = linked_page.entries.iter().find(|entry| entry.name == "nested.rs").unwrap();
+    assert_eq!(nested.path, "linked-source/nested.rs");
+    assert!(matches!(
+        service.read(&nested.path, 512 * 1024, ImageVariant::Thumbnail).unwrap(),
+        FilePreview::Text { ref path, ref content, .. }
+            if path == "linked-source/nested.rs" && content == "fn linked() {}\n"
+    ));
+}
+
 #[test]
 fn preview_limits_keep_text_at_512_kib_and_images_at_1_mib() {
     assert_eq!(TEXT_PREVIEW_LIMIT, 512 * 1024);

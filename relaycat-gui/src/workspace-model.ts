@@ -18,6 +18,18 @@ export interface WorkspaceEntriesPage {
   capped: boolean;
 }
 
+export function uniqueWorkspaceEntries<T extends Pick<WorkspaceEntry, "relative_path">>(
+  existingPaths: Iterable<string>,
+  entries: T[],
+): T[] {
+  const seen = new Set(existingPaths);
+  return entries.filter((entry) => {
+    if (seen.has(entry.relative_path)) return false;
+    seen.add(entry.relative_path);
+    return true;
+  });
+}
+
 export interface FilePreview {
   kind: "text" | "image" | "archive" | "database" | "binary" | "too_large";
   content: string;
@@ -25,10 +37,17 @@ export interface FilePreview {
   size_bytes: number;
 }
 
-export const LOCAL_TEXT_PREVIEW_LIMIT = 4 * 1024 * 1024;
-export const LOCAL_MARKDOWN_PREVIEW_LIMIT = 8 * 1024 * 1024;
-export const LOCAL_IMAGE_PREVIEW_LIMIT = 20 * 1024 * 1024;
-export const LOCAL_DATABASE_PREVIEW_LIMIT = 512 * 1024 * 1024;
+export const LOCAL_PREVIEW_LIMITS = Object.freeze({
+  text: 4 * 1024 * 1024,
+  markdown: 8 * 1024 * 1024,
+  image: 20 * 1024 * 1024,
+  database: 512 * 1024 * 1024,
+});
+
+export const LOCAL_TEXT_PREVIEW_LIMIT = LOCAL_PREVIEW_LIMITS.text;
+export const LOCAL_MARKDOWN_PREVIEW_LIMIT = LOCAL_PREVIEW_LIMITS.markdown;
+export const LOCAL_IMAGE_PREVIEW_LIMIT = LOCAL_PREVIEW_LIMITS.image;
+export const LOCAL_DATABASE_PREVIEW_LIMIT = LOCAL_PREVIEW_LIMITS.database;
 
 export function workspaceLocalPreviewLimit(path: string): number {
   if (/\.(?:sqlite|sqlite3|db|db3)$/i.test(path)) return LOCAL_DATABASE_PREVIEW_LIMIT;
