@@ -9,6 +9,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
+    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -58,26 +59,40 @@ impl GitService {
     pub fn status(&self) -> Result<GitStatus, WorkspaceServiceError> {
         self.ensure_repo()?;
         let branch = self.text(&["branch", "--show-current"])?.trim().to_string();
-        let output = self.output(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+        let output = self.output(&["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."])?;
         self.success(&output)?;
+        let repository_root = self.repository_root()?;
         let mut changes = Vec::new();
-        for raw in output.stdout.split(|byte| *byte == 0).filter(|part| !part.is_empty()) {
-            if raw.len() < 3 { continue; }
+        let records: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).filter(|part| !part.is_empty()).collect();
+        let mut index = 0;
+        while index < records.len() {
+            let raw = records[index];
+            if raw.len() < 3 { index += 1; continue; }
             let x = raw[0] as char;
             let y = raw[1] as char;
-            let path = String::from_utf8_lossy(&raw[3..]).into_owned();
+            let path = self.project_relative_git_path(&repository_root, &String::from_utf8_lossy(&raw[3..]))?;
+            let renamed_or_copied = matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C');
+            let old_path = if renamed_or_copied {
+                index += 1;
+                let raw_old_path = records.get(index).ok_or_else(|| WorkspaceServiceError::invalid("missing original path for renamed git entry"))?;
+                Some(self.project_relative_git_path(&repository_root, &String::from_utf8_lossy(raw_old_path))?)
+            } else {
+                None
+            };
             if x == '?' && y == '?' {
                 changes.push(GitChange { path, old_path: None, status: "untracked".into(), staged: false });
             } else {
-                if x != ' ' { changes.push(GitChange { path: path.clone(), old_path: None, status: status_name(x), staged: true }); }
-                if y != ' ' { changes.push(GitChange { path, old_path: None, status: status_name(y), staged: false }); }
+                if x != ' ' { changes.push(GitChange { path: path.clone(), old_path: old_path.clone(), status: status_name(x), staged: true }); }
+                if y != ' ' { changes.push(GitChange { path, old_path, status: status_name(y), staged: false }); }
             }
+            index += 1;
         }
         changes.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| b.staged.cmp(&a.staged)));
         let mut hasher = Sha256::new();
         hasher.update(branch.as_bytes());
         for change in &changes {
             hasher.update(change.path.as_bytes()); hasher.update(change.status.as_bytes()); hasher.update([change.staged as u8]);
+            if let Some(old_path) = &change.old_path { hasher.update(old_path.as_bytes()); }
         }
         Ok(GitStatus { branch, changes, fingerprint: format!("{:x}", hasher.finalize()) })
     }
@@ -189,6 +204,15 @@ impl GitService {
     }
     fn mutation_result(&self)->Result<GitMutationResult,WorkspaceServiceError>{Ok(GitMutationResult{operation_id:format!("git-{}",SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()),summary:self.summary()?})}
     fn lock_mutation(&self)->Result<std::sync::MutexGuard<'_,()>,WorkspaceServiceError>{self.mutation.try_lock().map_err(|_|WorkspaceServiceError::busy())}
+    fn repository_root(&self)->Result<PathBuf,WorkspaceServiceError>{
+        let root=self.text(&["rev-parse","--show-toplevel"])?;
+        PathBuf::from(root.trim()).canonicalize().map_err(WorkspaceServiceError::io)
+    }
+    fn project_relative_git_path(&self,repository_root:&Path,path:&str)->Result<String,WorkspaceServiceError>{
+        let absolute=repository_root.join(path);
+        let relative=absolute.strip_prefix(self.root.path()).map_err(|_|WorkspaceServiceError::outside_project())?;
+        Ok(relative.to_string_lossy().replace('\\',"/"))
+    }
     fn validate_paths(&self,paths:&[String])->Result<(),WorkspaceServiceError>{if paths.is_empty(){return Err(WorkspaceServiceError::invalid("at least one path is required"));}for path in paths{self.root.lexical_path(path)?;}Ok(())}
     fn validate_branch(&self,name:&str)->Result<(),WorkspaceServiceError>{if name.is_empty(){return Err(WorkspaceServiceError::invalid("branch name is required"));}let output=self.output(&["check-ref-format","--branch",name])?;if output.status.success(){Ok(())}else{Err(WorkspaceServiceError::invalid("invalid branch name"))}}
     fn ensure_repo(&self)->Result<(),WorkspaceServiceError>{let output=self.output(&["rev-parse","--git-dir"])?;if output.status.success(){Ok(())}else{Err(WorkspaceServiceError::new(WorkspaceErrorCode::NotGitRepository,"current project is not a Git repository",false))}}

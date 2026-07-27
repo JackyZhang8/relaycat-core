@@ -132,6 +132,13 @@ test("Markdown preview switches locally without requesting the file again", () =
   assert.doesNotMatch(setter, /invoke\s*</);
 });
 
+test("stale file previews resolve without a success value", () => {
+  const previewFile = workspacePanelSource.match(
+    /async function previewFile[\s\S]*?\n  }/,
+  )?.[0] ?? "";
+  assert.doesNotMatch(previewFile, /projectRevision !== revision\) return true;/);
+});
+
 test("developer preview switches locally while JSON stays in source mode", () => {
   assert.match(workspacePanelSource, /developerPreviewKind/);
   assert.doesNotMatch(workspacePanelSource, /parseJsonPreview/);

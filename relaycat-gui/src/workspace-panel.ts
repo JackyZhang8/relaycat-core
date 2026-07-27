@@ -543,7 +543,7 @@ export function createWorkspacePanel(
         relativePath,
         maxBytes: workspaceLocalPreviewLimit(relativePath),
       });
-      if (project !== activeProject || projectRevision !== revision) return true;
+      if (project !== activeProject || projectRevision !== revision) return;
       renderPreview(title, preview, false, relativePath);
     } catch (error) {
       if (project !== activeProject || projectRevision !== revision) return;
