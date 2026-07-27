@@ -1,8 +1,36 @@
 use relaycat_protocol::{
-    ArchiveEntry, CliMetadata, FilePreview, PlainMsg, WorkspaceEvent, WorkspaceEventEnvelope,
+    ArchiveEntry, CliMetadata, DatabaseColumn, DatabaseObject, FilePreview, PlainMsg, WorkspaceEvent, WorkspaceEventEnvelope,
     WorkspaceRequest, WorkspaceRequestEnvelope, WorkspaceResponse, WorkspaceResponseEnvelope,
     decode_plain_msg, encode_plain_msg, plain_msg_type, plain_msg_types,
 };
+
+#[test]
+fn database_file_preview_round_trips() {
+    let msg = PlainMsg::WorkspaceResponse(WorkspaceResponseEnvelope {
+        request_id: "req-database".to_string(),
+        project_id: "project-1".to_string(),
+        result: Ok(WorkspaceResponse::File(FilePreview::Database {
+            path: "cache.sqlite".to_string(),
+            format: "sqlite".to_string(),
+            size: 4096,
+            objects: vec![DatabaseObject {
+                name: "prices".to_string(),
+                kind: "table".to_string(),
+                table_name: None,
+                columns: vec![DatabaseColumn {
+                    name: "symbol".to_string(),
+                    declared_type: "TEXT".to_string(),
+                    nullable: false,
+                    primary_key: true,
+                }],
+            }],
+            has_more: false,
+        })),
+    });
+
+    let encoded = encode_plain_msg(&msg).expect("encode database preview");
+    assert_eq!(decode_plain_msg(&encoded).expect("decode database preview"), msg);
+}
 
 #[test]
 fn workspace_request_round_trips() {

@@ -20,6 +20,7 @@ import {
   workspaceCommitPresentation,
   workspaceEntryDecoration,
   workspacePanelWidth,
+  workspaceLocalPreviewLimit,
 } from "../src/workspace-model.ts";
 
 const workspacePanelSource = readFileSync(
@@ -74,11 +75,27 @@ test("extracts a project name from Unix and Windows paths", () => {
   assert.equal(projectBasename("C:\\work\\relaycat"), "relaycat");
 });
 
+test("uses wider local preview limits by development file category", () => {
+  assert.equal(workspaceLocalPreviewLimit("README.md"), 8 * 1024 * 1024);
+  assert.equal(workspaceLocalPreviewLimit("diagram.png"), 20 * 1024 * 1024);
+  assert.equal(workspaceLocalPreviewLimit("cache.sqlite"), 512 * 1024 * 1024);
+  assert.equal(workspaceLocalPreviewLimit("src/main.swift"), 4 * 1024 * 1024);
+});
+
 test("detects common source languages from file names", () => {
   assert.equal(previewLanguage("src/main.ts"), "typescript");
   assert.equal(previewLanguage("src/lib.rs"), "rust");
   assert.equal(previewLanguage("config.yaml"), "yaml");
   assert.equal(previewLanguage("LICENSE"), null);
+});
+
+test("detects special development filenames and formats", () => {
+  assert.equal(previewLanguage("Dockerfile"), "shell");
+  assert.equal(previewLanguage("Makefile"), "shell");
+  assert.equal(previewLanguage("CMakeLists.txt"), "shell");
+  assert.equal(previewLanguage("schema.graphql"), "plain");
+  assert.equal(previewLanguage("change.patch"), "diff");
+  assert.equal(previewLanguage("certificate.pem"), "plain");
 });
 
 test("detects mainstream native and JVM source languages", () => {
@@ -99,8 +116,8 @@ test("detects Markdown preview files case-insensitively", () => {
   assert.equal(isMarkdownPreviewPath("src/markdown.ts"), false);
 });
 
-test("GUI renders Markdown up to the existing 512 KiB text limit", () => {
-  assert.equal(MARKDOWN_RENDER_LIMIT, 512 * 1024);
+test("GUI renders Markdown up to its wider local 8 MiB limit", () => {
+  assert.equal(MARKDOWN_RENDER_LIMIT, 8 * 1024 * 1024);
   assert.equal(canRenderMarkdown(MARKDOWN_RENDER_LIMIT), true);
   assert.equal(canRenderMarkdown(MARKDOWN_RENDER_LIMIT + 1), false);
 });
@@ -111,6 +128,19 @@ test("Markdown preview switches locally without requesting the file again", () =
   assert.match(workspacePanelSource, /setMarkdownDisplayMode/);
   const setter = workspacePanelSource.match(
     /function setMarkdownDisplayMode[\s\S]*?\n  }/,
+  )?.[0] ?? "";
+  assert.doesNotMatch(setter, /invoke\s*</);
+});
+
+test("developer preview switches locally while JSON stays in source mode", () => {
+  assert.match(workspacePanelSource, /developerPreviewKind/);
+  assert.doesNotMatch(workspacePanelSource, /parseJsonPreview/);
+  assert.doesNotMatch(workspacePanelSource, /parseJsonLinesPreview/);
+  assert.match(workspacePanelSource, /parseDelimitedPreview/);
+  assert.match(workspacePanelSource, /sanitizeSvgPreview/);
+  assert.match(workspacePanelSource, /setDeveloperDisplayMode/);
+  const setter = workspacePanelSource.match(
+    /function setDeveloperDisplayMode[\s\S]*?\n  }/,
   )?.[0] ?? "";
   assert.doesNotMatch(setter, /invoke\s*</);
 });

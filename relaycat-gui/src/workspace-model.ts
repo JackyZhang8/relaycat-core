@@ -19,13 +19,25 @@ export interface WorkspaceEntriesPage {
 }
 
 export interface FilePreview {
-  kind: "text" | "image" | "archive" | "binary" | "too_large";
+  kind: "text" | "image" | "archive" | "database" | "binary" | "too_large";
   content: string;
   mime_type: string | null;
   size_bytes: number;
 }
 
-export const MARKDOWN_RENDER_LIMIT = 512 * 1024;
+export const LOCAL_TEXT_PREVIEW_LIMIT = 4 * 1024 * 1024;
+export const LOCAL_MARKDOWN_PREVIEW_LIMIT = 8 * 1024 * 1024;
+export const LOCAL_IMAGE_PREVIEW_LIMIT = 20 * 1024 * 1024;
+export const LOCAL_DATABASE_PREVIEW_LIMIT = 512 * 1024 * 1024;
+
+export function workspaceLocalPreviewLimit(path: string): number {
+  if (/\.(?:sqlite|sqlite3|db|db3)$/i.test(path)) return LOCAL_DATABASE_PREVIEW_LIMIT;
+  if (/\.(?:png|jpe?g|gif|webp)$/i.test(path)) return LOCAL_IMAGE_PREVIEW_LIMIT;
+  if (/\.(?:md|markdown)$/i.test(path)) return LOCAL_MARKDOWN_PREVIEW_LIMIT;
+  return LOCAL_TEXT_PREVIEW_LIMIT;
+}
+
+export const MARKDOWN_RENDER_LIMIT = LOCAL_MARKDOWN_PREVIEW_LIMIT;
 
 export function isMarkdownPreviewPath(path: string): boolean {
   return /\.(?:md|markdown)$/i.test(path);
@@ -123,7 +135,9 @@ export type PreviewLanguage =
   | "kotlin"
   | "php"
   | "ruby"
-  | "objective-c";
+  | "objective-c"
+  | "plain"
+  | "diff";
 
 export type PreviewTokenKind = "plain" | "keyword" | "string" | "number" | "comment";
 
@@ -133,7 +147,15 @@ export interface PreviewToken {
 }
 
 export function previewLanguage(_path: string): PreviewLanguage | null {
-  const extension = _path.split(/[\\/]/).pop()?.split(".").pop()?.toLowerCase();
+  const fileName = _path.split(/[\\/]/).pop()?.toLowerCase() ?? "";
+  const special: Record<string, PreviewLanguage> = {
+    dockerfile: "shell", containerfile: "shell", makefile: "shell", gnumakefile: "shell",
+    "cmakelists.txt": "shell", jenkinsfile: "shell", procfile: "shell", podfile: "ruby",
+    gemfile: "ruby", rakefile: "ruby", ".env": "plain", ".editorconfig": "plain",
+    ".gitignore": "plain", ".dockerignore": "plain",
+  };
+  if (special[fileName]) return special[fileName];
+  const extension = fileName.split(".").pop();
   if (!extension || extension === _path.toLowerCase()) return null;
   const languages: Record<string, PreviewLanguage> = {
     ts: "typescript",
@@ -149,6 +171,11 @@ export function previewLanguage(_path: string): PreviewLanguage | null {
     bash: "shell",
     zsh: "shell",
     json: "json",
+    jsonc: "json",
+    json5: "json",
+    jsonl: "json",
+    ndjson: "json",
+    map: "json",
     md: "markdown",
     markdown: "markdown",
     html: "html",
@@ -176,6 +203,33 @@ export function previewLanguage(_path: string): PreviewLanguage | null {
     rb: "ruby",
     m: "objective-c",
     mm: "objective-c",
+    diff: "diff",
+    patch: "diff",
+    csv: "plain",
+    tsv: "plain",
+    graphql: "plain",
+    gql: "plain",
+    proto: "plain",
+    dart: "plain",
+    lua: "plain",
+    scala: "plain",
+    vue: "html",
+    svelte: "html",
+    tf: "plain",
+    tfvars: "plain",
+    hcl: "plain",
+    nix: "plain",
+    sql: "plain",
+    gradle: "plain",
+    groovy: "plain",
+    ini: "plain",
+    conf: "plain",
+    properties: "plain",
+    env: "plain",
+    plist: "plain",
+    pem: "plain",
+    crt: "plain",
+    cer: "plain",
   };
   return languages[extension] ?? null;
 }

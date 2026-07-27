@@ -7,6 +7,18 @@ use std::{cmp::Ordering, fs, path::Path};
 
 pub const TEXT_PREVIEW_LIMIT: u64 = 512 * 1024;
 pub const IMAGE_PREVIEW_LIMIT: u64 = 1024 * 1024;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilePreviewLimits {
+    pub text: u64,
+    pub image: u64,
+    pub database: u64,
+}
+
+pub const MOBILE_FILE_PREVIEW_LIMITS: FilePreviewLimits = FilePreviewLimits {
+    text: TEXT_PREVIEW_LIMIT,
+    image: IMAGE_PREVIEW_LIMIT,
+    database: crate::database::DATABASE_PREVIEW_SOURCE_LIMIT,
+};
 const IGNORED_DIRECTORIES: &[&str] = &[
     ".git",
     "node_modules",
@@ -65,13 +77,34 @@ impl FileService {
     }
 
     pub fn read(&self, path: &str, max_bytes: u32, variant: ImageVariant) -> Result<FilePreview, WorkspaceServiceError> {
+        self.read_with_limits(path, u64::from(max_bytes), variant, MOBILE_FILE_PREVIEW_LIMITS)
+    }
+
+    pub fn read_with_limits(
+        &self,
+        path: &str,
+        max_bytes: u64,
+        variant: ImageVariant,
+        limits: FilePreviewLimits,
+    ) -> Result<FilePreview, WorkspaceServiceError> {
         let resolved = self.root.resolve(path)?;
         let metadata = fs::metadata(&resolved).map_err(WorkspaceServiceError::io)?;
         if !metadata.is_file() { return Err(WorkspaceServiceError::invalid("path is not a file")); }
+        if let Some(preview) = crate::database::preview(
+            &resolved,
+            path,
+            metadata.len(),
+            limits.database,
+        ) {
+            return Ok(preview);
+        }
+        if is_known_unsupported_binary(&resolved) {
+            return Ok(FilePreview::Binary { path: path.to_string(), size: metadata.len() });
+        }
         if let Some(preview) = crate::archive::preview(&resolved, path, metadata.len())? { return Ok(preview); }
         let image = image_kind(&resolved);
-        let ceiling = if image.is_some() { IMAGE_PREVIEW_LIMIT } else { TEXT_PREVIEW_LIMIT };
-        let limit = u64::from(max_bytes.max(1)).min(ceiling);
+        let ceiling = if image.is_some() { limits.image } else { limits.text };
+        let limit = max_bytes.max(1).min(ceiling);
         if metadata.len() > limit {
             return Ok(FilePreview::TooLarge { path: path.to_string(), size: metadata.len(), limit });
         }
@@ -100,6 +133,16 @@ impl FileService {
     }
 }
 
+fn is_known_unsupported_binary(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase().as_str(),
+        "parquet" | "arrow" | "feather" | "avro" | "orc"
+            | "sqlite" | "sqlite3" | "db" | "db3"
+            | "wasm" | "class" | "dex" | "o" | "obj" | "a" | "lib"
+            | "so" | "dylib" | "dll" | "exe" | "pdb"
+    )
+}
+
 fn thumbnail_jpeg(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let decoded = image::load_from_memory(bytes).ok()?;
     let resized = decoded.resize(512, 512, image::imageops::FilterType::Lanczos3);
@@ -112,15 +155,39 @@ fn thumbnail_jpeg(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     Some((output, width, height))
 }
 
+#[cfg(windows)]
 fn slash_path(path: &Path) -> String { path.to_string_lossy().replace('\\', "/") }
 
+#[cfg(not(windows))]
+fn slash_path(path: &Path) -> String { path.to_string_lossy().into_owned() }
+
 pub fn language_for(path: &Path) -> &'static str {
+    let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+    match file_name.as_str() {
+        "dockerfile" | "containerfile" => return "dockerfile",
+        "makefile" | "gnumakefile" => return "makefile",
+        "cmakelists.txt" => return "cmake",
+        "jenkinsfile" => return "groovy",
+        "procfile" => return "shell",
+        "podfile" => return "ruby",
+        "gemfile" | "rakefile" => return "ruby",
+        ".env" | ".editorconfig" | ".gitignore" | ".dockerignore" => return "config",
+        _ => {}
+    }
     match path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
         "rs" => "rust", "swift" => "swift", "kt" | "kts" => "kotlin",
-        "js" | "jsx" => "javascript", "ts" | "tsx" => "typescript", "json" => "json",
-        "toml" => "toml", "yaml" | "yml" => "yaml", "md" => "markdown",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript", "ts" | "tsx" => "typescript",
+        "json" | "jsonc" | "json5" | "jsonl" | "ndjson" | "map" => "json",
+        "toml" => "toml", "yaml" | "yml" => "yaml", "md" | "markdown" => "markdown",
         "sh" | "zsh" | "bash" => "shell", "css" => "css", "html" | "htm" => "html",
         "py" => "python", "go" => "go", "c" | "h" => "c", "cpp" | "cc" | "hpp" => "cpp",
+        "diff" | "patch" => "diff", "csv" | "tsv" => "csv", "svg" => "svg",
+        "xml" => "xml", "scss" | "less" => "css", "cs" => "csharp", "java" => "java",
+        "php" => "php", "rb" => "ruby", "m" | "mm" => "objective-c", "sql" => "sql",
+        "graphql" | "gql" => "graphql", "proto" => "protobuf", "dart" => "dart",
+        "lua" => "lua", "scala" => "scala", "vue" => "vue", "svelte" => "svelte",
+        "tf" | "tfvars" | "hcl" => "hcl", "nix" => "nix", "gradle" | "groovy" => "groovy",
+        "ini" | "conf" | "properties" | "env" | "plist" => "config",
         _ => "plain_text",
     }
 }

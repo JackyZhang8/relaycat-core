@@ -20,7 +20,7 @@ impl ArchiveKind {
         let name = path.file_name()?.to_str()?.to_ascii_lowercase();
         if name.ends_with(".tar.gz") { Some(Self::TarGz) }
         else if name.ends_with(".tgz") { Some(Self::Tgz) }
-        else if name.ends_with(".zip") { Some(Self::Zip) }
+        else if [".zip", ".jar", ".war", ".ear", ".apk", ".aab", ".aar", ".ipa", ".whl", ".egg", ".nupkg", ".vsix", ".crx"].iter().any(|suffix|name.ends_with(suffix)) { Some(Self::Zip) }
         else if name.ends_with(".7z") { Some(Self::SevenZ) }
         else if name.ends_with(".tar") { Some(Self::Tar) }
         else if name.ends_with(".gz") { Some(Self::Gz) }

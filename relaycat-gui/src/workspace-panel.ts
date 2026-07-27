@@ -1,6 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import { renderSafeMarkdown } from "./markdown-preview";
+import {
+  developerPreviewKind,
+  parseDelimitedPreview,
+  sanitizeSvgPreview,
+  type DeveloperPreviewKind,
+} from "./developer-preview";
 
 import {
   canCommit,
@@ -29,6 +35,7 @@ import {
   tokenizePreviewLine,
   workspaceCommitPresentation,
   workspacePanelWidth,
+  workspaceLocalPreviewLimit,
   workspaceEntryDecoration,
   workspacePreviewStartsCollapsed,
   type FilePreview,
@@ -157,6 +164,11 @@ export function createWorkspacePanel(
   let markdownSource: string | null = null;
   let markdownSourcePath = "";
   let markdownRenderedHtml = "";
+  let developerDisplayMode: "preview" | "source" = "preview";
+  let developerSource: string | null = null;
+  let developerSourcePath = "";
+  let activeDeveloperPreviewKind: DeveloperPreviewKind = null;
+  let developerRenderer: (() => void) | null = null;
   const directoryObservers = new Set<IntersectionObserver>();
 
   panel.classList.add("files-mode");
@@ -212,6 +224,8 @@ export function createWorkspacePanel(
   }
 
   function clearPreview() {
+    resetMarkdownPreview();
+    resetDeveloperPreview();
     previewTitle.textContent = t("workspace_preview");
     previewNotice.textContent = "";
     previewNotice.classList.remove("show");
@@ -231,6 +245,93 @@ export function createWorkspacePanel(
     markdownRenderedHtml = "";
     markdownPreview.hidden = true;
     markdownPreview.innerHTML = "";
+  }
+
+  function resetDeveloperPreview() {
+    developerDisplayMode = "preview";
+    developerSource = null;
+    developerSourcePath = "";
+    activeDeveloperPreviewKind = null;
+    developerRenderer = null;
+    markdownPreview.classList.remove("ws-developer-preview");
+  }
+
+  function renderDeveloperActions(enabled: boolean) {
+    previewActions.innerHTML = "";
+    const group = document.createElement("div");
+    group.className = "ws-markdown-toggle";
+    for (const value of ["preview", "source"] as const) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ws-small-btn";
+      button.textContent = t(
+        value === "preview" ? "workspace_markdown_preview" : "workspace_markdown_source",
+      );
+      button.disabled = !enabled;
+      button.classList.toggle("active", developerDisplayMode === value);
+      button.onclick = () => setDeveloperDisplayMode(value);
+      group.appendChild(button);
+    }
+    previewActions.appendChild(group);
+  }
+
+  function setDeveloperDisplayMode(value: "preview" | "source") {
+    if (developerSource === null) return;
+    developerDisplayMode = value;
+    renderDeveloperActions(true);
+    markdownPreview.innerHTML = "";
+    if (value === "preview") {
+      if (activeDeveloperPreviewKind === "diff") {
+        markdownPreview.hidden = true;
+        previewCode.hidden = false;
+        renderHighlightedDiff(developerSource, developerSourcePath);
+      } else {
+        previewCode.hidden = true;
+        markdownPreview.hidden = false;
+        developerRenderer?.();
+      }
+    } else {
+      markdownPreview.hidden = true;
+      previewCode.hidden = false;
+      renderHighlightedText(developerSource, developerSourcePath);
+    }
+  }
+
+  function prepareDeveloperPreview(content: string, path: string, kind: Exclude<DeveloperPreviewKind, null>): boolean {
+    markdownPreview.classList.add("ws-developer-preview");
+    let renderer: () => void;
+    try {
+      if (kind === "table") {
+        const delimiter = path.toLowerCase().endsWith(".tsv") ? "\t" : ",";
+        const tablePreview = parseDelimitedPreview(content, delimiter);
+        renderer = () => {
+          const wrapper = document.createElement("div");
+          wrapper.className = "ws-table-wrap";
+          const table = document.createElement("table");
+          const head = document.createElement("thead");
+          const headRow = document.createElement("tr");
+          for (const value of tablePreview.headers) { const cell = document.createElement("th"); cell.textContent = value; headRow.appendChild(cell); }
+          head.appendChild(headRow); table.appendChild(head);
+          const body = document.createElement("tbody");
+          for (const row of tablePreview.rows) { const tr = document.createElement("tr"); for (const value of row) { const cell = document.createElement("td"); cell.textContent = value; tr.appendChild(cell); } body.appendChild(tr); }
+          table.appendChild(body); wrapper.appendChild(table); markdownPreview.appendChild(wrapper);
+        };
+      } else if (kind === "svg") {
+        const safe = sanitizeSvgPreview(content);
+        renderer = () => { const frame = document.createElement("div"); frame.className = "ws-svg-preview"; frame.innerHTML = safe; markdownPreview.appendChild(frame); };
+      } else {
+        renderer = () => {};
+      }
+    } catch {
+      return false;
+    }
+    developerDisplayMode = "preview";
+    developerSource = content;
+    developerSourcePath = path;
+    activeDeveloperPreviewKind = kind;
+    developerRenderer = renderer;
+    setDeveloperDisplayMode("preview");
+    return true;
   }
 
   function renderMarkdownActions(enabled: boolean) {
@@ -360,6 +461,7 @@ export function createWorkspacePanel(
     sourcePath = title,
   ) {
     resetMarkdownPreview();
+    resetDeveloperPreview();
     previewActions.innerHTML = "";
     previewTitle.textContent = title;
     previewImage.hidden = true;
@@ -399,6 +501,10 @@ export function createWorkspacePanel(
       }
       return;
     }
+    if (!diff && preview.kind === "text") {
+      const kind = developerPreviewKind(sourcePath);
+      if (kind && prepareDeveloperPreview(preview.content, sourcePath, kind)) return;
+    }
     if (!diff) {
       renderHighlightedText(preview.content, sourcePath);
       return;
@@ -408,6 +514,7 @@ export function createWorkspacePanel(
 
   function showPreviewLoading(title: string, sourcePath = title) {
     resetMarkdownPreview();
+    resetDeveloperPreview();
     previewActions.innerHTML = "";
     setPreviewCollapsed(false);
     previewTitle.textContent = title;
@@ -418,6 +525,7 @@ export function createWorkspacePanel(
     previewCode.hidden = false;
     previewCode.textContent = t("workspace_loading");
     if (isMarkdownPreviewPath(sourcePath)) renderMarkdownActions(false);
+    else if (developerPreviewKind(sourcePath)) renderDeveloperActions(false);
   }
 
   function renderLoadError(container: HTMLElement, error: unknown) {
@@ -433,7 +541,7 @@ export function createWorkspacePanel(
       const preview = await invoke<FilePreview>("read_workspace_file", {
         project: activeProject,
         relativePath,
-        maxBytes: 512 * 1024,
+        maxBytes: workspaceLocalPreviewLimit(relativePath),
       });
       if (project !== activeProject || projectRevision !== revision) return true;
       renderPreview(title, preview, false, relativePath);

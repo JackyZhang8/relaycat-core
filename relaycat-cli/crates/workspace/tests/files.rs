@@ -1,8 +1,9 @@
 use relaycat_protocol::{FilePreview, ImageVariant};
 use relaycat_workspace::{
-    ARCHIVE_PREVIEW_SOURCE_LIMIT, FileService, ProjectRoot, IMAGE_PREVIEW_LIMIT,
-    TEXT_PREVIEW_LIMIT,
+    language_for, ARCHIVE_PREVIEW_SOURCE_LIMIT, DATABASE_PREVIEW_SOURCE_LIMIT, FileService,
+    ProjectRoot, IMAGE_PREVIEW_LIMIT, TEXT_PREVIEW_LIMIT,
 };
+use rusqlite::Connection;
 use std::{
     fs,
     fs::File,
@@ -64,9 +65,101 @@ fn previews_text_binary_large_and_image_files() {
 }
 
 #[test]
+fn known_developer_binary_formats_are_not_misclassified_as_text() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("sample.parquet"), b"PAR1 printable fixture").unwrap();
+    let service = FileService::new(ProjectRoot::open(&fixture.root).unwrap());
+
+    assert!(matches!(
+        service.read("sample.parquet", 512 * 1024, ImageVariant::Thumbnail).unwrap(),
+        FilePreview::Binary { ref path, size } if path == "sample.parquet" && size == 22
+    ));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn windows_style_filename_survives_list_to_read_round_trip() {
+    let fixture = Fixture::new();
+    let filename = r"C:\market\bars.parquet";
+    fs::write(fixture.root.join(filename), b"PAR1 printable fixture").unwrap();
+    let service = FileService::new(ProjectRoot::open(&fixture.root).unwrap());
+
+    let page = service.list("", 0, 100).unwrap();
+    let entry = page.entries.iter().find(|entry| entry.name == filename).unwrap();
+    assert_eq!(entry.path, filename);
+    assert!(matches!(
+        service.read(&entry.path, 512 * 1024, ImageVariant::Thumbnail).unwrap(),
+        FilePreview::Binary { ref path, size } if path == filename && size == 22
+    ));
+}
+
+#[test]
 fn preview_limits_keep_text_at_512_kib_and_images_at_1_mib() {
     assert_eq!(TEXT_PREVIEW_LIMIT, 512 * 1024);
     assert_eq!(IMAGE_PREVIEW_LIMIT, 1024 * 1024);
+}
+
+#[test]
+fn sqlite_preview_returns_schema_without_reading_rows() {
+    let fixture = Fixture::new();
+    let database_path = fixture.root.join("prices.sqlite");
+    let connection = Connection::open(&database_path).unwrap();
+    connection.execute_batch(
+        "CREATE TABLE prices(symbol TEXT PRIMARY KEY, close REAL NOT NULL, note TEXT);\
+         INSERT INTO prices VALUES ('SECRET_ROW', 10.5, 'must not be returned');\
+         CREATE INDEX prices_close_idx ON prices(close);\
+         CREATE VIEW priced_symbols AS SELECT symbol, close FROM prices;",
+    ).unwrap();
+    drop(connection);
+    let size = fs::metadata(&database_path).unwrap().len();
+    let service = FileService::new(ProjectRoot::open(&fixture.root).unwrap());
+
+    let preview = service.read("prices.sqlite", 1, ImageVariant::Thumbnail).unwrap();
+    assert!(matches!(preview, FilePreview::Database {
+        ref path, ref format, size: preview_size, ref objects, has_more: false
+    } if path == "prices.sqlite"
+        && format == "sqlite"
+        && preview_size == size
+        && objects.iter().any(|object| object.kind == "table"
+            && object.name == "prices"
+            && object.columns.iter().any(|column| column.name == "symbol" && column.primary_key))
+        && objects.iter().any(|object| object.kind == "index"
+            && object.name == "prices_close_idx"
+            && object.table_name.as_deref() == Some("prices"))
+        && objects.iter().any(|object| object.kind == "view" && object.name == "priced_symbols")
+        && !format!("{objects:?}").contains("SECRET_ROW")
+        && !format!("{objects:?}").contains("must not be returned")));
+}
+
+#[test]
+fn sqlite_magic_header_is_detected_without_an_extension() {
+    let fixture = Fixture::new();
+    let database_path = fixture.root.join("cache-data");
+    let connection = Connection::open(&database_path).unwrap();
+    connection.execute_batch("CREATE TABLE jobs(id INTEGER PRIMARY KEY, name TEXT);").unwrap();
+    drop(connection);
+    let service = FileService::new(ProjectRoot::open(&fixture.root).unwrap());
+
+    assert!(matches!(
+        service.read("cache-data", 1, ImageVariant::Thumbnail).unwrap(),
+        FilePreview::Database { ref format, .. } if format == "sqlite"
+    ));
+}
+
+#[test]
+fn oversized_sqlite_is_rejected_before_opening() {
+    let fixture = Fixture::new();
+    let database_path = fixture.root.join("large.sqlite");
+    let mut file = File::create(&database_path).unwrap();
+    file.write_all(b"SQLite format 3\0").unwrap();
+    file.set_len(DATABASE_PREVIEW_SOURCE_LIMIT + 1).unwrap();
+    let service = FileService::new(ProjectRoot::open(&fixture.root).unwrap());
+
+    assert!(matches!(
+        service.read("large.sqlite", 1, ImageVariant::Thumbnail).unwrap(),
+        FilePreview::TooLarge { size, limit, .. }
+            if size == DATABASE_PREVIEW_SOURCE_LIMIT + 1 && limit == DATABASE_PREVIEW_SOURCE_LIMIT
+    ));
 }
 
 #[test]
@@ -142,6 +235,38 @@ fn thumbnail_variant_resizes_to_512_pixels_while_original_is_preserved() {
 
     let original = service.read("wide.png", 1024 * 1024, ImageVariant::Original).unwrap();
     assert!(matches!(original, FilePreview::Image { width: 1024, height: 256, ref bytes, .. } if bytes == &source));
+}
+
+#[test]
+fn developer_files_and_package_archives_are_recognized() {
+    let fixture = Fixture::new();
+    for (name, expected) in [
+        ("Dockerfile", "dockerfile"),
+        ("Makefile", "makefile"),
+        ("CMakeLists.txt", "cmake"),
+        ("change.patch", "diff"),
+        ("events.jsonl", "json"),
+        ("table.csv", "csv"),
+        ("diagram.svg", "svg"),
+        ("schema.graphql", "graphql"),
+        ("api.proto", "protobuf"),
+        ("main.tf", "hcl"),
+        ("query.sql", "sql"),
+        ("certificate.pem", "plain_text"),
+    ] {
+        assert_eq!(language_for(std::path::Path::new(name)), expected, "{name}");
+    }
+
+    fs::write(fixture.root.join("certificate.pem"), "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n").unwrap();
+    let service = FileService::new(ProjectRoot::open(&fixture.root).unwrap());
+    assert!(matches!(service.read("certificate.pem", 512 * 1024, ImageVariant::Thumbnail).unwrap(), FilePreview::Text { .. }));
+
+    for extension in ["jar", "apk", "ipa", "aar", "whl", "nupkg", "vsix"] {
+        let name = format!("package.{extension}");
+        fs::copy(fixture.root.join("bundle.zip"), fixture.root.join(&name)).unwrap();
+        let preview = service.read(&name, 1, ImageVariant::Thumbnail).unwrap();
+        assert!(matches!(preview, FilePreview::Archive { ref entries, .. } if entries.len() == 50), "{name}");
+    }
 }
 
 fn minimal_png() -> Vec<u8> {

@@ -79,7 +79,23 @@ pub enum FilePreview {
     Text { path: String, language: String, content: String, truncated: bool },
     Image { path: String, mime: String, width: u32, height: u32, bytes: Vec<u8>, truncated: bool },
     Archive { path: String, format: String, entries: Vec<ArchiveEntry>, has_more: bool },
+    Database { path: String, format: String, size: u64, objects: Vec<DatabaseObject>, has_more: bool },
     Binary { path: String, size: u64 }, TooLarge { path: String, size: u64, limit: u64 },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseObject {
+    pub name: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_name: Option<String>,
+    pub columns: Vec<DatabaseColumn>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseColumn {
+    pub name: String,
+    pub declared_type: String,
+    pub nullable: bool,
+    pub primary_key: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveEntry {

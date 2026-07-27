@@ -1,12 +1,17 @@
 mod archive;
+mod database;
 mod files;
 mod git;
 mod security;
 mod service;
 mod shell;
 
-pub use files::{FileService, IMAGE_PREVIEW_LIMIT, TEXT_PREVIEW_LIMIT, language_for};
+pub use files::{
+    FilePreviewLimits, FileService, IMAGE_PREVIEW_LIMIT, MOBILE_FILE_PREVIEW_LIMITS,
+    TEXT_PREVIEW_LIMIT, language_for,
+};
 pub use archive::ARCHIVE_PREVIEW_SOURCE_LIMIT;
+pub use database::{DATABASE_PREVIEW_OBJECT_LIMIT, DATABASE_PREVIEW_SOURCE_LIMIT};
 pub use git::GitService;
 pub use security::{ProjectRoot, WorkspaceServiceError};
 pub use service::WorkspaceService;

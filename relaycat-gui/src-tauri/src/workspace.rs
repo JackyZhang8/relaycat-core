@@ -4,7 +4,7 @@ use crate::git::runner::git_output;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use relaycat_protocol::{DirectoryPage, FilePreview, ImageVariant};
-use relaycat_workspace::{FileService, ProjectRoot, IMAGE_PREVIEW_LIMIT};
+use relaycat_workspace::{FilePreviewLimits, FileService, ProjectRoot};
 use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -49,6 +49,7 @@ pub enum PreviewKind {
     Text,
     Image,
     Archive,
+    Database,
     Binary,
     TooLarge,
 }
@@ -88,7 +89,10 @@ pub struct GitCommitDto {
 
 const MAX_DIRECTORY_ENTRIES: usize = 1000;
 const DIRECTORY_PAGE_SIZE: usize = 100;
-const MAX_FILE_PREVIEW_BYTES: u64 = 512 * 1024;
+const MAX_LOCAL_TEXT_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_LOCAL_MARKDOWN_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_LOCAL_IMAGE_PREVIEW_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_LOCAL_DATABASE_PREVIEW_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DIFF_BYTES: usize = 1024 * 1024;
 
 fn project_root(project: &Path) -> Result<PathBuf, String> {
@@ -148,13 +152,23 @@ fn read_workspace_file_impl(
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase)
         .filter(|extension| matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"));
-    let requested = if image_extension.is_some() {
-        IMAGE_PREVIEW_LIMIT
-    } else {
-        max_bytes.clamp(1, MAX_FILE_PREVIEW_BYTES)
-    };
+    let is_markdown = matches!(
+        Path::new(relative_path).extension().and_then(|extension| extension.to_str()).map(str::to_ascii_lowercase).as_deref(),
+        Some("md" | "markdown")
+    );
+    let text_ceiling = if is_markdown { MAX_LOCAL_MARKDOWN_PREVIEW_BYTES } else { MAX_LOCAL_TEXT_PREVIEW_BYTES };
+    let requested = if image_extension.is_some() { MAX_LOCAL_IMAGE_PREVIEW_BYTES } else { max_bytes.clamp(1, text_ceiling) };
     let preview = FileService::new(ProjectRoot::open(project).map_err(|error| error.to_string())?)
-        .read(relative_path, requested as u32, ImageVariant::Original)
+        .read_with_limits(
+            relative_path,
+            requested,
+            ImageVariant::Original,
+            FilePreviewLimits {
+                text: text_ceiling,
+                image: MAX_LOCAL_IMAGE_PREVIEW_BYTES,
+                database: MAX_LOCAL_DATABASE_PREVIEW_BYTES,
+            },
+        )
         .map_err(|error| error.to_string())?;
     Ok(file_preview_dto(preview))
 }
@@ -198,6 +212,29 @@ fn file_preview_dto(preview: FilePreview) -> FilePreviewDto {
                 content: lines.join("\n"),
                 mime_type: Some(format),
                 size_bytes: 0,
+            }
+        }
+        FilePreview::Database { format, size, objects, has_more, .. } => {
+            let mut lines = Vec::new();
+            for object in objects {
+                let owner = object.table_name.as_deref().map(|table| format!(" ON {table}")).unwrap_or_default();
+                lines.push(format!("{}  {}{}", object.kind.to_ascii_uppercase(), object.name, owner));
+                for column in object.columns {
+                    let declared_type = if column.declared_type.is_empty() { "ANY" } else { &column.declared_type };
+                    let mut attributes = Vec::new();
+                    if column.primary_key { attributes.push("PRIMARY KEY"); }
+                    if !column.nullable { attributes.push("NOT NULL"); }
+                    let suffix = if attributes.is_empty() { String::new() } else { format!("  {}", attributes.join(" ")) };
+                    lines.push(format!("  {}  {}{}", column.name, declared_type, suffix));
+                }
+                lines.push(String::new());
+            }
+            if has_more { lines.push("… Showing the first 50 objects".into()); }
+            FilePreviewDto {
+                kind: PreviewKind::Database,
+                content: lines.join("\n").trim_end().to_string(),
+                mime_type: Some(format),
+                size_bytes: size,
             }
         }
         FilePreview::Binary { size, .. } => FilePreviewDto {
@@ -726,6 +763,35 @@ mod tests {
             dto.content,
             "DIR\tsrc/\n42 B\tsrc/main.rs\n… Showing the first 50 items"
         );
+    }
+
+    #[test]
+    fn converts_database_preview_to_schema_text() {
+        let preview = FilePreview::Database {
+            path: "prices.sqlite".into(),
+            format: "sqlite".into(),
+            size: 8192,
+            objects: vec![relaycat_protocol::DatabaseObject {
+                name: "prices".into(),
+                kind: "table".into(),
+                table_name: None,
+                columns: vec![relaycat_protocol::DatabaseColumn {
+                    name: "symbol".into(),
+                    declared_type: "TEXT".into(),
+                    nullable: false,
+                    primary_key: true,
+                }],
+            }],
+            has_more: false,
+        };
+
+        let dto = file_preview_dto(preview);
+
+        assert_eq!(dto.kind, PreviewKind::Database);
+        assert_eq!(dto.mime_type.as_deref(), Some("sqlite"));
+        assert_eq!(dto.size_bytes, 8192);
+        assert!(dto.content.contains("TABLE  prices"));
+        assert!(dto.content.contains("symbol  TEXT  PRIMARY KEY NOT NULL"));
     }
 
     #[test]
