@@ -35,6 +35,7 @@ import {
   type EmbeddedShellPanelController,
 } from "./embedded-shell-panel";
 import { toggleTermSidePanel } from "./embedded-shell-model";
+import { androidQrHref, resolveAndroidDownload, type AndroidDownload } from "./android-download";
 import thirdPartyLicenses from "./third-party-licenses.txt?raw";
 
 type Tool = { name: string; label: string; kind: string };
@@ -220,6 +221,10 @@ function applyI18n() {
   document.querySelectorAll<HTMLElement>("[data-i18n-title]").forEach((node) => {
     node.title = t(node.dataset.i18nTitle!);
   });
+  const androidVersion = document.getElementById("lp-android-version");
+  if (androidVersion?.dataset.version) {
+    androidVersion.textContent = `${t("lp_dl_android")} v${androidVersion.dataset.version}`;
+  }
 }
 
 function setLanguage(next: Lang) {
@@ -255,6 +260,30 @@ let pairCountdownTimer: number | null = null;
 let tabMenuEl: HTMLDivElement | null = null;
 let workspacePanel: WorkspacePanelController | null = null;
 let embeddedShellPanel: EmbeddedShellPanelController | null = null;
+
+function renderAndroidDownload(download: AndroidDownload) {
+  const version = document.getElementById("lp-android-version");
+  const target = document.getElementById("lp-android-download");
+  const qr = document.getElementById("lp-android-qr") as HTMLImageElement | null;
+  if (!version || !target || !qr) return;
+
+  version.dataset.version = download.version;
+  version.textContent = `${t("lp_dl_android")} v${download.version}`;
+  target.dataset.url = download.url;
+  target.title = `${t("lp_dl_android")} v${download.version}`;
+  qr.src = androidQrHref(download.url);
+  qr.alt = `${t("lp_dl_android")} v${download.version}`;
+}
+
+async function refreshAndroidDownload() {
+  try {
+    const raw = await invoke<string>("fetch_android_update_manifest");
+    const download = resolveAndroidDownload(JSON.parse(raw));
+    if (download) renderAndroidDownload(download);
+  } catch (error) {
+    console.warn("Unable to refresh Android download metadata; using bundled fallback.", error);
+  }
+}
 
 const relayCompatibility = createRelayCompatibilityChecker((relayUrl) =>
   invoke<RelayCompatibilityCheck>("check_relay_compatibility", { relayUrl }),
@@ -3042,6 +3071,7 @@ async function init() {
   await renderEmpty();
   renderStatusbar();
   void checkUpdate();
+  void refreshAndroidDownload();
   if (!localStorage.getItem(ONBOARD_KEY)) void openOnboarding();
   else window.setTimeout(maybeShowCoachMarks, 400);
 }

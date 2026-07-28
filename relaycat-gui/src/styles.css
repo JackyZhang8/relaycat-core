@@ -1873,6 +1873,7 @@ body.ws-resizing * {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #fff;
+  padding: 0;
   cursor: pointer;
   outline: none;
   overflow: visible;

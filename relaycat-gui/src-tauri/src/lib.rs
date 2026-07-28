@@ -969,6 +969,39 @@ fn diagnostics() -> Result<DiagnosticsInfo, String> {
     })
 }
 
+fn android_manifest_endpoints() -> [&'static str; 2] {
+    [
+        "https://www.relaycat.cn/update/android.json",
+        "https://relaycat.app/update/android.json",
+    ]
+}
+
+#[tauri::command]
+async fn fetch_android_update_manifest() -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .user_agent("RelayCat-GUI/android-update")
+        .build()
+        .map_err(|e| format!("failed to create Android update client: {e}"))?;
+    let mut errors = Vec::new();
+
+    for endpoint in android_manifest_endpoints() {
+        match client.get(endpoint).send().await {
+            Ok(response) if response.status().is_success() => match response.text().await {
+                Ok(body) => return Ok(body),
+                Err(error) => errors.push(format!("{endpoint}: failed to read response: {error}")),
+            },
+            Ok(response) => errors.push(format!("{endpoint}: HTTP {}", response.status())),
+            Err(error) => errors.push(format!("{endpoint}: {error}")),
+        }
+    }
+
+    Err(format!(
+        "failed to fetch Android update manifest: {}",
+        errors.join("; ")
+    ))
+}
+
 /// Read up to the last `max_bytes` of a file. Returns an empty string if the
 /// file does not exist yet.
 fn read_file_tail(path: &str, max_bytes: u64) -> Result<String, String> {
@@ -1144,9 +1177,8 @@ fn install_crash_logging() {
 ///
 /// Restricted to https URLs for official RelayCat pages and the source repo
 /// links referenced from the UI.
-#[tauri::command]
-async fn open_url(url: String) -> Result<(), String> {
-    let allowed = url.starts_with("https://")
+fn is_allowed_external_url(url: &str) -> bool {
+    url.starts_with("https://")
         && {
             let host = url
                 .trim_start_matches("https://")
@@ -1155,11 +1187,16 @@ async fn open_url(url: String) -> Result<(), String> {
                 .unwrap_or("");
             host == "relaycat.cn"
                 || host == "www.relaycat.cn"
+                || host == "cdn.relaycat.cn"
                 || host == "relaycat.app"
                 || host == "www.relaycat.app"
                 || (host == "github.com" && url == "https://github.com/jackyZhang8/relaycat-core")
-        };
-    if !allowed {
+        }
+}
+
+#[tauri::command]
+async fn open_url(url: String) -> Result<(), String> {
+    if !is_allowed_external_url(&url) {
         return Err("blocked url".into());
     }
 
@@ -1422,6 +1459,7 @@ pub fn run() {
             render_qr,
             open_url,
             diagnostics,
+            fetch_android_update_manifest,
             read_log_tail,
             build_diagnostics_report,
             write_text_file,
@@ -1450,4 +1488,31 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running RelayCat GUI");
+}
+
+#[cfg(test)]
+mod android_update_tests {
+    use super::{android_manifest_endpoints, is_allowed_external_url};
+
+    #[test]
+    fn android_manifest_endpoints_prefer_cn_and_fall_back_to_app() {
+        assert_eq!(
+            android_manifest_endpoints(),
+            [
+                "https://www.relaycat.cn/update/android.json",
+                "https://relaycat.app/update/android.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn android_cdn_download_is_an_allowed_external_url() {
+        assert!(is_allowed_external_url(
+            "https://cdn.relaycat.cn/download/relaycat-app-0.1.7-android-arm64.apk"
+        ));
+        assert!(!is_allowed_external_url(
+            "http://cdn.relaycat.cn/download/relaycat-app.apk"
+        ));
+        assert!(!is_allowed_external_url("https://relaycat.cn.evil.example/app"));
+    }
 }
