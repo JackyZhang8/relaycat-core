@@ -10,3 +10,4 @@ relaycat-server/rtasr_go
 certs_desktop
 .DS_Store
 docs
+.relaycat/
