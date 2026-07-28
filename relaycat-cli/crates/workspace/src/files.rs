@@ -1,9 +1,9 @@
 use crate::{ProjectRoot, WorkspaceServiceError};
 use relaycat_protocol::{
-    DirectoryEntry, DirectoryPage, FilePreview, ImageVariant, WORKSPACE_DIRECTORY_ENTRY_LIMIT,
+    DirectoryEntry, DirectoryPage, FilePreview, FileSearchPage, ImageVariant, WORKSPACE_DIRECTORY_ENTRY_LIMIT,
     WORKSPACE_DIRECTORY_PAGE_SIZE,
 };
-use std::{cmp::Ordering, fs, path::Path};
+use std::{cmp::Ordering, collections::HashSet, fs, path::{Path, PathBuf}};
 
 pub const TEXT_PREVIEW_LIMIT: u64 = 512 * 1024;
 pub const IMAGE_PREVIEW_LIMIT: u64 = 1024 * 1024;
@@ -28,6 +28,8 @@ const IGNORED_DIRECTORIES: &[&str] = &[
     ".next",
     ".cache",
 ];
+const FILE_SEARCH_RESULT_LIMIT: usize = 100;
+const FILE_SEARCH_SCAN_LIMIT: usize = 20_000;
 
 #[derive(Debug, Clone)]
 pub struct FileService { root: ProjectRoot }
@@ -75,6 +77,63 @@ impl FileService {
             has_more,
             capped,
         })
+    }
+
+    pub fn search(&self, query: &str, limit: u16) -> Result<FileSearchPage, WorkspaceServiceError> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() { return Err(WorkspaceServiceError::invalid("search query is empty")); }
+        let requested = usize::from(limit.clamp(1, FILE_SEARCH_RESULT_LIMIT as u16));
+        let mut matches = Vec::new();
+        let mut pending = vec![(self.root.path().to_path_buf(), PathBuf::new())];
+        let mut visited_directories = HashSet::new();
+        let mut scanned = 0usize;
+        let mut scan_capped = false;
+
+        while let Some((directory, logical_directory)) = pending.pop() {
+            let canonical_directory = match directory.canonicalize() {
+                Ok(path) if path.starts_with(self.root.path()) => path,
+                _ => continue,
+            };
+            if !visited_directories.insert(canonical_directory) { continue; }
+            let mut children = fs::read_dir(&directory)
+                .map_err(WorkspaceServiceError::io)?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            children.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
+            let mut child_directories = Vec::new();
+            for item in children {
+                if scanned >= FILE_SEARCH_SCAN_LIMIT { scan_capped = true; break; }
+                scanned += 1;
+                let resolved = match item.path().canonicalize() {
+                    Ok(path) if path.starts_with(self.root.path()) => path,
+                    _ => continue,
+                };
+                let metadata = fs::metadata(&resolved).map_err(WorkspaceServiceError::io)?;
+                let file_name = item.file_name();
+                let name = file_name.to_string_lossy().into_owned();
+                if metadata.is_dir() && IGNORED_DIRECTORIES.contains(&name.as_str()) { continue; }
+                let logical_path = logical_directory.join(&file_name);
+                let path = slash_path(&logical_path);
+                if path.to_lowercase().contains(&query) {
+                    matches.push(DirectoryEntry {
+                        name,
+                        path: path.clone(),
+                        is_directory: metadata.is_dir(),
+                        size: if metadata.is_file() { metadata.len() } else { 0 },
+                        modified_unix_seconds: metadata.modified().ok()
+                            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|value| value.as_secs()),
+                    });
+                }
+                if metadata.is_dir() { child_directories.push((item.path(), logical_path)); }
+            }
+            if scan_capped { break; }
+            for child in child_directories.into_iter().rev() { pending.push(child); }
+        }
+        matches.sort_by(|left, right| left.path.to_lowercase().cmp(&right.path.to_lowercase()).then_with(|| left.path.cmp(&right.path)));
+        let capped = scan_capped || matches.len() > requested;
+        matches.truncate(requested);
+        Ok(FileSearchPage { entries: matches, capped })
     }
 
     pub fn read(&self, path: &str, max_bytes: u32, variant: ImageVariant) -> Result<FilePreview, WorkspaceServiceError> {

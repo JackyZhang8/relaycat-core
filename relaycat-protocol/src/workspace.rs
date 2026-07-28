@@ -19,6 +19,7 @@ pub struct WorkspaceEventEnvelope { pub project_id: String, pub event_seq: u64, 
 pub enum WorkspaceRequest {
     Capabilities, Cancel { target_request_id: String },
     ListDirectory { path: String, offset: u16, limit: u16 },
+    SearchFiles { query: String, limit: u16 },
     ReadFile { path: String, max_bytes: u32, image_variant: ImageVariant },
     GitSummary, GitStatus,
     GitDiff { target: GitDiffTarget, cursor: Option<String>, max_bytes: u32 },
@@ -39,7 +40,7 @@ pub enum WorkspaceRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum WorkspaceResponse {
-    Capabilities(WorkspaceCapabilities), Directory(DirectoryPage), File(FilePreview),
+    Capabilities(WorkspaceCapabilities), Directory(DirectoryPage), FileSearch(FileSearchPage), File(FilePreview),
     GitSummary(GitSummary), GitStatus(GitStatus), GitDiff(ContentPage), GitHistory(GitHistoryPage),
     GitCommitDetail(GitCommitDetail), GitRefs(Vec<GitRef>), GitMutation(GitMutationResult),
     ShellList(Vec<ShellDescriptor>), ShellCreated(ShellSnapshot), ShellSnapshot(ShellSnapshot), Ack,
@@ -70,6 +71,8 @@ pub struct DirectoryEntry {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryPage { pub path: String, pub entries: Vec<DirectoryEntry>, pub next_offset: Option<u16>, pub has_more: bool, pub capped: bool }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSearchPage { pub entries: Vec<DirectoryEntry>, pub capped: bool }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageVariant { Thumbnail, Original }

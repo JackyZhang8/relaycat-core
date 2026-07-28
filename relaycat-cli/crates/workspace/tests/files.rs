@@ -54,6 +54,31 @@ fn directory_is_paged_and_capped() {
 }
 
 #[test]
+fn search_matches_names_and_relative_paths_with_a_bounded_result() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.root.join("Sources/WorkspaceUI")).unwrap();
+    fs::write(fixture.root.join("Sources/WorkspaceUI/Panel.swift"), "source").unwrap();
+    fs::write(fixture.root.join("workspace-notes.md"), "notes").unwrap();
+    fs::create_dir_all(fixture.root.join("target/workspace-hidden")).unwrap();
+    fs::write(fixture.root.join("target/workspace-hidden/result.txt"), "ignored").unwrap();
+    for index in 0..120 {
+        fs::write(fixture.root.join(format!("workspace-result-{index:03}.txt")), "match").unwrap();
+    }
+    let service = FileService::new(ProjectRoot::open(&fixture.root).unwrap());
+
+    let path_match = service.search("workspaceui", 100).unwrap();
+    assert_eq!(path_match.entries.len(), 2);
+    assert_eq!(path_match.entries[0].path, "Sources/WorkspaceUI");
+    assert_eq!(path_match.entries[1].path, "Sources/WorkspaceUI/Panel.swift");
+
+    let bounded = service.search("WORKSPACE", 100).unwrap();
+    assert_eq!(bounded.entries.len(), 100);
+    assert!(bounded.capped);
+    assert!(bounded.entries.windows(2).all(|pair| pair[0].path <= pair[1].path));
+    assert!(bounded.entries.iter().all(|entry| !entry.path.starts_with("target/")));
+}
+
+#[test]
 fn previews_text_binary_large_and_image_files() {
     let fixture = Fixture::new();
     let service = FileService::new(ProjectRoot::open(&fixture.root).unwrap());

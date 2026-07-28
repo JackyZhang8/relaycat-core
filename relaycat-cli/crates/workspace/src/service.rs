@@ -101,6 +101,7 @@ impl WorkspaceService {
             WorkspaceRequest::Capabilities=>Ok(WorkspaceResponse::Capabilities(WorkspaceCapabilities{files:true,git_read:true,git_write:true,shell:true,directory_page_size:WORKSPACE_DIRECTORY_PAGE_SIZE,directory_entry_limit:WORKSPACE_DIRECTORY_ENTRY_LIMIT,git_history_page_size:WORKSPACE_GIT_HISTORY_PAGE_SIZE,text_preview_limit:TEXT_PREVIEW_LIMIT as u32,image_preview_limit:IMAGE_PREVIEW_LIMIT as u32,shell_limit:WORKSPACE_APP_SHELL_LIMIT})),
             WorkspaceRequest::Cancel{..}=>Ok(WorkspaceResponse::Ack),
             WorkspaceRequest::ListDirectory{path,offset,limit}=>self.files.list(&path,offset,limit).map(WorkspaceResponse::Directory),
+            WorkspaceRequest::SearchFiles{query,limit}=>self.files.search(&query,limit).map(WorkspaceResponse::FileSearch),
             WorkspaceRequest::ReadFile{path,max_bytes,image_variant}=>self.files.read(&path,max_bytes,image_variant).map(WorkspaceResponse::File),
             WorkspaceRequest::GitSummary=>self.git.summary().map(WorkspaceResponse::GitSummary),
             WorkspaceRequest::GitStatus=>self.git.status().map(WorkspaceResponse::GitStatus),

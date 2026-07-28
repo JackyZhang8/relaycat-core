@@ -54,6 +54,23 @@ fn workspace_request_round_trips() {
 }
 
 #[test]
+fn workspace_file_search_request_round_trips() {
+    let msg = PlainMsg::WorkspaceRequest(WorkspaceRequestEnvelope {
+        request_id: "req-search".to_string(),
+        project_id: "project-1".to_string(),
+        deadline_unix_ms: 1_900_000_000_000,
+        idempotency_key: None,
+        operation: WorkspaceRequest::SearchFiles {
+            query: "workspace".to_string(),
+            limit: 100,
+        },
+    });
+
+    let encoded = encode_plain_msg(&msg).expect("encode workspace search request");
+    assert_eq!(decode_plain_msg(&encoded).expect("decode workspace search request"), msg);
+}
+
+#[test]
 fn archive_file_preview_round_trips_with_partial_listing() {
     let msg = PlainMsg::WorkspaceResponse(WorkspaceResponseEnvelope {
         request_id: "req-archive".to_string(),

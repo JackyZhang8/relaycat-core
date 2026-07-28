@@ -4,7 +4,7 @@ pub(crate) fn workspace_operation_name(operation: &relaycat_protocol::WorkspaceR
     use relaycat_protocol::WorkspaceRequest::*;
     match operation {
         Capabilities => "capabilities", Cancel { .. } => "cancel", ListDirectory { .. } => "list_directory",
-        ReadFile { .. } => "read_file", GitSummary => "git_summary", GitStatus => "git_status",
+        SearchFiles { .. } => "search_files", ReadFile { .. } => "read_file", GitSummary => "git_summary", GitStatus => "git_status",
         GitDiff { .. } => "git_diff", GitHistory { .. } => "git_history", GitCommitDetail { .. } => "git_commit_detail",
         GitListRefs => "git_list_refs", GitStage { .. } => "git_stage", GitUnstage { .. } => "git_unstage",
         GitDiscard { .. } => "git_discard", GitApplyPatch { .. } => "git_apply_patch", GitCheckout { .. } => "git_checkout",
