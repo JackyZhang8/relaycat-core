@@ -2,9 +2,11 @@ use crate::{ProjectRoot, WorkspaceServiceError};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use relaycat_protocol::{ShellDescriptor, ShellSnapshot, WorkspaceErrorCode};
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     env,
     io::{Read, Write},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -103,7 +105,8 @@ impl ShellManager {
             })
             .map_err(internal_error)?;
         let mut command = CommandBuilder::new(default_shell());
-        command.cwd(self.root.path());
+        let cwd = windows_shell_cwd(self.root.path());
+        command.cwd(cwd.as_ref());
         command.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(command).map_err(internal_error)?;
         drop(pair.slave);
@@ -385,10 +388,56 @@ fn default_shell() -> String {
     }
 }
 
+/// `std::fs::canonicalize` returns local Windows paths in the extended form
+/// (`\\?\C:\...`). Interactive `cmd.exe` treats that spelling like a UNC
+/// working directory and falls back to the Windows directory. Use the normal
+/// drive spelling for child shells while leaving real UNC and non-Windows
+/// paths untouched.
+fn windows_shell_cwd(path: &Path) -> Cow<'_, Path> {
+    let Some(text) = path.to_str() else {
+        return Cow::Borrowed(path);
+    };
+    let Some(legacy) = text.strip_prefix(r"\\?\") else {
+        return Cow::Borrowed(path);
+    };
+    let bytes = legacy.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        Cow::Owned(legacy.into())
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
 fn shell_not_found() -> WorkspaceServiceError {
     WorkspaceServiceError::new(WorkspaceErrorCode::NotFound, "shell was not found", false)
 }
 
 fn internal_error(error: impl ToString) -> WorkspaceServiceError {
     WorkspaceServiceError::new(WorkspaceErrorCode::Internal, error.to_string(), true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::windows_shell_cwd;
+    use std::path::Path;
+
+    #[test]
+    fn windows_shell_cwd_removes_verbatim_disk_prefix() {
+        assert_eq!(
+            windows_shell_cwd(Path::new(r"\\?\C:\data")),
+            Path::new(r"C:\data")
+        );
+    }
+
+    #[test]
+    fn windows_shell_cwd_preserves_regular_paths() {
+        assert_eq!(
+            windows_shell_cwd(Path::new(r"C:\data\relaycat")),
+            Path::new(r"C:\data\relaycat")
+        );
+    }
 }
