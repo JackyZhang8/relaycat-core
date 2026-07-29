@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 const MAX_GIT_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(120);
+const GIT_NOT_INSTALLED_ERROR: &str = "git_not_installed";
 
 pub fn project_root(project: &str) -> Result<PathBuf, String> {
     let root = Path::new(project)
@@ -35,7 +36,7 @@ pub fn git_output_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| e.to_string())?;
+        .map_err(git_spawn_error)?;
     let stdout = child.stdout.take().ok_or("git stdout unavailable")?;
     let stderr = child.stderr.take().ok_or("git stderr unavailable")?;
     let stdout_reader = thread::spawn(move || read_bounded_stream(stdout));
@@ -68,6 +69,14 @@ pub fn git_output_with_timeout(
         stdout,
         stderr,
     })
+}
+
+fn git_spawn_error(error: std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        GIT_NOT_INSTALLED_ERROR.to_string()
+    } else {
+        error.to_string()
+    }
 }
 
 fn read_bounded_stream(mut stream: impl Read) -> Result<(Vec<u8>, bool), String> {
@@ -113,10 +122,19 @@ fn bounded_text(bytes: &[u8], max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn missing_git_executable_has_a_stable_error_code() {
+        assert_eq!(
+            git_spawn_error(io::Error::from(io::ErrorKind::NotFound)),
+            "git_not_installed"
+        );
+    }
 
     #[test]
     fn output_is_capped_without_splitting_utf8() {

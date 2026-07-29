@@ -72,6 +72,10 @@ export interface GitStatus {
   changes: GitChange[];
 }
 
+export function isGitNotInstalledError(error: unknown): boolean {
+  return String(error).includes("git_not_installed");
+}
+
 export interface GitCommit {
   hash: string;
   short_hash: string;

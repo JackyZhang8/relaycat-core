@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   groupGitChanges,
+  isGitNotInstalledError,
   gitStatusFingerprint,
   gitHistoryPage,
   historyNearBottom,
@@ -25,6 +26,8 @@ import {
   workspaceLocalPreviewLimit,
 } from "../src/workspace-model.ts";
 
+import { I18N } from "../src/i18n.ts";
+
 const workspacePanelSource = readFileSync(
   new URL("../src/workspace-panel.ts", import.meta.url),
   "utf8",
@@ -33,6 +36,24 @@ const workspaceRustSource = readFileSync(
   new URL("../src-tauri/src/workspace.rs", import.meta.url),
   "utf8",
 );
+
+test("recognizes a missing Git installation and provides localized guidance", () => {
+  assert.equal(isGitNotInstalledError("git_not_installed"), true);
+  assert.equal(isGitNotInstalledError("加载失败：git_not_installed"), true);
+  assert.equal(isGitNotInstalledError("not a git repository"), false);
+  assert.equal(
+    I18N.zh.workspace_git_not_installed,
+    "未检测到 Git，请先安装 Git 后再使用工作区 Git 功能。",
+  );
+  assert.equal(
+    I18N.en.workspace_git_not_installed,
+    "Git was not detected. Install Git before using workspace Git features.",
+  );
+  assert.match(
+    workspacePanelSource,
+    /isGitNotInstalledError\(error\)[\s\S]{0,160}workspace_git_not_installed/,
+  );
+});
 
 test("groups index and worktree changes into separate sections", () => {
   const result = groupGitChanges([

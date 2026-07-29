@@ -27,6 +27,7 @@ import {
   canRenderMarkdown,
   formatWorkspaceEntrySize,
   formatWorkspaceModifiedTime,
+  isGitNotInstalledError,
   isMarkdownPreviewPath,
   previewLanguage,
   projectBasename,
@@ -1161,7 +1162,11 @@ export function createWorkspacePanel(
         console.error("workspace git refresh failed", error);
         return false;
       }
-      renderLoadError(gitList, error);
+      if (isGitNotInstalledError(error)) {
+        renderState(gitList, t("workspace_git_not_installed"));
+      } else {
+        renderLoadError(gitList, error);
+      }
       return false;
     }
   }
