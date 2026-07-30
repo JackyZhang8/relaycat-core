@@ -173,6 +173,44 @@ jobs:
             --bundles ${{ matrix.bundles }} \
             ${extra[@]+"${extra[@]}"}
 
+      - name: Prepare signed macOS updater
+        if: runner.os == 'macOS'
+        working-directory: relaycat-gui
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          bundle_dir="src-tauri/target/${{ matrix.target }}/release/bundle/macos"
+          apps=()
+          archives=()
+
+          while IFS= read -r -d '' path; do
+            apps+=("$path")
+          done < <(find "$bundle_dir" -type d -name "*.app" -prune -print0)
+
+          while IFS= read -r -d '' path; do
+            archives+=("$path")
+          done < <(find "$bundle_dir" -type f -name "*.app.tar.gz" -print0)
+
+          if [ "${#apps[@]}" -ne 1 ]; then
+            echo "::error::expected one macOS app under $bundle_dir, found ${#apps[@]}"
+            exit 1
+          fi
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo "::error::expected one macOS updater archive under $bundle_dir, found ${#archives[@]}"
+            exit 1
+          fi
+
+          app_path="${apps[0]}"
+          updater_path="${archives[0]}"
+          bash scripts/prepare-macos-updater.sh "$app_path" "$updater_path"
+
       - name: Collect GUI artifacts
         shell: bash
         run: |
