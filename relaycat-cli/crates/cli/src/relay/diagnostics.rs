@@ -37,7 +37,7 @@ fn workspace_error_code_name(code: relaycat_protocol::WorkspaceErrorCode) -> &'s
     match code {
         Unsupported => "unsupported", InvalidRequest => "invalid_request", PermissionDenied => "permission_denied",
         PathOutsideProject => "path_outside_project", NotFound => "not_found", TooLarge => "too_large",
-        Binary => "binary", NotGitRepository => "not_git_repository", Conflict => "conflict", Timeout => "timeout",
+        Binary => "binary", GitNotInstalled => "git_not_installed", NotGitRepository => "not_git_repository", Conflict => "conflict", Timeout => "timeout",
         Busy => "busy", Cancelled => "cancelled", Internal => "internal",
     }
 }

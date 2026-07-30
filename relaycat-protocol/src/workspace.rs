@@ -55,7 +55,7 @@ pub enum WorkspaceEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkspaceErrorCode { Unsupported, InvalidRequest, PermissionDenied, PathOutsideProject, NotFound, TooLarge, Binary, NotGitRepository, Conflict, Timeout, Busy, Cancelled, Internal }
+pub enum WorkspaceErrorCode { Unsupported, InvalidRequest, PermissionDenied, PathOutsideProject, NotFound, TooLarge, Binary, GitNotInstalled, NotGitRepository, Conflict, Timeout, Busy, Cancelled, Internal }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceError { pub code: WorkspaceErrorCode, pub message: String, pub retryable: bool }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

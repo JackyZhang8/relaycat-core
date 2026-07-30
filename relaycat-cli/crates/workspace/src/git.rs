@@ -159,7 +159,7 @@ impl GitService {
     pub fn apply_patch(&self, patch: &str, cached: bool, reverse: bool) -> Result<GitMutationResult, WorkspaceServiceError> {
         if patch.is_empty() || patch.len() > 2*1024*1024 { return Err(WorkspaceServiceError::invalid("invalid patch size")); }
         let _guard=self.lock_mutation()?; let mut command=self.command(); command.args(["apply","--recount","--whitespace=nowarn"]); if cached{command.arg("--cached");} if reverse{command.arg("--reverse");}
-        let mut child=command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(WorkspaceServiceError::io)?;
+        let mut child=command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(map_git_command_error)?;
         child.stdin.take().ok_or_else(||WorkspaceServiceError::invalid("git apply stdin unavailable"))?.write_all(patch.as_bytes()).map_err(WorkspaceServiceError::io)?;
         let output=child.wait_with_output().map_err(WorkspaceServiceError::io)?; self.success(&output)?; self.mutation_result()
     }
@@ -217,13 +217,24 @@ impl GitService {
     fn validate_branch(&self,name:&str)->Result<(),WorkspaceServiceError>{if name.is_empty(){return Err(WorkspaceServiceError::invalid("branch name is required"));}let output=self.output(&["check-ref-format","--branch",name])?;if output.status.success(){Ok(())}else{Err(WorkspaceServiceError::invalid("invalid branch name"))}}
     fn ensure_repo(&self)->Result<(),WorkspaceServiceError>{let output=self.output(&["rev-parse","--git-dir"])?;if output.status.success(){Ok(())}else{Err(WorkspaceServiceError::new(WorkspaceErrorCode::NotGitRepository,"current project is not a Git repository",false))}}
     fn command(&self)->Command{let mut command=Command::new("git");command.current_dir(self.root.path()).env("GIT_TERMINAL_PROMPT","0").env("GCM_INTERACTIVE","Never").env("LC_ALL","C");command}
-    fn output(&self,args:&[&str])->Result<Output,WorkspaceServiceError>{self.command().args(args).output().map_err(WorkspaceServiceError::io)}
+    fn output(&self,args:&[&str])->Result<Output,WorkspaceServiceError>{self.command().args(args).output().map_err(map_git_command_error)}
     fn text(&self,args:&[&str])->Result<String,WorkspaceServiceError>{let output=self.output(args)?;self.success(&output)?;Ok(String::from_utf8_lossy(&output.stdout).into_owned())}
     fn run_success(&self,args:&[&str])->Result<(),WorkspaceServiceError>{let output=self.output(args)?;self.success(&output)}
     fn success(&self,output:&Output)->Result<(),WorkspaceServiceError>{if output.status.success(){Ok(())}else{let message=sanitize_git_error_message(&String::from_utf8_lossy(&output.stderr));Err(WorkspaceServiceError::new(WorkspaceErrorCode::Conflict,message,false))}}
 }
 
 fn status_name(code:char)->String{match code{'A'=>"added",'D'=>"deleted",'R'=>"renamed",'C'=>"copied",'U'=>"conflict",_=>"modified"}.into()}
+fn map_git_command_error(error: std::io::Error) -> WorkspaceServiceError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        WorkspaceServiceError::new(
+            WorkspaceErrorCode::GitNotInstalled,
+            "git is not installed",
+            false,
+        )
+    } else {
+        WorkspaceServiceError::io(error)
+    }
+}
 fn short_oid(oid:&str)->&str{oid.get(..7).unwrap_or(oid)}
 fn plural(count:u32,singular:&str,plural:&str)->String{format!("{count} {}",if count==1{singular}else{plural})}
 fn remote_target(snapshot:&GitRemoteSnapshot)->String{snapshot.upstream.clone().unwrap_or_else(||if snapshot.branch.is_empty(){snapshot.remote.clone()}else{format!("{}/{}",snapshot.remote,snapshot.branch)})}
@@ -352,6 +363,18 @@ fn redact_url_credentials(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_git_executable_has_a_stable_workspace_error_code() {
+        let error = map_git_command_error(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "git executable missing",
+        ));
+        assert_eq!(error.code(), WorkspaceErrorCode::GitNotInstalled);
+        let wire: relaycat_protocol::WorkspaceError = error.into();
+        assert_eq!(wire.message, "git is not installed");
+        assert!(!wire.retryable);
+    }
 
     #[test]
     fn git_error_message_is_sanitized_redacted_and_bounded() {
