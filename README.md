@@ -10,8 +10,8 @@ RelayCat Core 是本地 AI Coding Agent 的开源桌面控制层与加密中继�
 
 | iOS | Android |
 | --- | --- |
-| <a href="https://apps.apple.com/cn/app/relaycat%E7%BC%96%E7%A8%8B%E5%8A%A9%E6%89%8B/id6781284514"><img src="https://api.qrserver.com/v1/create-qr-code/?size=216x216&data=https%3A%2F%2Fapps.apple.com%2Fcn%2Fapp%2Frelaycat%25E7%25BC%2596%25E7%25A8%258B%25E5%258A%25A9%25E6%2589%258B%2Fid6781284514" width="180" alt="RelayCat iOS App Store 二维码"></a> | <a href="https://cdn.relaycat.cn/download/relaycat-app-0.1.5-android-arm64.apk"><img src="https://api.qrserver.com/v1/create-qr-code/?size=216x216&data=https%3A%2F%2Fcdn.relaycat.cn%2Fdownload%2Frelaycat-app-0.1.5-android-arm64.apk" width="180" alt="RelayCat Android APK 二维码"></a> |
-| [App Store 下载](https://apps.apple.com/cn/app/relaycat%E7%BC%96%E7%A8%8B%E5%8A%A9%E6%89%8B/id6781284514) | [下载 Android 0.1.5 arm64 APK](https://cdn.relaycat.cn/download/relaycat-app-0.1.5-android-arm64.apk) |
+| <a href="https://apps.apple.com/cn/app/relaycat%E7%BC%96%E7%A8%8B%E5%8A%A9%E6%89%8B/id6781284514"><img src="https://api.qrserver.com/v1/create-qr-code/?size=216x216&data=https%3A%2F%2Fapps.apple.com%2Fcn%2Fapp%2Frelaycat%25E7%25BC%2596%25E7%25A8%258B%25E5%258A%25A9%25E6%2589%258B%2Fid6781284514" width="180" alt="RelayCat iOS App Store 二维码"></a> | <a href="https://cdn.relaycat.cn/download/relaycat-app-0.1.7-android-arm64.apk"><img src="https://api.qrserver.com/v1/create-qr-code/?size=216x216&data=https%3A%2F%2Fcdn.relaycat.cn%2Fdownload%2Frelaycat-app-0.1.7-android-arm64.apk" width="180" alt="RelayCat Android APK 二维码"></a> |
+| [App Store 下载](https://apps.apple.com/cn/app/relaycat%E7%BC%96%E7%A8%8B%E5%8A%A9%E6%89%8B/id6781284514) | [下载 Android 0.1.7 arm64 APK](https://cdn.relaycat.cn/download/relaycat-app-0.1.7-android-arm64.apk) |
 
 桌面端 CLI、GUI 和自建 Relay 安装包可前往 [RelayCat 下载站](https://cdn.relaycat.cn/) 或本仓库的 [GitHub Releases](https://github.com/JackyZhang8/relaycat-core/releases)。
 
