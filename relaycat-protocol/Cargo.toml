@@ -2,9 +2,9 @@
 name = "relaycat-protocol"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 description = "Shared MessagePack protocol definitions and frame logic for the RelayCat CLI and relay server."
-repository = "https://example.invalid/relaycat-protocol"
+repository = "https://github.com/JackyZhang8/relaycat-core/"
 
 [workspace]
 

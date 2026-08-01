@@ -1,6 +1,6 @@
 # RelayCat Core
 
-RelayCat Core 是本地 AI Coding Agent 的开源桌面控制层与加密中继层，包含 CLI、桌面 GUI、Relay 服务和共享协议。
+RelayCat Core 是本地 AI Coding Agent 的开源桌面控制层与加密中继层，包含 CLI、桌面 GUI、Relay 服务和共享协议。项目源码托管在 [GitHub](https://github.com/JackyZhang8/relaycat-core/)。
 
 它让你在手机上查看和控制电脑里的 Claude Code、Codex、OpenCode、Gemini CLI、Aider 或普通 Shell。代码、终端和 Agent 始终运行在自己的电脑上——**Local execution，Mobile control，End-to-end encryption**。
 
@@ -33,6 +33,8 @@ RelayCat 把已经在本地运行的终端会话安全地延伸到手机上。�
 - 在手机上继续输入提示词、补充上下文或回答 Agent 的问题。
 - 发送 Enter、方向键、Ctrl-C 等终端输入，必要时中断失控任务。
 - 在 GUI 中管理多个项目和多个独立 PTY 会话。
+- 在 GUI 中浏览项目文件、预览代码和 Markdown，并完成常用 Git 操作。
+- 在已配对会话中同时使用 App 共享终端和桌面本地辅助终端。
 - 使用官方 Relay 快速连接，或者在自己的服务器和内网中部署 `relaycat-relay`。
 - 在断线重连后恢复终端输出，继续跟进本地进程，而不是重新启动任务。
 
@@ -49,6 +51,8 @@ RelayCat 把已经在本地运行的终端会话安全地延伸到手机上。�
 - **Local execution**：AI 工具、项目目录、Shell 和 PTY 都在本机运行。
 - **手机接管**：扫码后查看终端、输入内容、发送快捷键和中断任务。
 - **CLI + GUI 双入口**：终端用户可直接运行 `relaycat`，也可以使用 Tauri 桌面 GUI。
+- **桌面工作区**：查看项目文件、Git 状态、Diff、提交历史、分支和远程操作。
+- **共享终端**：App 与 GUI 可共享项目 Shell，桌面端也可打开独立的本地辅助终端。
 - **E2EE**：桌面端和 App 共同派生会话密钥，Relay 无法解密终端内容。
 - **安全配对**：二维码中的 pairing token 用于证明配对资格，不会直接发送给 Relay。
 - **断线恢复**：通过序号、快照和 replay 机制恢复短时断线期间的终端变化。
@@ -68,7 +72,7 @@ GUI 适合首次使用、同时管理多个项目，或希望通过可视化界�
 5. 启动 Relay 会话后，用手机 App 扫描弹出的二维码。
 6. 状态变为“已配对”后，即可在手机和电脑上共同操作该终端。
 
-GUI 提供多标签 PTY、工具检测、项目收藏、二维码展示、连接状态和最近会话入口。它复用 CLI 的会话与加密逻辑，不单独实现另一套协议。
+GUI 0.1.7 提供多标签与分屏 PTY、工具检测、项目收藏、二维码展示、连接状态和最近会话入口；还内置项目文件浏览、开发文件预览、Git 状态与 Diff、暂存与提交、分支与历史、远程操作、共享终端、自动更新、托盘和诊断包。它复用 CLI 的会话、工作区与加密逻辑，不单独实现另一套协议。Windows 未安装 Git 时，GUI 和 App 都会收到明确的 Git 未安装提示。
 
 ### 方式二：使用 CLI
 
@@ -280,12 +284,19 @@ RelayCat 保护的是桌面端和手机端之间的远程终端通道。Claude C
 
 ```text
 relaycat-core/
-  relaycat-cli/        # CLI/TUI 桌面桥接，二进制：relaycat
-  relaycat-gui/        # Tauri 桌面 GUI，复用 CLI 会话与加密逻辑
-  relaycat-server/     # WebSocket Relay，二进制：relaycat-relay
-  relaycat-protocol/   # 共享协议类型、帧编码与压缩
-  screenshots/         # README 产品截图
+  LICENSE                   # 仓库 Apache License 2.0
+  relaycat-cli/             # CLI/TUI 桌面桥接，二进制：relaycat
+    LICENSE                 # CLI Apache License 2.0
+  relaycat-gui/             # Tauri 桌面 GUI，复用 CLI 会话与加密逻辑
+    LICENSE                 # GUI Apache License 2.0
+  relaycat-server/          # WebSocket Relay，二进制：relaycat-relay
+    LICENSE                 # Relay Apache License 2.0
+  relaycat-protocol/        # 共享协议类型、帧编码与压缩
+    LICENSE                 # Protocol Apache License 2.0
+  screenshots/              # README 产品截图
 ```
+
+四个子项目的详细职责、构建方式和内部结构请查看各自 README。项目统一开源地址为 [github.com/JackyZhang8/relaycat-core](https://github.com/JackyZhang8/relaycat-core/)。
 
 移动端 App 源码不在本仓库中。本仓库提供开源的 desktop、relay 和 protocol core。
 
@@ -361,4 +372,10 @@ relaycat-relay-v<version>
 
 ## License
 
-各 crate 和组件的许可证以对应 `Cargo.toml`、源码头部及发布包中的许可文件为准。
+RelayCat Core 以及本仓库中的 CLI、GUI、Protocol 和 Relay 均基于 **Apache License 2.0** 开源：
+
+- [仓库根许可证](LICENSE)
+- [RelayCat CLI 许可证](relaycat-cli/LICENSE)
+- [RelayCat GUI 许可证](relaycat-gui/LICENSE)
+- [RelayCat Protocol 许可证](relaycat-protocol/LICENSE)
+- [RelayCat Relay 许可证](relaycat-server/LICENSE)

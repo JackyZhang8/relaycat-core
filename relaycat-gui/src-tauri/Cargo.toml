@@ -2,9 +2,9 @@
 name = "relaycat-gui"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 description = "RelayCat desktop GUI (Tauri): a multi-tab terminal that reuses the relaycat CLI session core."
-repository = "https://example.invalid/relaycat-gui"
+repository = "https://github.com/JackyZhang8/relaycat-core/"
 
 [workspace]
 

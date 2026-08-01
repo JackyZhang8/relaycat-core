@@ -1,84 +1,131 @@
-# relaycat-gui
+# RelayCat GUI
 
-RelayCat 的桌面 GUI（Tauri 2 + Vite 前端 + xterm.js 终端）。底层会话逻辑几乎全部复用
-`relaycat-cli`：PTY 启动、会话定义（`TargetCommand` / `SessionKind`）、配置（与 CLI 共用
-`~/.config/relaycat/config.json`）、配对二维码。
+RelayCat GUI 是 RelayCat 的开源桌面客户端，当前对外发布版本为 **0.1.7**。它使用 Tauri 2、Vite、TypeScript 和 xterm.js，将本地 AI Coding Agent、项目文件、Git 工作流和手机远程控制整合在一个桌面界面中。
 
-GUI 不重写底层逻辑：CLI 的 `run_interactive` 把 PTY 绑定到系统 stdin/stdout/SIGWINCH，
-而 GUI 把同一套 PTY 启动逻辑抽成前端无关的 `PtySession`
-（`relaycat-cli/crates/cli/src/session.rs`，CLI 与 GUI 共用），由前端的 xterm.js 负责渲染。
+GUI 不会把项目上传到云端执行。Claude Code、Codex、OpenCode、Gemini CLI、Aider、Shell 和自定义工具仍在本机 PTY 中运行；手机通过 RelayCat 的端到端加密会话查看和控制终端。
 
-## 界面
+## 功能特性
 
-- 顶部多标签：每个标签 = 一个独立 PTY 子进程，状态色区分 本地（灰）/ 等待配对（黄）/
-  已配对（绿）/ 已退出（红）。
-- 下方 xterm.js 终端：原生渲染 VT 序列，输入直接转发到 PTY，窗口 resize 同步到 PTY。
-- 新建会话面板：选工具 → 选项目（收藏置顶）→ 填 Relay（留空 = 仅本机运行）。
-- 配对二维码弹窗：Relay 模式下用 CLI 实际生成的配对 URL 渲染二维码；手机扫码、建立
-  端到端加密会话后，标签与状态条自动转为「已配对」（绿）。点击状态条的配对标记可重新打开二维码。
-- 设置页：默认工具 / 默认 Relay / 字号 / 自定义工具（增删）/ 收藏项目（删除），均与 CLI
-  共用 `~/.config/relaycat/config.json`。
-- 顶部更新提示横幅：启动时检查 CLI 升级清单，有新版本时提示。
-- 底部状态条 + 空态引导（最近会话快捷入口）。
+### 终端与会话
+
+- 多项目、多标签 PTY 会话，每个标签对应独立的本地进程。
+- 终端分屏、标签切换、窗口 resize、快捷键和右键菜单。
+- xterm.js 终端渲染，并在 WebGL 上下文异常后自动恢复。
+- 支持 Claude Code、Codex、OpenCode、Gemini CLI、Aider、Shell 和自定义工具。
+- 扫码配对、连接状态显示、二维码重新打开和断线重连。
+- 每个已配对会话可同时使用 App 共享终端和 GUI 本地辅助终端。
+
+### 工作区与 Git
+
+- 浏览项目目录，并分页加载大型目录。
+- 预览文本、代码和 Markdown；对二进制或过大文件给出明确提示。
+- 查看 Git 状态、文件 Diff、提交 Diff 和历史记录。
+- 支持暂存、取消暂存、按 hunk 或选中行操作、提交和修订提交。
+- 支持创建、切换、重命名和删除分支，以及创建标签。
+- 支持 fetch、pull、push、提交并推送等远程操作。
+- 提供 cherry-pick、revert 和不同模式的 reset，并在危险操作前确认。
+- Windows 未安装 Git 时，明确提示“未检测到 Git”，不会混淆为普通工作区请求失败。
+
+### 桌面体验
+
+- 项目收藏、最近会话、默认工具、默认 Relay 和自定义工具配置。
+- 自动检查、下载和安装新版本。
+- 系统托盘与开机自动启动。
+- 配对设备管理、会话状态与运行诊断。
+- 导出经过脱敏处理的诊断包，过滤主目录、配对材料、密钥和 IP 等敏感信息。
+- 中英文界面。
+
+## 架构关系
+
+GUI 复用 `relaycat-cli` 的 PTY、会话、Relay 和加密实现，并复用 `relaycat-workspace` 处理项目文件、Git 和共享 Shell。Tauri 后端负责把这些本地能力以 command 和 event 暴露给前端，xterm.js 负责终端显示与输入。
+
+Relay 模式下，GUI 会为 CLI 启动一个带随机 token 的本机 loopback TCP 状态桥。CLI 通过认证后的结构化状态快照通知 GUI 当前处于等待配对、同步、在线、断开或错误状态；GUI 不再依赖 tail 日志判断是否配对。
+
+```text
+Vite / TypeScript / xterm.js
+            |
+      Tauri command/event
+            |
+relaycat-cli + relaycat-workspace
+            |
+     encrypted WebSocket
+            |
+      Relay -> Mobile App
+```
+
+GUI 会按以下顺序定位 `relaycat` 可执行文件：
+
+1. `RELAYCAT_BIN` 环境变量；
+2. GUI 可执行文件同目录中的打包版本；
+3. 源码工作区中的 CLI release/debug 产物；
+4. 系统 `PATH`。
 
 ## 开发
 
-需要 Node.js、Rust（edition 2024）以及 Tauri 的系统依赖（Linux 上为
-`libwebkit2gtk-4.1-dev`、`build-essential`、`pkg-config` 等），还有 `tauri-cli`：
+需要 Node.js、Rust stable、Tauri 2 所需的系统依赖，以及一个可用的 `relaycat` CLI 构建产物。
 
 ```bash
-cargo install tauri-cli --version "^2.0" --locked
-cd relaycat-gui
+cd ../relaycat-cli
+cargo build --release -p relaycat-cli
+
+cd ../relaycat-gui
 npm install
-cargo tauri dev      # 启动 Vite + Tauri 开发窗口
+npm run tauri dev
 ```
 
-构建发布产物：
+也可以设置 CLI 路径：
 
 ```bash
-cd relaycat-gui
-cargo tauri build
+RELAYCAT_BIN=/absolute/path/to/relaycat npm run tauri dev
 ```
 
-## Relay 模式
+Linux 通常还需要 `libwebkit2gtk-4.1-dev`、`libgtk-3-dev`、`libayatana-appindicator3-dev`、`librsvg2-dev`、`build-essential`、`pkg-config` 和 `patchelf` 等系统依赖。
 
-本机模式直接在 PTY 中启动目标工具。Relay 模式则在 PTY 中启动 `relaycat` CLI 本身
-（`relaycat <tool> --relay <url>`）：端到端加密配对、终端镜像、手机输入回传这套
-协议敏感逻辑由 CLI 原样承担，GUI 不重新实现，只做终端宿主——本地用 xterm.js 渲染 CLI、
-转发按键，并通过观察 CLI 输出与日志把配对二维码 / 状态呈现到原生界面：
+## 构建与测试
 
-- `session://pairing`：从 CLI 输出里抓到的真实 `relaycat://pair?...` URL，用于渲染二维码。
-- `session://relay`：通过 tail `<project>/.relaycat/cli.log` 中的
-  `secure session established` 判定手机已配对。
+构建前端：
 
-GUI 通过以下顺序定位 `relaycat` 可执行文件：`RELAYCAT_BIN` 环境变量 → 与 GUI 可执行文件
-同目录（打包布局）→ `relaycat-cli/target/{release,debug}/relaycat`（开发布局）→ `PATH`。
-开发时请先在 `relaycat-cli` 下 `cargo build --release` 生成该二进制，或设置 `RELAYCAT_BIN`。
+```bash
+npm ci
+npm run build
+```
 
-## 与 relaycat-cli 的关系
+构建桌面安装包：
 
-`src-tauri` 是独立的 Cargo workspace，通过
-`relaycat-cli = { path = "../../relaycat-cli/crates/cli" }` 复用 CLI 库，并在
-`[patch.crates-io]` 中复制了 CLI 的本地 `vt100` 补丁。后端只是一层薄桥：把 CLI 的能力暴露
-成 Tauri command / event，并把 PTY 输出流式推送到 webview。
+```bash
+npm run tauri build
+```
 
-### 后端 Tauri command
+运行前端和文档测试：
 
-`list_tools` · `get_config` / `save_config` · `default_project` · `list_recents` /
-`forget_recent` · `create_session` · `write_session` · `resize_session` /
-`close_session` · `render_qr`
+```bash
+npm test
+```
 
-### 后端 → 前端事件
+运行 Tauri 后端测试：
 
-- `session://output` `{ id, data }`：PTY 原始字节，前端直接喂给 xterm.js。
-- `session://status` `{ id, state, code }`：会话退出时上报退出码。
-- `session://pairing` `{ id, url }`：Relay 会话抓到的真实配对 URL。
-- `session://relay` `{ id, state }`：Relay 配对状态（`paired`）。
+```bash
+cargo test --locked --manifest-path src-tauri/Cargo.toml
+```
 
-## 当前范围
+正式版本通过仓库中的 GitHub Actions 独立发布，tag 格式为 `relaycat-gui-v<version>`。桌面安装包可在 [GitHub Releases](https://github.com/JackyZhang8/relaycat-core/releases) 或 [RelayCat 下载站](https://cdn.relaycat.cn/) 获取。
 
-已实现：多标签 + 本地 PTY + xterm.js I/O + resize + 新建/设置/空态；Relay 模式（复用 CLI 的
-端到端加密配对 + 终端镜像 + 手机输入回传，配对二维码 / 已配对状态实时呈现）；最近会话快捷
-入口、收藏管理、自定义工具增删、设置完善、更新提示。
+## 项目结构
 
-后续可选：分屏、会话持久化、安装包分发（`cargo tauri build` 已可出包）。
+```text
+relaycat-gui/
+  src/             # TypeScript 前端、终端、工作区和本地化
+  src-tauri/       # Rust/Tauri 后端、Git、会话和桌面集成
+  tests/           # 前端行为、发布清单和 README 链接测试
+  package.json     # Vite、测试与 Tauri 命令
+```
+
+共享协议见 [`relaycat-protocol`](../relaycat-protocol/README.md)，本地会话核心见 [`relaycat-cli`](../relaycat-cli/README.md)，Relay 部署见 [`relaycat-server`](../relaycat-server/README.md)。
+
+## 参与贡献
+
+问题反馈、功能建议和 Pull Request 请前往 [relaycat-core](https://github.com/JackyZhang8/relaycat-core/)。提交前请运行前端测试、构建检查和相关 Rust 测试；涉及更新、Git 或进程管理的改动应同时覆盖失败路径和用户提示。
+
+## License
+
+本项目基于 [Apache License 2.0](LICENSE) 开源。
