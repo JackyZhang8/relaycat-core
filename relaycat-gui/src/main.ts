@@ -811,6 +811,13 @@ async function createTab(tool: string, project: string, relay: string) {
   const flushPending229 = () => {
     if (pending229Baseline === undefined || imeComposing) return;
     const value = term.textarea?.value ?? "";
+    // xterm clears its hidden textarea wholesale (blur, Enter / Ctrl-C, after
+    // a paste). Replaying that clear against a stale baseline would send one
+    // DEL per cleared character, erasing text the program already received.
+    if (value.length === 0 && pending229Baseline.length > 0) {
+      pending229Baseline = undefined;
+      return;
+    }
     const data = textareaDelta(pending229Baseline, value);
     if (!data) return;
     pending229Baseline = undefined;
@@ -883,6 +890,23 @@ async function createTab(tool: string, project: string, relay: string) {
       schedulePending229Flush();
     }
     return true;
+  });
+  // On blur xterm resets the hidden textarea, and modifier keyups / pending
+  // IME state may never be delivered while focus is elsewhere. Drop all
+  // workaround state so a stale baseline or stuck modifier can't replay
+  // deletions or duplicate characters after focus returns.
+  term.textarea?.addEventListener("blur", () => {
+    pending229Baseline = undefined;
+    imeComposing = false;
+    suppressNext229AfterComposition = false;
+    if (pending229FlushTimer !== undefined) {
+      clearTimeout(pending229FlushTimer);
+      pending229FlushTimer = undefined;
+    }
+    for (const candidate of earlyImeInputs) candidate.consumed = true;
+    earlyImeInputs.length = 0;
+    modifierKeysDown.clear();
+    lastOnData = undefined;
   });
   term.textarea?.addEventListener("compositionstart", () => {
     imeComposing = true;
