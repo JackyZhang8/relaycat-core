@@ -15,4 +15,4 @@ pub use database::{DATABASE_PREVIEW_OBJECT_LIMIT, DATABASE_PREVIEW_SOURCE_LIMIT}
 pub use git::GitService;
 pub use security::{ProjectRoot, WorkspaceServiceError};
 pub use service::WorkspaceService;
-pub use shell::{ShellManager, ShellTransportEvent};
+pub use shell::{ShellManager, ShellTransportEvent, configure_shell_terminal_env};

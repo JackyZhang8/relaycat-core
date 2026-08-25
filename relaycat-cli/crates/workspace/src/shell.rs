@@ -104,10 +104,12 @@ impl ShellManager {
                 pixel_height: 0,
             })
             .map_err(internal_error)?;
-        let mut command = CommandBuilder::new(default_shell());
+        let (program, args) = default_shell_command();
+        let mut command = CommandBuilder::new(program);
+        command.args(args);
         let cwd = windows_shell_cwd(self.root.path());
         command.cwd(cwd.as_ref());
-        command.env("TERM", "xterm-256color");
+        configure_shell_terminal_env(&mut command);
         let child = pair.slave.spawn_command(command).map_err(internal_error)?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().map_err(internal_error)?;
@@ -388,6 +390,66 @@ fn default_shell() -> String {
     }
 }
 
+fn default_shell_command() -> (String, Vec<String>) {
+    let program = default_shell();
+    #[cfg(windows)]
+    let args = vec![
+        "/D".to_string(),
+        "/Q".to_string(),
+        "/K".to_string(),
+        "chcp 65001>nul".to_string(),
+    ];
+    #[cfg(not(windows))]
+    let args = Vec::new();
+    (program, args)
+}
+
+/// Establish the byte-level contract expected by xterm.js: VT escape
+/// sequences and UTF-8 text, regardless of whether the GUI was launched from
+/// a terminal, Finder/Explorer, an IDE or a desktop service.
+pub fn configure_shell_terminal_env(command: &mut CommandBuilder) {
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env_remove("COLUMNS");
+    command.env_remove("LINES");
+
+    #[cfg(unix)]
+    {
+        let lc_all_is_utf8 = command
+            .get_env("LC_ALL")
+            .and_then(|value| value.to_str())
+            .is_some_and(is_utf8_locale);
+        let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .into_iter()
+            .filter_map(|key| command.get_env(key).and_then(|value| value.to_str()))
+            .find(|value| is_utf8_locale(value))
+            .map(str::to_string)
+            .unwrap_or_else(default_utf8_locale);
+
+        if !lc_all_is_utf8 {
+            command.env_remove("LC_ALL");
+        }
+        command.env("LANG", &locale);
+        command.env("LC_CTYPE", &locale);
+    }
+}
+
+#[cfg(unix)]
+fn is_utf8_locale(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("utf-8") || normalized.contains("utf8")
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn default_utf8_locale() -> String {
+    "en_US.UTF-8".to_string()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn default_utf8_locale() -> String {
+    "C.UTF-8".to_string()
+}
+
 /// `std::fs::canonicalize` returns local Windows paths in the extended form
 /// (`\\?\C:\...`). Interactive `cmd.exe` treats that spelling like a UNC
 /// working directory and falls back to the Windows directory. Use the normal
@@ -422,8 +484,43 @@ fn internal_error(error: impl ToString) -> WorkspaceServiceError {
 
 #[cfg(test)]
 mod tests {
-    use super::windows_shell_cwd;
+    use super::{configure_shell_terminal_env, windows_shell_cwd};
+    #[cfg(windows)]
+    use super::default_shell_command;
+    use portable_pty::CommandBuilder;
     use std::path::Path;
+
+    #[test]
+    fn workspace_shell_configures_xterm_and_utf8_locale() {
+        let mut command = CommandBuilder::new("shell");
+        command.env("TERM", "");
+        command.env("LANG", "C");
+        command.env("LC_CTYPE", "POSIX");
+        command.env("LC_ALL", "C");
+
+        configure_shell_terminal_env(&mut command);
+
+        assert_eq!(
+            command.get_env("TERM").and_then(|value| value.to_str()),
+            Some("xterm-256color")
+        );
+        #[cfg(unix)]
+        {
+            let locale = command
+                .get_env("LC_CTYPE")
+                .and_then(|value| value.to_str())
+                .unwrap();
+            assert!(locale.to_ascii_lowercase().contains("utf"));
+            assert!(command.get_env("LC_ALL").is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_shell_switches_cmd_to_utf8_code_page() {
+        let (_, args) = default_shell_command();
+        assert!(args.iter().any(|arg| arg.contains("chcp 65001")));
+    }
 
     #[test]
     fn windows_shell_cwd_removes_verbatim_disk_prefix() {

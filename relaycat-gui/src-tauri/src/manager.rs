@@ -129,6 +129,7 @@ struct LiveSession {
 }
 
 const WORKSPACE_TERMINAL_REPLAY_LIMIT: usize = 2 * 1024 * 1024;
+const TERMINAL_REPLAY_RESET: &[u8] = b"\x1b[0m\x1b[H\x1b[2J";
 
 struct WorkspaceTerminalState {
     token: String,
@@ -969,10 +970,101 @@ fn record_workspace_terminal_output(state: &mut WorkspaceTerminalState, bytes: &
 
 fn append_workspace_terminal_replay(replay: &mut Vec<u8>, bytes: &[u8]) {
     replay.extend_from_slice(bytes);
-    if replay.len() > WORKSPACE_TERMINAL_REPLAY_LIMIT {
-        let excess = replay.len() - WORKSPACE_TERMINAL_REPLAY_LIMIT;
-        replay.drain(..excess);
+    trim_terminal_replay(replay, WORKSPACE_TERMINAL_REPLAY_LIMIT);
+}
+
+fn trim_terminal_replay(replay: &mut Vec<u8>, limit: usize) {
+    if replay.len() <= limit {
+        return;
     }
+    if limit <= TERMINAL_REPLAY_RESET.len() {
+        replay.clear();
+        replay.extend_from_slice(&TERMINAL_REPLAY_RESET[..limit]);
+        return;
+    }
+
+    let suffix_budget = limit - TERMINAL_REPLAY_RESET.len();
+    let minimum_start = replay.len().saturating_sub(suffix_budget);
+    let safe_start = terminal_replay_safe_start(replay, minimum_start);
+    let suffix = replay[safe_start..].to_vec();
+    replay.clear();
+    replay.extend_from_slice(TERMINAL_REPLAY_RESET);
+    replay.extend_from_slice(&suffix);
+}
+
+#[derive(Clone, Copy)]
+enum TerminalReplayParserState {
+    Ground,
+    Escape,
+    Csi,
+    Osc,
+    OscEscape,
+    String,
+    StringEscape,
+}
+
+fn terminal_replay_safe_start(bytes: &[u8], minimum_start: usize) -> usize {
+    use TerminalReplayParserState::*;
+
+    let mut state = Ground;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if index >= minimum_start && matches!(state, Ground) && byte & 0b1100_0000 != 0b1000_0000 {
+            return index;
+        }
+
+        state = match state {
+            Ground => {
+                if byte == 0x1b {
+                    Escape
+                } else {
+                    Ground
+                }
+            }
+            Escape => match byte {
+                b'[' => Csi,
+                b']' => Osc,
+                b'P' | b'X' | b'^' | b'_' => String,
+                0x20..=0x2f => Escape,
+                _ => Ground,
+            },
+            Csi => {
+                if byte == 0x1b {
+                    Escape
+                } else if (0x40..=0x7e).contains(&byte) {
+                    Ground
+                } else {
+                    Csi
+                }
+            }
+            Osc => match byte {
+                0x07 => Ground,
+                0x1b => OscEscape,
+                _ => Osc,
+            },
+            OscEscape => {
+                if byte == b'\\' {
+                    Ground
+                } else {
+                    Osc
+                }
+            }
+            String => {
+                if byte == 0x1b {
+                    StringEscape
+                } else {
+                    String
+                }
+            }
+            StringEscape => {
+                if byte == b'\\' {
+                    Ground
+                } else {
+                    String
+                }
+            }
+        };
+    }
+    bytes.len()
 }
 
 fn write_workspace_terminal_command(
@@ -1216,6 +1308,37 @@ mod tests {
         assert_eq!(record_workspace_terminal_output(&mut state, b"second"), 2);
         assert_eq!(state.output_seq, 2);
         assert_eq!(state.replay, b"firstsecond");
+    }
+
+    #[test]
+    fn workspace_terminal_replay_never_starts_inside_utf8_text_after_trimming() {
+        let mut replay = vec![b'a'];
+        replay.extend_from_slice("中文".as_bytes());
+        replay.resize(WORKSPACE_TERMINAL_REPLAY_LIMIT, b'x');
+
+        append_workspace_terminal_replay(&mut replay, b"yz");
+
+        assert!(
+            std::str::from_utf8(&replay).is_ok(),
+            "trimmed terminal replay must remain valid UTF-8"
+        );
+        assert!(replay.starts_with(b"\x1b[0m\x1b[H\x1b[2J"));
+    }
+
+    #[test]
+    fn workspace_terminal_replay_never_starts_inside_an_ansi_sequence_after_trimming() {
+        let mut replay = vec![b'a'; 12];
+        replay.extend_from_slice(b"\x1b[31mcolored");
+        replay.resize(WORKSPACE_TERMINAL_REPLAY_LIMIT, b'x');
+
+        append_workspace_terminal_replay(&mut replay, b"xyz");
+
+        assert!(replay.starts_with(b"\x1b[0m\x1b[H\x1b[2J"));
+        let suffix = replay.strip_prefix(b"\x1b[0m\x1b[H\x1b[2J").unwrap();
+        assert!(
+            suffix.starts_with(b"colored"),
+            "trimming inside CSI should advance to the next parser ground state"
+        );
     }
 
     #[test]

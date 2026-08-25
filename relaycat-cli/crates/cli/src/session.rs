@@ -13,6 +13,7 @@ use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
+use relaycat_workspace::configure_shell_terminal_env;
 
 use crate::command::TargetCommand;
 use crate::relay::kill_child_process_group;
@@ -57,6 +58,7 @@ impl PtySession {
         for (key, value) in envs {
             command.env(key, value);
         }
+        configure_shell_terminal_env(&mut command);
 
         let child = pair
             .slave
@@ -127,5 +129,55 @@ fn pty_size(rows: u16, cols: u16) -> PtySize {
         cols: cols.max(1),
         pixel_width: 0,
         pixel_height: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PtySession;
+    use crate::command::{SessionKind, TargetCommand};
+    use std::io::Read;
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_child_receives_xterm_and_utf8_locale_even_from_desktop_style_env() {
+        let target = TargetCommand {
+            program: "/usr/bin/env".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            relay: None,
+            session_kind: SessionKind::shell(),
+        };
+        let mut session = PtySession::spawn_with_envs(
+            &target,
+            24,
+            80,
+            &[
+                ("TERM", String::new()),
+                ("LANG", "C".to_string()),
+                ("LC_CTYPE", "POSIX".to_string()),
+                ("LC_ALL", "C".to_string()),
+            ],
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        session.reader().unwrap().read_to_end(&mut output).unwrap();
+        session.wait().unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("TERM=xterm-256color"));
+        assert!(
+            output.lines().any(|line| {
+                line.strip_prefix("LC_CTYPE=")
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("utf"))
+            }),
+            "LC_CTYPE should explicitly select UTF-8: {output}"
+        );
+        assert!(
+            !output
+                .lines()
+                .any(|line| line == "LC_ALL=C" || line == "LC_ALL=POSIX"),
+            "LC_ALL must not override the UTF-8 character locale: {output}"
+        );
     }
 }

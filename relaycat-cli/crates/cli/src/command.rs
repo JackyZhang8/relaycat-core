@@ -267,10 +267,21 @@ fn default_shell_from_env_value(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(any(windows, test))]
+fn windows_utf8_cmd_args() -> Vec<String> {
+    vec![
+        "/D".to_string(),
+        "/Q".to_string(),
+        "/K".to_string(),
+        "chcp 65001>nul".to_string(),
+    ]
+}
+
 fn default_shell_command() -> (String, Vec<String>) {
     let program = default_shell_from_env().unwrap_or_else(default_shell);
-    // cmd.exe launched inside the PTY is interactive and stays open with no
-    // arguments, so both platforms use an empty argument list.
+    #[cfg(windows)]
+    let args = windows_utf8_cmd_args();
+    #[cfg(not(windows))]
     let args = Vec::new();
     (program, args)
 }
@@ -305,10 +316,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
-    fn windows_default_shell_command_has_no_extra_args() {
-        let (_program, args) = default_shell_command();
-        assert!(args.is_empty());
+    fn windows_default_shell_command_enables_utf8_code_page() {
+        let args = windows_utf8_cmd_args();
+        assert!(args.iter().any(|arg| arg.contains("chcp 65001")));
     }
 
     #[test]
