@@ -25,6 +25,7 @@ import { shouldApplyRelaySnapshot } from "./relay-state";
 import { projectRowMenuItems } from "./project-row-menu";
 import { restoreTerminalFocusAfterOverlayClose } from "./pairing-focus";
 import { runSplitAction } from "./split-action";
+import { appendedTextareaText } from "./terminal-input";
 import {
   createWorkspacePanel,
   type WorkspaceEntryMode,
@@ -796,37 +797,18 @@ async function createTab(tool: string, project: string, relay: string) {
   };
   term.textarea?.addEventListener("keydown", (ev) => trackModifier(ev, true), true);
   term.textarea?.addEventListener("keyup", (ev) => trackModifier(ev, false), true);
-  const textareaDelta = (oldValue: string, newValue: string): string => {
-    let prefix = 0;
-    while (
-      prefix < oldValue.length &&
-      prefix < newValue.length &&
-      oldValue.charCodeAt(prefix) === newValue.charCodeAt(prefix)
-    ) {
-      prefix++;
-    }
-    const removed = oldValue.length - prefix;
-    return `${"\x7f".repeat(removed)}${newValue.substring(prefix)}`;
-  };
   const flushPending229 = () => {
     if (pending229Baseline === undefined || imeComposing) return;
     const value = term.textarea?.value ?? "";
-    // xterm clears its hidden textarea wholesale (blur, Enter / Ctrl-C, after
-    // a paste). Replaying that clear against a stale baseline would send one
-    // DEL per cleared character, erasing text the program already received.
-    if (value.length === 0 && pending229Baseline.length > 0) {
-      pending229Baseline = undefined;
-      return;
-    }
-    const data = textareaDelta(pending229Baseline, value);
+    const data = appendedTextareaText(pending229Baseline, value);
     if (!data) return;
     pending229Baseline = undefined;
     term.input(data, true);
   };
   const schedulePending229Flush = () => {
     if (pending229FlushTimer !== undefined) return;
-    // Run after xterm's own zero-delay check so an xterm send can clear the
-    // baseline before this fallback runs.
+    // Let the WebView commit the keydown's text into the helper textarea
+    // before reading the append-only delta.
     pending229FlushTimer = setTimeout(() => {
       pending229FlushTimer = undefined;
       flushPending229();
@@ -880,13 +862,17 @@ async function createTab(tool: string, project: string, relay: string) {
           earlyInput.awaitingKeydown = false;
         } else if (pending229Baseline === undefined) {
           pending229Baseline = term.textarea?.value ?? "";
-          // The handler runs before xterm's CompositionHelper. Queue our
-          // fallback after the current event so xterm's own timer gets first
-          // chance to consume the change and clear the baseline.
+          // Queue the fallback after the current event so the WebView gets a
+          // chance to commit the punctuation into the helper textarea.
           queueMicrotask(schedulePending229Flush);
         }
       }
-    } else if (ev.type === "keyup") {
+      // This workaround owns non-composition keydown(229). Do not let xterm's
+      // CompositionHelper schedule a second delayed textarea diff, which can
+      // observe blur/paste clearing the textarea and emit an unwanted DEL.
+      return false;
+    }
+    if (ev.type === "keyup") {
       schedulePending229Flush();
     }
     return true;
@@ -959,7 +945,7 @@ async function createTab(tool: string, project: string, relay: string) {
     }
     if (pending229Baseline !== undefined && !imeComposing) {
       const value = term.textarea?.value ?? "";
-      if (data === textareaDelta(pending229Baseline, value))
+      if (data === appendedTextareaText(pending229Baseline, value))
         pending229Baseline = undefined;
     }
     if (!tab.id.startsWith("failed-"))
