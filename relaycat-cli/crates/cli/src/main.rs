@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
             let path = recent_file_path()?;
             let store = RecentStore::load(&path)?;
             let target = store.resolve_target(&args.selector)?;
-            let relay_options = target.relay.clone().expect("relay");
+            let relay_options = recent_relay_options(&target)?;
             return relay::run_secure_pairing(target, relay_options).await;
         }
         Command::Forget(args) => {
@@ -141,6 +141,10 @@ fn show_pairing_qr(args: &QrArgs, language: CliLanguage) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn recent_relay_options(target: &relaycat_cli::command::TargetCommand) -> anyhow::Result<relaycat_cli::command::RelayOptions> {
+    target.relay.clone().context("recent target is missing relay configuration")
 }
 
 #[cfg(test)]
