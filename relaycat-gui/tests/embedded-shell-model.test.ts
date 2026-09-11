@@ -7,6 +7,7 @@ import {
   embeddedShellCreateKind,
   nextLocalShellNumber,
   toggleTermSidePanel,
+  shouldApplyWorkspaceOutput,
 } from "../src/embedded-shell-model.ts";
 
 const shells = [
@@ -81,4 +82,10 @@ test("creation kind restores a missing shared Shell before using local slots", (
     ]),
     "limit",
   );
+});
+
+test("ignores workspace output already included in the attach snapshot", () => {
+  assert.equal(shouldApplyWorkspaceOutput(10, 10), false);
+  assert.equal(shouldApplyWorkspaceOutput(10, 9), false);
+  assert.equal(shouldApplyWorkspaceOutput(10, 11), true);
 });

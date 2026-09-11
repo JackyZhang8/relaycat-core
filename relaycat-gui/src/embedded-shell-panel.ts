@@ -8,6 +8,7 @@ import {
   MAX_EMBEDDED_SHELLS_PER_SESSION,
   embeddedShellCreateKind,
   nextLocalShellNumber,
+  shouldApplyWorkspaceOutput,
 } from "./embedded-shell-model";
 import { tabScrollState } from "./tab-scroll";
 
@@ -65,6 +66,7 @@ interface EmbeddedShellTab {
   ready: Promise<void>;
   closing: boolean;
   snapshotApplied: boolean;
+  lastAppliedOutputSeq: number;
   pendingOutput: Array<{ output_seq: number; data: number[] }>;
   term: Terminal;
   fit: FitAddon;
@@ -384,11 +386,13 @@ export function createEmbeddedShellPanel(
         if (!snapshot) throw new Error(t("embedded_shell_bridge_unavailable"));
         if (shell.closing || shellById(id) !== shell) return;
         shell.remoteShellId = snapshot.shell_id;
+        shell.lastAppliedOutputSeq = snapshot.last_output_seq;
         if (snapshot.data.length > 0) shell.term.write(new Uint8Array(snapshot.data));
         shell.snapshotApplied = true;
         for (const pending of shell.pendingOutput) {
-          if (pending.output_seq > snapshot.last_output_seq) {
+          if (pending.output_seq > snapshot.last_output_seq && shouldApplyWorkspaceOutput(shell.lastAppliedOutputSeq, pending.output_seq)) {
             shell.term.write(new Uint8Array(pending.data));
+            shell.lastAppliedOutputSeq = pending.output_seq;
           }
         }
         shell.pendingOutput = [];
@@ -529,7 +533,9 @@ export function createEmbeddedShellPanel(
         shell.pendingOutput.push({ output_seq, data: event.payload.data });
         return;
       }
+      if (!shouldApplyWorkspaceOutput(shell.lastAppliedOutputSeq, output_seq)) return;
       shell.term.write(new Uint8Array(event.payload.data));
+      shell.lastAppliedOutputSeq = output_seq;
       return;
     }
     if (event.payload.kind === "started") {

@@ -60,3 +60,7 @@ export function toggleTermSidePanel(
   if (requested === "git" && (current === "git" || current === "history")) return null;
   return current === requested ? null : requested;
 }
+
+export function shouldApplyWorkspaceOutput(lastAppliedSeq: number, outputSeq: number): boolean {
+  return outputSeq > lastAppliedSeq;
+}
