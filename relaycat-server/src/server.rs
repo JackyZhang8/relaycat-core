@@ -55,6 +55,7 @@ const ROOM_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const STATS_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const CLIENT_PING_INTERVAL: Duration = Duration::from_secs(10);
 const CLIENT_PONG_TIMEOUT: Duration = Duration::from_secs(30);
+const WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Capacity of the per-connection outbound channel.  If the channel fills up
 /// the recipient is too slow; the hub evicts it so the ws task disconnects.
 pub const DEFAULT_OUTBOUND_CHANNEL_CAPACITY: usize = 64;
@@ -1205,7 +1206,7 @@ async fn relay_socket_frames(
                     .await;
                     break;
                 }
-                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                if tokio::time::timeout(WEBSOCKET_SEND_TIMEOUT, socket.send(Message::Ping(Vec::new().into()))).await.is_err() {
                     break;
                 }
             }
@@ -1555,7 +1556,9 @@ fn encode_outbound_frame(frame: &OuterFrame) -> anyhow::Result<Vec<u8>> {
 
 async fn send_frame(socket: &mut WebSocket, frame: &OuterFrame) -> anyhow::Result<()> {
     let bytes = encode_outbound_frame(frame)?;
-    socket.send(Message::Binary(bytes.into())).await?;
+    tokio::time::timeout(WEBSOCKET_SEND_TIMEOUT, socket.send(Message::Binary(bytes.into())))
+        .await
+        .context("websocket send timed out")??;
     Ok(())
 }
 
