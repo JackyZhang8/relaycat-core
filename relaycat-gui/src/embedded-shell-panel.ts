@@ -72,6 +72,8 @@ interface EmbeddedShellTab {
   fit: FitAddon;
   pane: HTMLDivElement;
   tabEl: HTMLButtonElement;
+  inputQueue: Promise<void>;
+  inputGeneration: number;
 }
 
 interface EmbeddedShellPanelOptions {
@@ -261,6 +263,7 @@ export function createEmbeddedShellPanel(
     const shell = shellById(id);
     if (!shell || shell.closing) return;
     shell.closing = true;
+    shell.inputGeneration += 1;
     await shell.ready;
     if (shell.kind === "shared") {
       await invoke(terminate ? "close_workspace_terminal" : "detach_workspace_terminal", {
@@ -336,6 +339,8 @@ export function createEmbeddedShellPanel(
       fit,
       pane,
       tabEl,
+      inputQueue: Promise.resolve(),
+      inputGeneration: 0,
     };
     shells.push(shell);
     tabEl.onclick = () => selectShell(id);
@@ -365,9 +370,11 @@ export function createEmbeddedShellPanel(
     shell.remoteShellId = remoteShellId;
     shell.term.onData((data) => {
       if (shell.state === "running") {
-        void invoke("write_workspace_terminal", {
-          id: shell.id,
-          data: Array.from(new TextEncoder().encode(data)),
+        const generation = shell.inputGeneration;
+        const bytes = Array.from(new TextEncoder().encode(data));
+        shell.inputQueue = shell.inputQueue.then(async () => {
+          if (generation !== shell.inputGeneration || shell.state !== "running") return;
+          await invoke("write_workspace_terminal", { id: shell.id, data: bytes });
         }).catch(() => {});
       }
     });
@@ -430,7 +437,11 @@ export function createEmbeddedShellPanel(
     const shell = createShellTab(session, normalized, id, "local", number);
     shell.term.onData((data) => {
       if (shell.state === "running") {
-        void invoke("write_session", { id: shell.id, data }).catch(() => {});
+        const generation = shell.inputGeneration;
+        shell.inputQueue = shell.inputQueue.then(async () => {
+          if (generation !== shell.inputGeneration || shell.state !== "running") return;
+          await invoke("write_session", { id: shell.id, data });
+        }).catch(() => {});
       }
     });
     activeShellByOwner.set(session.id, id);
