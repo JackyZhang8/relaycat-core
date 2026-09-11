@@ -4,3 +4,14 @@
 export function appendedTextareaText(oldValue: string, newValue: string): string {
   return newValue.startsWith(oldValue) ? newValue.substring(oldValue.length) : "";
 }
+
+export function truncateUtf8(text: string, maxBytes: number): string {
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length <= maxBytes) return text;
+  let end = Math.max(0, maxBytes);
+  while (end > 0) {
+    try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes.slice(0, end)); }
+    catch { end -= 1; }
+  }
+  return "";
+}

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { appendedTextareaText } from "../src/terminal-input.ts";
+import { appendedTextareaText, truncateUtf8 } from "../src/terminal-input.ts";
 
 const mainSource = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 
@@ -23,4 +23,9 @@ test("custom key handling consumes keydown 229 before xterm schedules a second t
     handler[1],
     /if \(ev\.type === "keydown" && ev\.keyCode === 229\) \{[\s\S]*?return false;\n    \}/,
   );
+});
+
+
+test("truncates pasted UTF-8 without splitting a character", () => {
+  assert.equal(truncateUtf8("a😀b", 5), "a😀");
 });

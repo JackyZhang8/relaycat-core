@@ -25,7 +25,7 @@ import { shouldApplyRelaySnapshot } from "./relay-state";
 import { projectRowMenuItems } from "./project-row-menu";
 import { restoreTerminalFocusAfterOverlayClose } from "./pairing-focus";
 import { runSplitAction } from "./split-action";
-import { appendedTextareaText } from "./terminal-input";
+import { appendedTextareaText, truncateUtf8 } from "./terminal-input";
 import {
   createWorkspacePanel,
   type WorkspaceEntryMode,
@@ -1380,7 +1380,7 @@ function openTermMenu(tab: Tab, x: number, y: number) {
         const bytes = new TextEncoder().encode(text);
         if (bytes.length > MAX_PASTE_BYTES) {
           console.warn("paste content exceeded 2 MiB; truncating");
-          enqueueSessionInput(tab, new TextDecoder().decode(bytes.slice(0, MAX_PASTE_BYTES)));
+          enqueueSessionInput(tab, truncateUtf8(text, MAX_PASTE_BYTES));
           return;
         }
         tab.term.paste(text);
