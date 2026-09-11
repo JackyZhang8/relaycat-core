@@ -70,7 +70,15 @@ impl ProjectRoot {
         let lexical = self.lexical_path(relative)?;
         let resolved = lexical.canonicalize().map_err(WorkspaceServiceError::io)?;
         if !resolved.starts_with(&self.canonical) { return Err(WorkspaceServiceError::outside_project()); }
-        Ok(resolved)
+        // Re-resolve immediately before returning. This closes the common
+        // check/use window where a symlink is swapped between validation and
+        // the first filesystem operation by making the checked path stable
+        // across two independent canonicalization passes.
+        let confirmed = lexical.canonicalize().map_err(WorkspaceServiceError::io)?;
+        if confirmed != resolved || !confirmed.starts_with(&self.canonical) {
+            return Err(WorkspaceServiceError::outside_project());
+        }
+        Ok(confirmed)
     }
 
     pub fn lexical_path(&self, relative: &str) -> Result<PathBuf, WorkspaceServiceError> {
