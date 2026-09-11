@@ -58,7 +58,8 @@ const CLIENT_PONG_TIMEOUT: Duration = Duration::from_secs(30);
 const WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Capacity of the per-connection outbound channel.  If the channel fills up
 /// the recipient is too slow; the hub evicts it so the ws task disconnects.
-pub const DEFAULT_OUTBOUND_CHANNEL_CAPACITY: usize = 64;
+// Keep the worst-case queued payload bounded (8 x 1 MiB frames per peer).
+pub const DEFAULT_OUTBOUND_CHANNEL_CAPACITY: usize = 8;
 /// Maximum number of simultaneous WebSocket connections across all rooms.
 pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 4096;
 /// Maximum number of simultaneous WebSocket connections from one source IP.
