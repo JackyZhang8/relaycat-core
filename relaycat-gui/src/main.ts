@@ -93,6 +93,21 @@ interface Tab {
   // macOS/Linux and for local sessions, where the terminal just fits the window.
   remoteGrid?: { cols: number; rows: number };
   sidePanelMode: "files" | "git" | "history" | "shell" | null;
+  inputQueue: Promise<void>;
+  inputGeneration: number;
+}
+
+const MAX_PASTE_BYTES = 2 * 1024 * 1024;
+
+function enqueueSessionInput(tab: Tab, data: string): void {
+  if (!data || tab.id.startsWith("failed-") || tab.state === "exited") return;
+  const generation = tab.inputGeneration;
+  tab.inputQueue = tab.inputQueue
+    .then(async () => {
+      if (generation !== tab.inputGeneration || tab.state === "exited") return;
+      await invoke("write_session", { id: tab.id, data });
+    })
+    .catch(() => {});
 }
 
 /* ------------------------------- theming --------------------------------- */
@@ -742,6 +757,8 @@ async function createTab(tool: string, project: string, relay: string) {
     pane,
     tabEl: el("div", "tab") as HTMLDivElement,
     sidePanelMode: null,
+    inputQueue: Promise.resolve(),
+    inputGeneration: 0,
   };
   tabs.push(tab);
   appendTermToolRail(tab);
@@ -949,7 +966,7 @@ async function createTab(tool: string, project: string, relay: string) {
         pending229Baseline = undefined;
     }
     if (!tab.id.startsWith("failed-"))
-      invoke("write_session", { id: tab.id, data }).catch(() => {});
+      enqueueSessionInput(tab, data);
   });
   term.onTitleChange((title) => {
     const tt = title.trim();
@@ -1359,7 +1376,14 @@ function openTermMenu(tab: Tab, x: number, y: number) {
     disabled: tab.id.startsWith("failed-"),
     onClick: () => {
       void navigator.clipboard?.readText().then((text) => {
-        if (text) invoke("write_session", { id: tab.id, data: text }).catch(() => {});
+        if (!text) return;
+        const bytes = new TextEncoder().encode(text);
+        if (bytes.length > MAX_PASTE_BYTES) {
+          console.warn("paste content exceeded 2 MiB; truncating");
+          enqueueSessionInput(tab, new TextDecoder().decode(bytes.slice(0, MAX_PASTE_BYTES)));
+          return;
+        }
+        tab.term.paste(text);
       });
     },
   });
@@ -1516,6 +1540,7 @@ async function closeTab(id: string, force = false) {
   let idx = tabs.findIndex((t) => t.id === id);
   if (idx < 0) return;
   const tab = tabs[idx];
+  tab.inputGeneration += 1;
   if (!force && tab.state !== "exited" && !tab.id.startsWith("failed-")) {
     const ok = await confirmDialog({
       title: t("close_confirm_title"),
