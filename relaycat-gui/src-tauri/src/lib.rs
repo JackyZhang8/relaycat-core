@@ -23,6 +23,8 @@ use relaycat_cli::command::{SessionKind, TargetCommand};
 use relaycat_cli::config::{self, Config, CustomTool};
 use relaycat_cli::pairing_store;
 use relaycat_cli::recent_store::{self, RecentStore};
+
+const MAX_SESSION_INPUT_BYTES: usize = 2 * 1024 * 1024;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
@@ -897,6 +899,7 @@ fn write_workspace_terminal(
     id: String,
     data: Vec<u8>,
 ) -> Result<(), String> {
+    if data.len() > MAX_SESSION_INPUT_BYTES { return Err("workspace terminal input exceeds 2 MiB".into()); }
     state
         .workspace_terminal_write(&id, data)
         .map_err(|e| e.to_string())
@@ -1026,6 +1029,11 @@ fn read_file_tail(path: &str, max_bytes: u64) -> Result<String, String> {
 /// panel's live tail.
 #[tauri::command]
 fn read_log_tail(path: String, max_bytes: u64) -> Result<String, String> {
+    let candidate = PathBuf::from(&path);
+    if candidate.file_name().and_then(|n| n.to_str()) != Some("cli.log")
+        || candidate.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) != Some(relaycat_cli::pairing_store::RELAYCAT_DIR) { return Err("invalid log path".into()); }
+    let parent = candidate.parent().ok_or("invalid log path")?.canonicalize().map_err(|e| e.to_string())?;
+    if parent.file_name().and_then(|n| n.to_str()) != Some(relaycat_cli::pairing_store::RELAYCAT_DIR) { return Err("invalid log path".into()); }
     read_file_tail(&path, max_bytes)
 }
 
