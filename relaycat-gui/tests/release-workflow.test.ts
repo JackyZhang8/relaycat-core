@@ -28,7 +28,9 @@ test("the macOS updater script rebuilds and validates a distributable archive", 
   assert.match(script, /xattr -cr/);
   assert.match(script, /codesign[\s\S]*--options runtime[\s\S]*--timestamp/);
   assert.match(script, /xcrun notarytool submit[\s\S]*--wait/);
-  assert.match(script, /xcrun stapler staple/);
+  assert.ok(script.includes('bash "$stapler_script" staple "$prepared_app"'));
+  assert.ok(script.includes('bash "$stapler_script" validate "$prepared_app"'));
+  assert.ok(script.includes('bash "$stapler_script" validate "$extracted_app"'));
   assert.match(script, /COPYFILE_DISABLE=1 tar -czf/);
   assert.match(script, /npx tauri signer sign/);
   assert.match(script, /\[ ! -s "\$\{updater_archive\}\.sig" \]/);

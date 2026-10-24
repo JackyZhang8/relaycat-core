@@ -253,8 +253,8 @@ jobs:
               exit 1
             fi
 
-            xcrun stapler staple "$pkg"
-            xcrun stapler validate "$pkg"
+            bash scripts/apple-stapler.sh staple "$pkg"
+            bash scripts/apple-stapler.sh validate "$pkg"
           done
 
       - uses: actions/upload-artifact@v4

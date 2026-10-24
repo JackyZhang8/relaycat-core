@@ -16,6 +16,8 @@ fi
 
 source_app="$1"
 updater_archive="$2"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+stapler_script="$script_dir/../../scripts/apple-stapler.sh"
 
 if [ ! -d "$source_app" ]; then
   echo "macOS app bundle not found: $source_app" >&2
@@ -63,8 +65,8 @@ xcrun notarytool submit "$notary_zip" \
   --password "$APPLE_PASSWORD" \
   --team-id "$APPLE_TEAM_ID" \
   --wait
-xcrun stapler staple "$prepared_app"
-xcrun stapler validate "$prepared_app"
+bash "$stapler_script" staple "$prepared_app"
+bash "$stapler_script" validate "$prepared_app"
 
 # Do not add AppleDouble files or copyfile metadata: the updater extracts this
 # archive with Rust's tar implementation and must get the same signed bytes.
@@ -80,7 +82,7 @@ fi
 tar -xzf "$updater_archive" -C "$verify_dir"
 extracted_app="$verify_dir/$app_name"
 codesign --verify --deep --strict --verbose=2 "$extracted_app"
-xcrun stapler validate "$extracted_app"
+bash "$stapler_script" validate "$extracted_app"
 spctl --assess --type execute --verbose=2 "$extracted_app"
 
 echo "Validated macOS updater archive: $updater_archive"
