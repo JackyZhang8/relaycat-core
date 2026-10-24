@@ -324,10 +324,10 @@ jobs:
           key="$RUNNER_TEMP/update-signing-key.pem"
           message="$RUNNER_TEMP/update-signing-message"
           umask 077
-          printf '%s\n' "$SIGNING_KEY" > "$key"
           trap 'rm -f "$key" "$message"' EXIT
+          bash .github/scripts/prepare-update-signing-key.sh "$key"
           derived_public_key="$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | base64 -w0)"
-          if [ "$derived_public_key" != "$PUBLIC_KEY" ]; then
+          if [ "$derived_public_key" != "$(printf '%s' "$PUBLIC_KEY" | tr -d ' \t\r\n')" ]; then
             echo "::error::RELAYCAT_CLI_UPDATE_SIGNING_KEY does not match RELAYCAT_CLI_UPDATE_PUBLIC_KEY."
             exit 1
           fi

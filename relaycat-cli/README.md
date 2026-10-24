@@ -101,7 +101,7 @@ openssl genpkey -algorithm ed25519 -out relaycat-update-key.pem
 openssl pkey -in relaycat-update-key.pem -pubout -outform DER | tail -c 32 | base64 -w0
 ```
 
-In the repository’s **Settings → Secrets and variables → Actions → Repository secrets**, create both secrets: `RELAYCAT_CLI_UPDATE_PUBLIC_KEY` with the derived base64 raw public key, and `RELAYCAT_CLI_UPDATE_SIGNING_KEY` with the complete private-key PEM. The release workflow reads both values from `secrets`. Releases fail until both are configured. Keep the private PEM offline and never commit it. Rotating the key means older CLIs, which pin the previous public key, cannot verify new releases.
+In the repository’s **Settings → Secrets and variables → Actions → Repository secrets**, create both secrets: `RELAYCAT_CLI_UPDATE_PUBLIC_KEY` with the derived base64 raw public key, and `RELAYCAT_CLI_UPDATE_SIGNING_KEY` with the complete private-key PEM. The release workflow reads both values from `secrets`. Releases fail until both are configured. The workflow also accepts the PEM with lost line breaks, a base64-encoded PEM/DER, or a base64 raw 32-byte seed; OpenSSH (`ssh-keygen`) and passphrase-protected keys are rejected with a specific error. Keep the private PEM offline and never commit it. Rotating the key means older CLIs, which pin the previous public key, cannot verify new releases.
 
 ## 项目结构
 
