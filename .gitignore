@@ -9,5 +9,8 @@ relaycat-server/conf.d
 relaycat-server/rtasr_go
 certs_desktop
 .DS_Store
-docs
+docs/superpowers/
+relaycat-cli/docs
+relaycat-gui/docs
 .relaycat/
+.workbuddy/
