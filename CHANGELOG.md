@@ -2,6 +2,15 @@
 
 本文档记录 RelayCat Core（`relaycat-gui`、`relaycat-cli`、`relaycat-server` 与 `relaycat-protocol`）的版本变更说明。
 
+## [Relay v0.1.3] - 2026-10-24
+
+- 新增所有连接共享的排队 payload 字节预算，默认 256 MiB，可通过 `limits.max_queued_bytes` 配置。
+- 默认全局并发连接上限降为 512，每连接出站队列降为 32 条，降低高并发和慢消费者场景的内存压力。
+- WebSocket 数据帧及心跳写入增加 10 秒超时，避免慢连接长期占用发送任务。
+- 更新依赖锁定版本，修复严格 Clippy 检查诊断。
+
+独立发布说明：[Relay v0.1.3](docs/releases/relaycat-relay-v0.1.3.md)。
+
 ## [GUI v0.2.0 / CLI v0.1.6] - 2026-10-24
 
 ### GUI

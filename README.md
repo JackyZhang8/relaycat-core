@@ -21,6 +21,7 @@ RelayCat Core 是本地 AI Coding Agent 的开源桌面控制层与加密中继�
 | --- | --- | --- |
 | CLI / TUI | **0.1.6** | [CLI v0.1.6](docs/releases/relaycat-cli-v0.1.6.md) |
 | 桌面 GUI | **0.2.0** | [GUI v0.2.0](docs/releases/relaycat-gui-v0.2.0.md) |
+| Relay server | **0.1.3** | [Relay v0.1.3](docs/releases/relaycat-relay-v0.1.3.md) |
 
 CLI 本次重点加固签名更新、配对有效期与工作区访问；GUI 本次改进文件搜索、图片预览和 Git 工作流。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 

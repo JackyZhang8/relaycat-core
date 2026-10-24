@@ -1,8 +1,10 @@
 # RelayCat Relay
 
-`relaycat-relay` 是 RelayCat 的开源 WebSocket 中继服务，当前版本为 **0.1.2**。它基于 Axum 和 Tokio，为 CLI/GUI 与移动端 App 提供房间配对、连接管理和帧转发。
+`relaycat-relay` 是 RelayCat 的开源 WebSocket 中继服务，当前版本为 **0.1.3**。它基于 Axum 和 Tokio，为 CLI/GUI 与移动端 App 提供房间配对、连接管理和帧转发。
 
 Relay 只负责转发公开握手数据和端到端加密后的 payload，不持有客户端私钥，也不参与解密终端、项目文件、Git 或共享 Shell 内容。
+
+本版变更见 [v0.1.3 Release 说明](../docs/releases/relaycat-relay-v0.1.3.md) 和 [更新日志](../CHANGELOG.md)。
 
 ## 功能特性
 
@@ -43,7 +45,7 @@ limits:
   max_connections_per_ip: 24
   inbound_messages_per_second: 120
   inbound_bytes_per_second: 2097152
-  outbound_channel_capacity: 64
+  outbound_channel_capacity: 32
   max_binary_frame_bytes: 1048576
   max_queued_bytes: 268435456
 ```
@@ -73,7 +75,7 @@ location /ws {
 }
 ```
 
-完整示例见 [conf.d](conf.d/)。
+部署时请将上述配置加入自己的 Nginx 站点配置，并按实际监听地址调整 `proxy_pass`。
 
 ## 安全部署建议
 
