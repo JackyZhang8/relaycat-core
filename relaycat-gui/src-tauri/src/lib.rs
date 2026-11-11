@@ -1523,6 +1523,8 @@ pub fn run() {
             git::git_stage_paths,
             git::git_unstage_paths,
             workspace::list_workspace_entries,
+            workspace::copy_workspace_path,
+            workspace::open_workspace_folder,
             workspace::search_workspace_files,
             workspace::read_workspace_file,
             workspace::git_workspace_status,

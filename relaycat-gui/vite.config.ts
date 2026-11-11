@@ -3,6 +3,7 @@ import { defineConfig } from "vite";
 // Tauri expects a fixed port and a predictable dist directory.
 export default defineConfig({
   clearScreen: false,
+  worker: { format: "es" },
   server: {
     port: 1420,
     strictPort: true,

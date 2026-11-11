@@ -256,54 +256,22 @@ export function projectBasename(project: string): string {
   return trimmed.split(/[\\/]/).pop() || project;
 }
 
-export type PreviewLanguage =
-  | "typescript"
-  | "javascript"
-  | "rust"
-  | "python"
-  | "go"
-  | "shell"
-  | "json"
-  | "markdown"
-  | "html"
-  | "css"
-  | "toml"
-  | "yaml"
-  | "swift"
-  | "c"
-  | "cpp"
-  | "csharp"
-  | "java"
-  | "kotlin"
-  | "php"
-  | "ruby"
-  | "objective-c"
-  | "plain"
-  | "diff";
-
-export type PreviewTokenKind = "plain" | "keyword" | "string" | "number" | "comment";
-
-export interface PreviewToken {
-  text: string;
-  kind: PreviewTokenKind;
-}
-
-export function previewLanguage(_path: string): PreviewLanguage | null {
+export function previewLanguage(_path: string): string | null {
   const fileName = _path.split(/[\\/]/).pop()?.toLowerCase() ?? "";
-  const special: Record<string, PreviewLanguage> = {
-    dockerfile: "shell", containerfile: "shell", makefile: "shell", gnumakefile: "shell",
-    "cmakelists.txt": "shell", jenkinsfile: "shell", procfile: "shell", podfile: "ruby",
-    gemfile: "ruby", rakefile: "ruby", ".env": "plain", ".editorconfig": "plain",
+  const special: Record<string, string> = {
+    dockerfile: "dockerfile", containerfile: "dockerfile", makefile: "makefile", gnumakefile: "makefile",
+    "cmakelists.txt": "cmake", jenkinsfile: "groovy", procfile: "shell", podfile: "ruby",
+    gemfile: "ruby", rakefile: "ruby", ".env": "dotenv", ".editorconfig": "ini",
     ".gitignore": "plain", ".dockerignore": "plain",
   };
   if (special[fileName]) return special[fileName];
   const extension = fileName.split(".").pop();
   if (!extension || extension === _path.toLowerCase()) return null;
-  const languages: Record<string, PreviewLanguage> = {
+  const languages: Record<string, string> = {
     ts: "typescript",
-    tsx: "typescript",
+    tsx: "tsx",
     js: "javascript",
-    jsx: "javascript",
+    jsx: "jsx",
     mjs: "javascript",
     cjs: "javascript",
     rs: "rust",
@@ -313,8 +281,8 @@ export function previewLanguage(_path: string): PreviewLanguage | null {
     bash: "shell",
     zsh: "shell",
     json: "json",
-    jsonc: "json",
-    json5: "json",
+    jsonc: "jsonc",
+    json5: "json5",
     jsonl: "json",
     ndjson: "json",
     map: "json",
@@ -322,11 +290,11 @@ export function previewLanguage(_path: string): PreviewLanguage | null {
     markdown: "markdown",
     html: "html",
     htm: "html",
-    xml: "html",
-    svg: "html",
+    xml: "xml",
+    svg: "xml",
     css: "css",
-    scss: "css",
-    less: "css",
+    scss: "scss",
+    less: "less",
     toml: "toml",
     yaml: "yaml",
     yml: "yaml",
@@ -349,88 +317,31 @@ export function previewLanguage(_path: string): PreviewLanguage | null {
     patch: "diff",
     csv: "plain",
     tsv: "plain",
-    graphql: "plain",
-    gql: "plain",
-    proto: "plain",
-    dart: "plain",
-    lua: "plain",
-    scala: "plain",
-    vue: "html",
-    svelte: "html",
-    tf: "plain",
-    tfvars: "plain",
-    hcl: "plain",
-    nix: "plain",
-    sql: "plain",
-    gradle: "plain",
-    groovy: "plain",
-    ini: "plain",
+    graphql: "graphql",
+    gql: "graphql",
+    proto: "protobuf",
+    dart: "dart",
+    lua: "lua",
+    scala: "scala",
+    vue: "vue",
+    svelte: "svelte",
+    tf: "hcl",
+    tfvars: "hcl",
+    hcl: "hcl",
+    nix: "nix",
+    sql: "sql",
+    gradle: "groovy",
+    groovy: "groovy",
+    ini: "ini",
     conf: "plain",
-    properties: "plain",
-    env: "plain",
-    plist: "plain",
+    properties: "properties",
+    env: "dotenv",
+    plist: "xml",
     pem: "plain",
     crt: "plain",
     cer: "plain",
   };
   return languages[extension] ?? null;
-}
-
-export function tokenizePreviewLine(
-  line: string,
-  language: PreviewLanguage,
-): PreviewToken[] {
-  if (language === "markdown" && /^\s*#{1,6}\s/.test(line)) {
-    return [{ text: line, kind: "keyword" }];
-  }
-  const commentMarkers: Partial<Record<PreviewLanguage, string>> = {
-    typescript: "//",
-    javascript: "//",
-    rust: "//",
-    go: "//",
-    python: "#",
-    shell: "#",
-    toml: "#",
-    yaml: "#",
-    html: "<!--",
-    css: "/*",
-    swift: "//",
-    c: "//",
-    cpp: "//",
-    csharp: "//",
-    java: "//",
-    kotlin: "//",
-    php: "//",
-    ruby: "#",
-    "objective-c": "//",
-  };
-  const commentMarker = commentMarkers[language];
-  const commentIndex = commentMarker ? commentStart(line, commentMarker) : -1;
-  const code = commentIndex >= 0 ? line.slice(0, commentIndex) : line;
-  const comment = commentIndex >= 0 ? line.slice(commentIndex) : "";
-  const keywords = LANGUAGE_KEYWORDS[language] ?? [];
-  const keywordPattern = keywords.length ? `|\\b(?:${keywords.join("|")})\\b` : "";
-  const tokenPattern = new RegExp(
-    `(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|\`(?:\\\\.|[^\`\\\\])*\`|\\b\\d+(?:\\.\\d+)?\\b${keywordPattern})`,
-    "g",
-  );
-  const tokens: PreviewToken[] = [];
-  let offset = 0;
-  for (const match of code.matchAll(tokenPattern)) {
-    const index = match.index ?? 0;
-    if (index > offset) tokens.push({ text: code.slice(offset, index), kind: "plain" });
-    const text = match[0];
-    const kind: PreviewTokenKind = /^["'`]/.test(text)
-      ? "string"
-      : /^\d/.test(text)
-        ? "number"
-        : "keyword";
-    tokens.push({ text, kind });
-    offset = index + text.length;
-  }
-  if (offset < code.length) tokens.push({ text: code.slice(offset), kind: "plain" });
-  if (comment) tokens.push({ text: comment, kind: "comment" });
-  return tokens.length ? tokens : [{ text: line, kind: "plain" }];
 }
 
 export function gitStatusFingerprint(status: GitStatus): string {
@@ -450,8 +361,8 @@ export function workspaceEntryDecoration(isDirectory: boolean): {
   icon: string;
 } {
   return isDirectory
-    ? { disclosure: "›", icon: "" }
-    : { disclosure: "", icon: "·" };
+    ? { disclosure: "›", icon: "folder" }
+    : { disclosure: "", icon: "file" };
 }
 
 export function formatWorkspaceEntrySize(size: number, isDirectory: boolean): string {
@@ -501,25 +412,19 @@ export type DiffLineKind = "plain" | "add" | "del" | "hunk" | "header";
 export interface DiffPreviewLine {
   kind: DiffLineKind;
   prefix: string;
-  tokens: PreviewToken[];
+  source: string;
 }
 
-export function tokenizeDiffLine(line: string, sourcePath: string): DiffPreviewLine {
-  if (line.startsWith("@@")) {
-    return { kind: "hunk", prefix: "", tokens: [{ text: line, kind: "plain" }] };
+export function parseDiffPreviewLine(line: string, inHunk = false): DiffPreviewLine {
+  if (line.startsWith("@@")) return { kind: "hunk", prefix: "", source: line };
+  if (line.startsWith("diff ") || (!inHunk && /^(\+\+\+|---) /.test(line))) {
+    return { kind: "header", prefix: "", source: line };
   }
-  if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ")) {
-    return { kind: "header", prefix: "", tokens: [{ text: line, kind: "plain" }] };
-  }
-  const prefix = /^[+\- ]/.test(line) ? line[0] : "";
-  const source = prefix ? line.slice(1) : line;
-  const language = previewLanguage(sourcePath);
+  const prefix = inHunk && /^[+\- ]/.test(line) ? line[0] : "";
   return {
     kind: prefix === "+" ? "add" : prefix === "-" ? "del" : "plain",
     prefix,
-    tokens: language
-      ? tokenizePreviewLine(source, language)
-      : [{ text: source || (prefix ? "" : " "), kind: "plain" }],
+    source: prefix ? line.slice(1) : line,
   };
 }
 
@@ -535,207 +440,6 @@ export function historyNearBottom(
   return scrollHeight - scrollTop - clientHeight <= 100;
 }
 
-const LANGUAGE_KEYWORDS: Partial<Record<PreviewLanguage, string[]>> = {
-  typescript: [
-    "as",
-    "async",
-    "await",
-    "class",
-    "const",
-    "else",
-    "export",
-    "extends",
-    "false",
-    "for",
-    "from",
-    "function",
-    "if",
-    "import",
-    "interface",
-    "let",
-    "new",
-    "null",
-    "return",
-    "true",
-    "type",
-    "undefined",
-  ],
-  javascript: [
-    "async",
-    "await",
-    "class",
-    "const",
-    "else",
-    "export",
-    "extends",
-    "false",
-    "for",
-    "from",
-    "function",
-    "if",
-    "import",
-    "let",
-    "new",
-    "null",
-    "return",
-    "true",
-    "undefined",
-  ],
-  rust: [
-    "async",
-    "await",
-    "const",
-    "crate",
-    "else",
-    "enum",
-    "false",
-    "fn",
-    "for",
-    "if",
-    "impl",
-    "let",
-    "match",
-    "mod",
-    "mut",
-    "pub",
-    "return",
-    "self",
-    "struct",
-    "trait",
-    "true",
-    "use",
-    "where",
-  ],
-  python: [
-    "and",
-    "as",
-    "async",
-    "await",
-    "class",
-    "def",
-    "elif",
-    "else",
-    "False",
-    "for",
-    "from",
-    "if",
-    "import",
-    "in",
-    "None",
-    "not",
-    "or",
-    "return",
-    "True",
-    "while",
-    "with",
-  ],
-  go: [
-    "break",
-    "case",
-    "const",
-    "continue",
-    "default",
-    "defer",
-    "else",
-    "fallthrough",
-    "for",
-    "func",
-    "go",
-    "if",
-    "import",
-    "interface",
-    "map",
-    "package",
-    "range",
-    "return",
-    "select",
-    "struct",
-    "switch",
-    "type",
-    "var",
-  ],
-  shell: ["case", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in", "then", "while"],
-  json: ["false", "null", "true"],
-  html: ["html", "head", "body", "div", "span", "script", "style", "link", "meta"],
-  swift: [
-    "actor", "as", "async", "await", "break", "case", "catch", "class", "continue",
-    "default", "defer", "do", "else", "enum", "extension", "false", "for", "func",
-    "guard", "if", "import", "in", "init", "let", "nil", "private", "protocol",
-    "public", "return", "self", "static", "struct", "switch", "throw", "throws", "true",
-    "try", "var", "where", "while",
-  ],
-  c: [
-    "break", "case", "char", "const", "continue", "default", "do", "double", "else",
-    "enum", "extern", "float", "for", "if", "int", "long", "return", "short", "signed",
-    "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned", "void", "while",
-  ],
-  cpp: [
-    "auto", "bool", "break", "case", "catch", "class", "const", "constexpr", "continue",
-    "default", "delete", "else", "enum", "false", "for", "if", "namespace", "new", "nullptr",
-    "private", "protected", "public", "return", "static", "struct", "switch", "template", "this",
-    "throw", "true", "try", "using", "virtual", "void", "while",
-  ],
-  csharp: [
-    "async", "await", "bool", "break", "case", "catch", "class", "const", "continue", "decimal",
-    "default", "delegate", "else", "enum", "false", "for", "foreach", "if", "interface", "namespace",
-    "new", "null", "private", "protected", "public", "return", "static", "string", "struct", "switch",
-    "this", "throw", "true", "try", "using", "var", "virtual", "void", "while",
-  ],
-  java: [
-    "abstract", "boolean", "break", "case", "catch", "class", "const", "continue", "default", "do",
-    "else", "enum", "extends", "false", "final", "finally", "for", "if", "implements", "import",
-    "instanceof", "interface", "new", "null", "package", "private", "protected", "public", "return",
-    "static", "super", "switch", "this", "throw", "throws", "true", "try", "void", "while",
-  ],
-  kotlin: [
-    "as", "break", "class", "continue", "data", "do", "else", "false", "for", "fun", "if", "import",
-    "in", "interface", "is", "null", "object", "package", "private", "protected", "public", "return",
-    "sealed", "super", "this", "throw", "true", "try", "typealias", "val", "var", "when", "while",
-  ],
-  php: [
-    "abstract", "and", "array", "as", "break", "case", "catch", "class", "const", "continue", "default",
-    "do", "echo", "else", "elseif", "extends", "false", "final", "finally", "for", "foreach", "function",
-    "if", "implements", "interface", "namespace", "new", "null", "private", "protected", "public", "return",
-    "static", "switch", "throw", "trait", "true", "try", "use", "while",
-  ],
-  ruby: [
-    "begin", "break", "case", "class", "def", "do", "else", "elsif", "end", "ensure", "false", "for",
-    "if", "in", "module", "next", "nil", "redo", "rescue", "retry", "return", "self", "super", "then",
-    "true", "unless", "until", "when", "while", "yield",
-  ],
-  "objective-c": [
-    "BOOL", "Class", "NO", "Nil", "SEL", "YES", "break", "case", "char", "const", "continue", "default",
-    "do", "double", "else", "enum", "float", "for", "id", "if", "int", "long", "nil", "return", "self",
-    "short", "static", "struct", "super", "switch", "typedef", "void", "while",
-  ],
-};
-
 function compactDecimal(value: number): string {
   return value >= 10 || Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1);
-}
-
-function commentStart(line: string, marker: string): number {
-  let quote = "";
-  let escaped = false;
-  for (let index = 0; index <= line.length - marker.length; index += 1) {
-    const char = line[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\" && quote) {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = "";
-      continue;
-    }
-    if (char === '"' || char === "'" || char === "`") {
-      quote = char;
-      continue;
-    }
-    if (line.startsWith(marker, index)) return index;
-  }
-  return -1;
 }

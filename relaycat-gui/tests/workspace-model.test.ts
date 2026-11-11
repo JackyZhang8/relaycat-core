@@ -23,8 +23,7 @@ import {
   previewLanguage,
   projectBasename,
   storedWorkspacePanelWidth,
-  tokenizePreviewLine,
-  tokenizeDiffLine,
+  parseDiffPreviewLine,
   uniqueWorkspaceEntries,
   workspaceEntryDecoration,
   workspacePanelWidth,
@@ -225,10 +224,10 @@ test("detects common source languages from file names", () => {
 });
 
 test("detects special development filenames and formats", () => {
-  assert.equal(previewLanguage("Dockerfile"), "shell");
-  assert.equal(previewLanguage("Makefile"), "shell");
-  assert.equal(previewLanguage("CMakeLists.txt"), "shell");
-  assert.equal(previewLanguage("schema.graphql"), "plain");
+  assert.equal(previewLanguage("Dockerfile"), "dockerfile");
+  assert.equal(previewLanguage("Makefile"), "makefile");
+  assert.equal(previewLanguage("CMakeLists.txt"), "cmake");
+  assert.equal(previewLanguage("schema.graphql"), "graphql");
   assert.equal(previewLanguage("change.patch"), "diff");
   assert.equal(previewLanguage("certificate.pem"), "plain");
 });
@@ -288,32 +287,6 @@ test("developer preview switches locally while JSON stays in source mode", () =>
   assert.doesNotMatch(setter, /invoke\s*</);
 });
 
-test("tokenizes source lines into safe syntax-color segments", () => {
-  assert.deepEqual(
-    tokenizePreviewLine('const value = "x"; // note', "typescript"),
-    [
-      { text: "const", kind: "keyword" },
-      { text: " value = ", kind: "plain" },
-      { text: '"x"', kind: "string" },
-      { text: "; ", kind: "plain" },
-      { text: "// note", kind: "comment" },
-    ],
-  );
-});
-
-test("tokenizes Swift keywords strings and comments", () => {
-  assert.deepEqual(
-    tokenizePreviewLine('let title = "RelayCat" // note', "swift"),
-    [
-      { text: "let", kind: "keyword" },
-      { text: " title = ", kind: "plain" },
-      { text: '"RelayCat"', kind: "string" },
-      { text: " ", kind: "plain" },
-      { text: "// note", kind: "comment" },
-    ],
-  );
-});
-
 test("formats workspace entry metadata compactly", () => {
   assert.equal(formatWorkspaceEntrySize(0, true), "");
   assert.equal(formatWorkspaceEntrySize(999, false), "999 B");
@@ -323,22 +296,17 @@ test("formats workspace entry metadata compactly", () => {
   assert.match(formatWorkspaceModifiedTime(1_700_000_000), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
 });
 
-test("diff syntax keeps prefixes while highlighting source tokens", () => {
-  assert.deepEqual(tokenizeDiffLine('+let title = "RelayCat"', "App.swift"), {
-    kind: "add",
-    prefix: "+",
-    tokens: [
-      { text: "let", kind: "keyword" },
-      { text: " title = ", kind: "plain" },
-      { text: '"RelayCat"', kind: "string" },
-    ],
+test("diff rows preserve source text and distinguish headers from hunk content", () => {
+  assert.deepEqual(parseDiffPreviewLine('+let title = "RelayCat"', true), {
+    kind: "add", prefix: "+", source: 'let title = "RelayCat"',
   });
-  assert.deepEqual(tokenizeDiffLine("@@ -1 +1 @@", "App.swift"), {
-    kind: "hunk",
-    prefix: "",
-    tokens: [{ text: "@@ -1 +1 @@", kind: "plain" }],
+  assert.deepEqual(parseDiffPreviewLine("@@ -1 +1 @@"), {
+    kind: "hunk", prefix: "", source: "@@ -1 +1 @@",
   });
-  assert.equal(tokenizeDiffLine("+++ b/App.swift", "App.swift").kind, "header");
+  assert.equal(parseDiffPreviewLine("+++ b/App.swift").kind, "header");
+  assert.deepEqual(parseDiffPreviewLine("+++ b/App.swift", true), {
+    kind: "add", prefix: "+", source: "++ b/App.swift",
+  });
 });
 
 test("git status fingerprint changes only when repository state changes", () => {
@@ -354,14 +322,14 @@ test("git status fingerprint changes only when repository state changes", () => 
   );
 });
 
-test("folder rows use only the leading disclosure triangle", () => {
+test("folder and file rows have distinct icons with folder-only disclosure", () => {
   assert.deepEqual(workspaceEntryDecoration(true), {
     disclosure: "›",
-    icon: "",
+    icon: "folder",
   });
   assert.deepEqual(workspaceEntryDecoration(false), {
     disclosure: "",
-    icon: "·",
+    icon: "file",
   });
 });
 

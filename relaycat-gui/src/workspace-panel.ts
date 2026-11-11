@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import { purifySvgMarkup, renderSafeMarkdown } from "./markdown-preview";
+import { applySyntaxRows, highlightMarkdownBlocks, highlightSyntax } from "./syntax-highlight";
 import {
   developerPreviewKind,
   parseDelimitedPreview,
@@ -43,8 +44,7 @@ import {
   previewCollapseFor,
   projectBasename,
   storedWorkspacePanelWidth,
-  tokenizeDiffLine,
-  tokenizePreviewLine,
+  parseDiffPreviewLine,
   uniqueWorkspaceEntries,
   workspacePanelWidth,
   NARROW_PANEL_WIDTH,
@@ -61,6 +61,17 @@ import {
 } from "./workspace-model";
 
 type WorkspaceMode = "files" | "git" | "history" | "shell";
+interface MarkdownVisit {
+  path: string;
+  title: string;
+  displayMode: "preview" | "source";
+  scrollTop: number;
+  scrollLeft: number;
+}
+interface MarkdownNavigationHistory {
+  visits: MarkdownVisit[];
+  index: number;
+}
 export type WorkspaceEntryMode = WorkspaceMode | null;
 
 export interface WorkspacePanelController {
@@ -115,6 +126,7 @@ export function createWorkspacePanel(
   const resizer = document.querySelector("#workspace-resizer") as HTMLElement;
   const closeBtn = document.querySelector("#workspace-close") as HTMLButtonElement;
   const refreshBtn = document.querySelector("#workspace-refresh") as HTMLButtonElement;
+  const openFolderBtn = document.querySelector("#workspace-open-folder") as HTMLButtonElement;
   const refreshProgress = document.querySelector("#workspace-refresh-progress") as HTMLElement;
   const projectLabel = document.querySelector("#workspace-project") as HTMLElement;
   const projectName = document.querySelector("#workspace-project-name") as HTMLElement;
@@ -189,6 +201,12 @@ export function createWorkspacePanel(
   let historyLoading = false;
   let historyHasMore = true;
   let historyRequestSequence = 0;
+  let historyLoadError: string | null = null;
+  const historyMore = document.createElement("button");
+  historyMore.type = "button";
+  historyMore.className = "ws-history-more";
+  historyMore.setAttribute("aria-live", "polite");
+  historyMore.onclick = () => void refreshHistory(false);
   let appliedHistoryFilters = historyFilterArgs("", "", "");
   let stagedCount = 0;
   // Unique changed paths in the repository, independent of the path filter, so
@@ -205,6 +223,13 @@ export function createWorkspacePanel(
   const collapsedGitDirs = new Set<string>();
   let commitMenu: HTMLElement | null = null;
   let fileMenu: HTMLElement | null = null;
+  let copyNoticeTimer: number | null = null;
+  const copyNotice = document.createElement("div");
+  copyNotice.className = "ws-copy-notice";
+  copyNotice.setAttribute("role", "status");
+  copyNotice.setAttribute("aria-live", "polite");
+  copyNotice.hidden = true;
+  panel.appendChild(copyNotice);
   let gitPathFilter: { path: string; isDir: boolean } | null = null;
   let fileSearchSequence = 0;
   let fileSearchTimer: number | null = null;
@@ -239,6 +264,10 @@ export function createWorkspacePanel(
   let markdownSource: string | null = null;
   let markdownSourcePath = "";
   let markdownRenderedHtml = "";
+  let markdownCanRender = false;
+  let syntaxRenderSequence = 0;
+  const markdownHistoryByMode: Partial<Record<WorkspaceMode, MarkdownNavigationHistory>> = {};
+  let previewLoading = false;
   let developerDisplayMode: "preview" | "source" = "preview";
   let developerSource: string | null = null;
   let developerSourcePath = "";
@@ -461,6 +490,8 @@ export function createWorkspacePanel(
   }).observe(imageView);
 
   function clearPreview() {
+    previewRequestToken += 1;
+    previewLoading = false;
     resetMarkdownPreview();
     resetDeveloperPreview();
     previewTitle.textContent = t("workspace_preview");
@@ -476,10 +507,12 @@ export function createWorkspacePanel(
   }
 
   function resetMarkdownPreview() {
+    syntaxRenderSequence += 1;
     markdownDisplayMode = "preview";
     markdownSource = null;
     markdownSourcePath = "";
     markdownRenderedHtml = "";
+    markdownCanRender = false;
     markdownPreview.hidden = true;
     markdownPreview.innerHTML = "";
   }
@@ -514,6 +547,7 @@ export function createWorkspacePanel(
 
   function setDeveloperDisplayMode(value: "preview" | "source") {
     if (developerSource === null) return;
+    syntaxRenderSequence += 1;
     developerDisplayMode = value;
     renderDeveloperActions(true);
     markdownPreview.innerHTML = "";
@@ -595,16 +629,72 @@ export function createWorkspacePanel(
       group.appendChild(button);
     }
     previewActions.appendChild(group);
+    const navigation = document.createElement("div");
+    navigation.className = "ws-markdown-navigation";
+    const history = markdownHistoryByMode[mode];
+    for (const direction of [-1, 1] as const) {
+      const visit = history?.visits[history.index + direction];
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ws-small-btn ws-markdown-nav-btn";
+      button.textContent = direction === -1 ? "<" : ">";
+      const label = t(direction === -1 ? "workspace_markdown_back" : "workspace_markdown_forward");
+      button.setAttribute("aria-label", label);
+      button.title = visit ? `${label} · ${visit.path}` : label;
+      button.disabled = previewLoading || !visit;
+      button.onclick = () => navigateMarkdownHistory(direction);
+      navigation.appendChild(button);
+    }
+    previewActions.appendChild(navigation);
+  }
+
+  function saveMarkdownVisit(targetMode: WorkspaceMode = mode) {
+    const history = markdownHistoryByMode[targetMode];
+    const visit = history?.visits[history.index];
+    if (markdownSource === null || visit?.path !== markdownSourcePath) return;
+    const viewport = markdownDisplayMode === "preview" ? markdownPreview : previewCode;
+    visit.displayMode = markdownDisplayMode;
+    visit.scrollTop = viewport.scrollTop;
+    visit.scrollLeft = viewport.scrollLeft;
+  }
+
+  function recordMarkdownVisit(
+    path: string,
+    title: string,
+    targetMode: WorkspaceMode,
+    historyIndex?: number,
+  ): MarkdownVisit {
+    const history = markdownHistoryByMode[targetMode] ??= { visits: [], index: -1 };
+    if (historyIndex !== undefined && history.visits[historyIndex]?.path === path) {
+      history.index = historyIndex;
+    } else if (history.visits[history.index]?.path !== path) {
+      // A new navigation after Back replaces the old forward branch.
+      history.visits.splice(history.index + 1);
+      history.visits.push({ path, title, displayMode: "preview", scrollTop: 0, scrollLeft: 0 });
+      history.index = history.visits.length - 1;
+    }
+    return history.visits[history.index];
+  }
+
+  function navigateMarkdownHistory(direction: -1 | 1) {
+    if (previewLoading) return;
+    const history = markdownHistoryByMode[mode];
+    if (!history) return;
+    const index = history.index + direction;
+    const visit = history.visits[index];
+    if (visit) void previewFile(visit.path, visit.title, mode, false, index);
   }
 
   function setMarkdownDisplayMode(value: "preview" | "source") {
     if (markdownSource === null) return;
+    const sequence = ++syntaxRenderSequence;
     markdownDisplayMode = value;
     renderMarkdownActions(true);
     if (value === "preview") {
       previewCode.hidden = true;
       markdownPreview.innerHTML = markdownRenderedHtml;
       markdownPreview.hidden = false;
+      void highlightMarkdownBlocks(markdownPreview, () => sequence === syntaxRenderSequence);
     } else {
       markdownPreview.hidden = true;
       markdownPreview.innerHTML = "";
@@ -685,35 +775,37 @@ export function createWorkspacePanel(
   }
 
   function renderHighlightedText(content: string, path: string) {
-    const language = previewLanguage(path);
+    const sequence = ++syntaxRenderSequence;
     previewCode.innerHTML = "";
     previewCode.classList.add("show-line-numbers");
     if (content === "") return;
+    const fragment = document.createDocumentFragment();
+    const rows: HTMLElement[] = [];
     for (const line of content.split("\n")) {
       const lineEl = document.createElement("span");
       lineEl.className = "ws-code-line";
-      if (!language) {
-        lineEl.textContent = line;
-      } else {
-        for (const token of tokenizePreviewLine(line, language)) {
-          const tokenEl = document.createElement("span");
-          tokenEl.className = `ws-token ${token.kind}`;
-          tokenEl.textContent = token.text;
-          lineEl.appendChild(tokenEl);
-        }
-      }
-      previewCode.appendChild(lineEl);
+      lineEl.textContent = line;
+      rows.push(lineEl);
+      fragment.appendChild(lineEl);
     }
+    previewCode.appendChild(fragment);
+    void highlightSyntax(content, previewLanguage(path)).then((lines) => {
+      if (!lines || sequence !== syntaxRenderSequence) return;
+      return applySyntaxRows(rows, lines, () => sequence === syntaxRenderSequence);
+    });
   }
 
   function renderHighlightedDiff(content: string, sourcePath: string) {
+    const sequence = ++syntaxRenderSequence;
     previewCode.innerHTML = "";
     previewCode.classList.remove("show-line-numbers");
-    let activePath = sourcePath;
+    const fragment = document.createDocumentFragment();
+    const rows: HTMLElement[] = [];
+    let inHunk = false;
     for (const line of content.split("\n")) {
-      const nextPath = line.match(/^\+\+\+ b\/(.+)$/)?.[1];
-      if (nextPath) activePath = nextPath;
-      const rendered = tokenizeDiffLine(line, activePath);
+      if (line.startsWith("diff ")) inHunk = false;
+      const rendered = parseDiffPreviewLine(line, inHunk);
+      if (rendered.kind === "hunk") inHunk = true;
       const lineEl = document.createElement("span");
       lineEl.className = `ws-diff-line ${rendered.kind}`;
       if (rendered.prefix) {
@@ -722,14 +814,19 @@ export function createWorkspacePanel(
         prefix.textContent = rendered.prefix;
         lineEl.appendChild(prefix);
       }
-      for (const token of rendered.tokens) {
-        const tokenEl = document.createElement("span");
-        tokenEl.className = `ws-token ${token.kind}`;
-        tokenEl.textContent = token.text;
-        lineEl.appendChild(tokenEl);
-      }
-      previewCode.appendChild(lineEl);
+      const source = document.createElement("span");
+      source.className = "ws-diff-source";
+      source.textContent = rendered.source;
+      lineEl.appendChild(source);
+      rows.push(source);
+      fragment.appendChild(lineEl);
     }
+    previewCode.appendChild(fragment);
+    void highlightSyntax(content, "diff", sourcePath).then((lines) => {
+      if (!lines || sequence !== syntaxRenderSequence) return;
+      // Keep row elements and their staging/selection handlers intact.
+      return applySyntaxRows(rows, lines, () => sequence === syntaxRenderSequence);
+    });
   }
 
   function hideImagePreview() {
@@ -882,16 +979,14 @@ export function createWorkspacePanel(
       previewImage.src = preview.content;
       return;
     }
-    if (!preview.content) {
-      previewCode.textContent = diff ? t("workspace_diff_empty") : "";
-      return;
-    }
     if (!diff && preview.kind === "text" && isMarkdownPreviewPath(sourcePath)) {
       markdownSource = preview.content;
       markdownSourcePath = sourcePath;
-      if (canRenderMarkdown(preview.size_bytes)) {
-        markdownRenderedHtml = renderSafeMarkdown(preview.content);
+      markdownCanRender = canRenderMarkdown(preview.size_bytes);
+      if (markdownCanRender) {
+        markdownRenderedHtml = renderSafeMarkdown(preview.content, sourcePath);
         setMarkdownDisplayMode("preview");
+        markdownPreview.scrollTop = 0;
       } else {
         markdownDisplayMode = "source";
         renderMarkdownActions(false);
@@ -899,6 +994,10 @@ export function createWorkspacePanel(
         previewNotice.classList.add("show");
         renderHighlightedText(preview.content, sourcePath);
       }
+      return;
+    }
+    if (!preview.content) {
+      previewCode.textContent = diff ? t("workspace_diff_empty") : "";
       return;
     }
     if (!diff && preview.kind === "text") {
@@ -913,6 +1012,7 @@ export function createWorkspacePanel(
   }
 
   function showPreviewLoading(title: string, sourcePath = title) {
+    saveMarkdownVisit();
     resetMarkdownPreview();
     resetDeveloperPreview();
     previewActions.innerHTML = "";
@@ -932,19 +1032,73 @@ export function createWorkspacePanel(
   }
 
   let previewRequestToken = 0;
+
+  function activateMarkdownLink(event: MouseEvent | KeyboardEvent) {
+    if (event instanceof KeyboardEvent && event.key !== "Enter") return;
+    if (markdownSource === null) return;
+    if (!(event.target instanceof Element)) return;
+    const link = event.target.closest<HTMLElement>(
+      ".ws-md-local-link[data-workspace-path]",
+    );
+    if (!link || !markdownPreview.contains(link)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const path = link.dataset.workspacePath;
+    if (path) void previewFile(path, path, mode);
+  }
+  markdownPreview.addEventListener("click", activateMarkdownLink);
+  markdownPreview.addEventListener("keydown", activateMarkdownLink);
+
+  function createEntryIcon(entry: WorkspaceEntry): HTMLElement {
+    const icon = document.createElement("span");
+    renderEntryIcon(icon, entry);
+    return icon;
+  }
+
+  function renderEntryIcon(icon: HTMLElement, entry: WorkspaceEntry, expanded = false) {
+    icon.className = `ws-tree-icon ${workspaceEntryDecoration(entry.is_dir).icon}`;
+    icon.classList.toggle("expanded", expanded);
+    icon.setAttribute("aria-hidden", "true");
+    // Fixed-size outline icons keep files and folders in the same name column.
+    const shape = entry.is_dir
+      ? expanded
+        ? '<path d="M20 10V6a2 2 0 0 0-2-2h-6l-2-2H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14l4-10H8l-4 10"/>'
+        : '<path d="M3 7V5a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/><path d="M3 8h18"/>'
+      : '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8M8 17h6"/>';
+    icon.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${shape}</svg>`;
+  }
+
+  function selectFileRow(row: HTMLElement) {
+    panel.querySelector(".ws-tree-row.selected, .ws-tree-result.selected")?.classList.remove("selected");
+    row.classList.add("selected");
+  }
+
   async function previewFile(
     relativePath: string,
     title = relativePath,
     targetMode: WorkspaceMode = "files",
     restore = false,
+    historyIndex?: number,
   ) {
     if (!project) return;
+    if (!restore) saveMarkdownVisit(targetMode);
     const requestToken = ++previewRequestToken;
     const activeProject = project;
     const revision = projectRevision;
-    previewRestore[targetMode] = () =>
-      previewFile(relativePath, title, targetMode, true);
-    if (!restore) showPreviewLoading(title, relativePath);
+    const keepMarkdown = !restore && mode === targetMode &&
+      isMarkdownPreviewPath(relativePath) && markdownSource !== null;
+    previewLoading = true;
+    if (keepMarkdown) {
+      // Keep the current document available if the target cannot be loaded.
+      setPreviewCollapsed(false);
+      renderMarkdownActions(false);
+      previewNotice.textContent = t("workspace_loading");
+      previewNotice.classList.add("show");
+    } else if (!restore) {
+      showPreviewLoading(title, relativePath);
+    } else if (markdownSource !== null) {
+      renderMarkdownActions(false);
+    }
     try {
       const preview = await invoke<FilePreview>("read_workspace_file", {
         project: activeProject,
@@ -954,18 +1108,49 @@ export function createWorkspacePanel(
       if (
         requestToken !== previewRequestToken ||
         project !== activeProject ||
-        projectRevision !== revision
+        projectRevision !== revision || mode !== targetMode
       )
         return;
+      if (keepMarkdown && preview.kind !== "text") {
+        throw new Error(preview.kind === "too_large"
+          ? t("workspace_too_large", formatBytes(preview.size_bytes))
+          : t("workspace_binary"));
+      }
+      if (keepMarkdown) saveMarkdownVisit(targetMode);
+      const isMarkdown = isMarkdownPreviewPath(relativePath);
+      const visit = isMarkdown && preview.kind === "text"
+        ? recordMarkdownVisit(relativePath, title, targetMode, historyIndex)
+        : undefined;
+      previewLoading = false;
+      previewRestore[targetMode] = () =>
+        previewFile(relativePath, title, targetMode, true);
       renderPreview(title, preview, false, relativePath);
+      if (visit && (restore || historyIndex !== undefined)) {
+        if (canRenderMarkdown(preview.size_bytes) && markdownDisplayMode !== visit.displayMode) {
+          setMarkdownDisplayMode(visit.displayMode);
+        }
+        const viewport = markdownDisplayMode === "preview" ? markdownPreview : previewCode;
+        viewport.scrollTop = visit.scrollTop;
+        viewport.scrollLeft = visit.scrollLeft;
+      } else if (isMarkdown && markdownSource === null) {
+        renderMarkdownActions(false);
+      }
     } catch (error) {
       if (
         requestToken !== previewRequestToken ||
         project !== activeProject ||
-        projectRevision !== revision
+        projectRevision !== revision || mode !== targetMode
       )
         return;
-      previewCode.textContent = t("workspace_load_failed", String(error));
+      previewLoading = false;
+      if (keepMarkdown) {
+        previewNotice.textContent = t("workspace_load_failed", String(error));
+        previewNotice.classList.add("show");
+        renderMarkdownActions(markdownCanRender);
+      } else if (!restore) {
+        previewCode.textContent = t("workspace_load_failed", String(error));
+        if (isMarkdownPreviewPath(relativePath)) renderMarkdownActions(false);
+      }
     }
   }
 
@@ -998,15 +1183,16 @@ export function createWorkspacePanel(
       const row = document.createElement("button");
       row.type = "button";
       row.className = "ws-tree-row";
-      row.style.paddingLeft = `${8 + depth * 14}px`;
+      row.style.paddingLeft = `${10 + depth * 18}px`;
       row.title = entry.relative_path;
       const arrow = document.createElement("span");
       arrow.className = "ws-tree-arrow";
       const decoration = workspaceEntryDecoration(entry.is_dir);
-      arrow.textContent = decoration.disclosure;
-      const icon = document.createElement("span");
-      icon.className = "ws-tree-icon";
-      icon.textContent = decoration.icon;
+      arrow.setAttribute("aria-hidden", "true");
+      if (decoration.disclosure) {
+        arrow.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m6 4 4 4-4 4"/></svg>';
+      }
+      const icon = createEntryIcon(entry);
       const name = document.createElement("span");
       name.className = "ws-tree-name";
       name.textContent = entry.name;
@@ -1015,13 +1201,12 @@ export function createWorkspacePanel(
       const size = formatWorkspaceEntrySize(entry.size_bytes, entry.is_dir);
       const modified = formatWorkspaceModifiedTime(entry.modified_unix_seconds);
       metadata.textContent = [size, modified].filter(Boolean).join(" · ");
-      row.append(arrow);
-      if (decoration.icon) row.append(icon);
-      row.append(name);
+      row.append(arrow, icon, name);
       if (metadata.textContent) row.append(metadata);
       node.appendChild(row);
 
       if (entry.is_dir) {
+        row.setAttribute("aria-expanded", "false");
         const children = document.createElement("div");
         children.className = "ws-tree-children";
         children.hidden = true;
@@ -1030,11 +1215,15 @@ export function createWorkspacePanel(
         row.onclick = async () => {
           if (!children.hidden) {
             children.hidden = true;
-            arrow.textContent = "›";
+            arrow.classList.remove("expanded");
+            renderEntryIcon(icon, entry);
+            row.setAttribute("aria-expanded", "false");
             return;
           }
           children.hidden = false;
-          arrow.textContent = "⌄";
+          arrow.classList.add("expanded");
+          renderEntryIcon(icon, entry, true);
+          row.setAttribute("aria-expanded", "true");
           if (loaded) return;
           renderState(children, t("workspace_loading"));
           try {
@@ -1055,10 +1244,14 @@ export function createWorkspacePanel(
           }
         };
       } else {
-        row.onclick = () => void previewFile(entry.relative_path);
+        row.onclick = () => {
+          selectFileRow(row);
+          void previewFile(entry.relative_path);
+        };
       }
       row.oncontextmenu = (event) => {
         event.preventDefault();
+        event.stopPropagation();
         openFileMenu(entry, event.clientX, event.clientY);
       };
       container.appendChild(node);
@@ -1152,11 +1345,20 @@ export function createWorkspacePanel(
       row.type = "button";
       row.className = "ws-tree-result";
       row.title = entry.relative_path;
+      row.appendChild(createEntryIcon(entry));
       const path = document.createElement("span");
       path.className = "ws-tree-result-path";
       path.textContent = entry.relative_path;
       row.appendChild(path);
-      row.onclick = () => void previewFile(entry.relative_path);
+      row.onclick = () => {
+        selectFileRow(row);
+        void previewFile(entry.relative_path);
+      };
+      row.oncontextmenu = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openFileMenu(entry, event.clientX, event.clientY);
+      };
       fileResults.appendChild(row);
     }
   }
@@ -2043,6 +2245,20 @@ export function createWorkspacePanel(
     fileMenu = null;
   }
 
+  function hideCopyNotice() {
+    if (copyNoticeTimer !== null) window.clearTimeout(copyNoticeTimer);
+    copyNoticeTimer = null;
+    copyNotice.hidden = true;
+    copyNotice.textContent = "";
+  }
+
+  function showCopyNotice() {
+    hideCopyNotice();
+    copyNotice.hidden = false;
+    copyNotice.textContent = t("workspace_path_copied");
+    copyNoticeTimer = window.setTimeout(hideCopyNotice, 1500);
+  }
+
   function matchesGitPathFilter(change: { path: string }): boolean {
     if (!gitPathFilter) return true;
     return gitPathFilter.isDir
@@ -2052,10 +2268,13 @@ export function createWorkspacePanel(
 
   function openFileMenu(entry: WorkspaceEntry, x: number, y: number) {
     closeFileMenu();
+    if (!project) return;
+    const activeProject = project;
+    const revision = projectRevision;
     const menu = document.createElement("div");
     menu.className = "ws-commit-menu";
     menu.style.left = `${Math.min(x, window.innerWidth - 200)}px`;
-    menu.style.top = `${Math.min(y, window.innerHeight - 80)}px`;
+    menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - 100))}px`;
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = t(
@@ -2069,6 +2288,29 @@ export function createWorkspacePanel(
       void refreshGit(true);
     };
     menu.appendChild(button);
+    const copyPath = document.createElement("button");
+    copyPath.type = "button";
+    copyPath.textContent = t("workspace_copy_path");
+    copyPath.onclick = async () => {
+      copyPath.disabled = true;
+      try {
+        await invoke("copy_workspace_path", {
+          project: activeProject,
+          relativePath: entry.relative_path,
+        });
+        if (fileMenu === menu) closeFileMenu();
+        if (project === activeProject && projectRevision === revision && opened) showCopyNotice();
+      } catch (error) {
+        copyPath.disabled = false;
+        menu.querySelector(".ws-menu-error")?.remove();
+        const message = document.createElement("div");
+        message.className = "ws-menu-error";
+        message.setAttribute("role", "alert");
+        message.textContent = t("workspace_copy_path_failed", String(error));
+        menu.appendChild(message);
+      }
+    };
+    menu.appendChild(copyPath);
     document.body.appendChild(menu);
     fileMenu = menu;
   }
@@ -2202,13 +2444,35 @@ export function createWorkspacePanel(
     }
   }
 
+  function renderHistoryMore() {
+    historyMore.remove();
+    if (historyCommits.length === 0 || !historyHasMore) return;
+    historyMore.disabled = historyLoading;
+    historyMore.textContent = t(
+      historyLoading ? "workspace_loading" : historyLoadError ? "workspace_history_retry" : "workspace_load_more",
+    );
+    historyMore.title = historyLoadError ?? "";
+    historyList.appendChild(historyMore);
+  }
+
+  function loadHistoryNearBottom() {
+    if (
+      opened && mode === "history" && historyList.clientHeight > 0 &&
+      historyCommits.length > 0 &&
+      !historyLoading && historyHasMore && !historyLoadError &&
+      historyNearBottom(historyList.scrollTop, historyList.clientHeight, historyList.scrollHeight)
+    ) void refreshHistory(false);
+  }
+
   async function refreshHistory(reset = true): Promise<boolean> {
     if (!project) return false;
-    if (historyLoading || (!reset && !historyHasMore)) return true;
+    if (!reset && (historyLoading || !historyHasMore)) return true;
     const activeProject = project;
     const revision = projectRevision;
     const sequence = ++historyRequestSequence;
     historyLoading = true;
+    historyLoadError = null;
+    let loaded = false;
     if (reset) {
       appliedHistoryFilters = historyFilterArgs(
         historyQuery.value,
@@ -2218,9 +2482,10 @@ export function createWorkspacePanel(
       renderHistoryChips();
       historyCommits = [];
       historyHasMore = true;
-      historyView.scrollTop = 0;
+      historyList.scrollTop = 0;
       renderState(historyList, t("workspace_loading"));
     }
+    renderHistoryMore();
     try {
       if (reset) {
         const status = await invoke<GitStatus>("git_workspace_status", {
@@ -2255,6 +2520,7 @@ export function createWorkspacePanel(
       ) return true;
       loadedViews.add("history");
       if (reset) historyList.innerHTML = "";
+      historyMore.remove();
       historyCommits.push(...commits);
       historyHasMore = commits.length === page.limit;
       if (historyCommits.length === 0) {
@@ -2263,6 +2529,7 @@ export function createWorkspacePanel(
         appendHistoryRows(commits);
       }
       renderContext();
+      loaded = true;
       return true;
     } catch (error) {
       if (
@@ -2270,10 +2537,20 @@ export function createWorkspacePanel(
         projectRevision !== revision ||
         sequence !== historyRequestSequence
       ) return true;
-      renderLoadError(historyList, error);
+      historyLoadError = String(error);
+      if (reset || historyCommits.length === 0) {
+        renderState(historyList, t("workspace_load_failed", String(error)), {
+          action: { label: t("workspace_history_retry"), run: () => void refreshHistory(true) },
+        });
+      }
+      // Appending errors leave the existing rows intact; finally adds a retry footer.
       return false;
     } finally {
-      if (sequence === historyRequestSequence) historyLoading = false;
+      if (sequence === historyRequestSequence) {
+        historyLoading = false;
+        renderHistoryMore();
+        if (loaded && historyHasMore) requestAnimationFrame(loadHistoryNearBottom);
+      }
     }
   }
 
@@ -2321,7 +2598,9 @@ export function createWorkspacePanel(
   }
 
   function setOpened(next: boolean) {
+    if (!next) saveMarkdownVisit();
     opened = next && !!project;
+    if (!opened) hideCopyNotice();
     panel.classList.toggle("open", opened);
     stage.classList.toggle("workspace-open", opened);
     syncOpenModeClasses();
@@ -2378,7 +2657,13 @@ export function createWorkspacePanel(
   function setMode(next: WorkspaceMode) {
     // Clicking the tab you are already on must not refetch or re-render.
     if (opened && mode === next) return;
-    if (mode !== next) collapsedByMode[mode] = previewCollapsed;
+    if (mode !== next) {
+      saveMarkdownVisit();
+      collapsedByMode[mode] = previewCollapsed;
+      previewRequestToken += 1;
+      previewLoading = false;
+      syntaxRenderSequence += 1;
+    }
     mode = next;
     const filesActive = mode === "files";
     const gitActive = mode === "git";
@@ -2449,6 +2734,22 @@ export function createWorkspacePanel(
     onClose();
   });
   refreshBtn.onclick = () => void refresh();
+  openFolderBtn.onclick = async () => {
+    if (!project || openFolderBtn.disabled) return;
+    const activeProject = project;
+    const revision = projectRevision;
+    openFolderBtn.disabled = true;
+    try {
+      await invoke("open_workspace_folder", { project: activeProject });
+    } catch (error) {
+      if (project !== activeProject || projectRevision !== revision) return;
+      previewNotice.textContent = t("workspace_open_folder_failed", String(error));
+      previewNotice.classList.add("show");
+      setPreviewCollapsed(false);
+    } finally {
+      if (project === activeProject && projectRevision === revision) openFolderBtn.disabled = false;
+    }
+  };
   for (const list of [fileTree, gitList, historyList]) attachPullToRefresh(list);
   fileSearch.oninput = () => {
     if (fileSearchTimer !== null) window.clearTimeout(fileSearchTimer);
@@ -2642,22 +2943,12 @@ export function createWorkspacePanel(
       commitRecentList.hidden = true;
     }
   });
-  historyView.addEventListener(
+  historyList.addEventListener(
     "scroll",
-    () => {
-      if (
-        mode === "history" &&
-        historyNearBottom(
-          historyView.scrollTop,
-          historyView.clientHeight,
-          historyView.scrollHeight,
-        )
-      ) {
-        void refreshHistory(false);
-      }
-    },
+    loadHistoryNearBottom,
     { passive: true },
   );
+  new ResizeObserver(() => requestAnimationFrame(loadHistoryNearBottom)).observe(historyList);
 
   resizer.addEventListener("pointerdown", (event) => {
     if (window.matchMedia("(max-width: 760px)").matches) return;
@@ -2723,6 +3014,7 @@ export function createWorkspacePanel(
     },
     setProject(nextProject) {
       if (project === nextProject) return;
+      hideCopyNotice();
       project = nextProject;
       projectRevision += 1;
       clearDirectoryObservers();
@@ -2746,6 +3038,9 @@ export function createWorkspacePanel(
       for (const key of Object.keys(previewRestore)) {
         delete previewRestore[key as WorkspaceMode];
       }
+      for (const key of Object.keys(markdownHistoryByMode)) {
+        delete markdownHistoryByMode[key as WorkspaceMode];
+      }
       for (const key of Object.keys(collapsedByMode)) {
         delete collapsedByMode[key as WorkspaceMode];
       }
@@ -2753,6 +3048,8 @@ export function createWorkspacePanel(
       historyRequestSequence += 1;
       historyLoading = false;
       historyHasMore = true;
+      historyLoadError = null;
+      historyMore.remove();
       stagedPaths = [];
       unstagedPaths = [];
       stagedCount = 0;
@@ -2767,6 +3064,8 @@ export function createWorkspacePanel(
       updateGitControls();
       setOperation("", false);
       closeCommitMenu();
+      closeFileMenu();
+      openFolderBtn.disabled = !project;
       projectName.textContent = project ? projectBasename(project) : "";
       projectLabel.title = project ?? "";
       renderContext();

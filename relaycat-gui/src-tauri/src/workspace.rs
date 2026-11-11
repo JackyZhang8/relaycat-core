@@ -535,6 +535,62 @@ fn git_workspace_commit_diff_impl(project: &str, commit: &str) -> Result<FilePre
 }
 
 #[tauri::command]
+pub async fn copy_workspace_path(
+    app: tauri::AppHandle,
+    project: String,
+    relative_path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
+
+        let root = ProjectRoot::open(&project).map_err(|error| error.to_string())?;
+        let path = root
+            .resolve(&relative_path)
+            .map_err(|error| error.to_string())?;
+        app.clipboard()
+            .write_text(path.to_string_lossy().into_owned())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn open_workspace_folder(project: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = project_root(Path::new(&project))?;
+        #[cfg(target_os = "macos")]
+        let mut command = std::process::Command::new("open");
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            use std::os::windows::process::CommandExt;
+            let mut command = std::process::Command::new("explorer.exe");
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            command
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut command = std::process::Command::new("xdg-open");
+
+        // Pass the validated directory as one argument, never through a shell.
+        let mut child = command
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        // Reap the launcher without tying the GUI request to the lifetime of
+        // an Explorer/file-manager window.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub async fn list_workspace_entries(
     project: String,
     relative_path: String,

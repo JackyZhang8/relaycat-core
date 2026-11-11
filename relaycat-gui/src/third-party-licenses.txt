@@ -15,10 +15,24 @@ Frontend dependencies (npm)
   @tauri-apps/plugin-dialog 2.7.1 — MIT OR Apache-2.0
   @tauri-apps/plugin-process 2.3.1 — MIT OR Apache-2.0
   @tauri-apps/plugin-updater 2.10.1 — MIT OR Apache-2.0
-  @xterm/addon-fit 0.10.0 — MIT
-  @xterm/addon-web-links 0.11.0 — MIT
-  @xterm/xterm 5.5.0 — MIT
-  (8 packages)
+  @xterm/addon-fit 0.11.0 — MIT
+  @xterm/addon-web-links 0.12.0 — MIT
+  @xterm/xterm 6.0.0 — MIT
+  dompurify 3.4.17 — (MPL-2.0 OR Apache-2.0)
+  markdown-it 14.3.3 — MIT
+  shiki 4.6.0 — MIT
+  (11 direct packages)
+
+Shiki highlighting runtime (npm)
+----------------------------------------------------
+  @shikijs/core 4.6.0 — MIT
+  @shikijs/primitive 4.6.0 — MIT
+  @shikijs/engine-oniguruma 4.6.0 — MIT
+  @shikijs/langs 4.6.0 — MIT
+  @shikijs/themes 4.6.0 — MIT
+  @shikijs/types 4.6.0 — MIT
+  @shikijs/vscode-textmate 10.1.0 — MIT
+  Oniguruma WebAssembly (vscode-oniguruma) — MIT
 
 
 Desktop backend dependencies (Rust crates)

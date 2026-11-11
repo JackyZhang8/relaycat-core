@@ -28,6 +28,9 @@
   --hover-strong: rgba(251, 244, 236, 0.09);
   --inset: rgba(0, 0, 0, 0.3);
   --code-bg: #251a13;
+  --syntax-bg: #24292e;
+  --syntax-fg: #e1e4e8;
+  --syntax-line-number: #959da5;
   --elevated: #3a2b20;
   --divider: rgba(251, 244, 236, 0.07);
   --shadow-pop: 0 24px 70px -12px rgba(0, 0, 0, 0.7);
@@ -56,6 +59,9 @@ body[data-theme="light"] {
   --hover-strong: rgba(74, 48, 22, 0.08);
   --inset: rgba(74, 48, 22, 0.06);
   --code-bg: #efe6d7;
+  --syntax-bg: #ffffff;
+  --syntax-fg: #24292e;
+  --syntax-line-number: #6a737d;
   --elevated: #e7dccb;
   --divider: rgba(74, 48, 22, 0.1);
   --shadow-pop: 0 24px 60px -16px rgba(74, 48, 22, 0.2);
@@ -706,6 +712,7 @@ body.ws-resizing .workspace-resizer {
   outline: none;
 }
 .workspace-panel {
+  position: relative;
   display: none;
   width: 360px;
   min-width: 320px;
@@ -766,6 +773,9 @@ body.ws-resizing .workspace-resizer {
 .ws-icon-btn:hover {
   color: var(--text);
   background: var(--hover-strong);
+}
+.workspace-panel:not(.files-mode) #workspace-open-folder {
+  display: none;
 }
 .workspace-panel.refreshing #workspace-refresh {
   animation: ws-refresh-spin 0.8s linear infinite;
@@ -938,6 +948,7 @@ body.ws-preview-resizing .ws-preview-resizer::after {
   color: var(--text);
   cursor: pointer;
   text-align: left;
+  gap: 6px;
 }
 .ws-tree-result:hover {
   background: var(--hover);
@@ -1028,16 +1039,50 @@ body.ws-preview-resizing .ws-preview-resizer::after {
 .ws-git-row:hover {
   background: var(--hover-strong);
 }
+.ws-tree-row.selected,
+.ws-tree-result.selected {
+  background: var(--accent-soft);
+}
+.ws-tree-row:focus-visible,
+.ws-tree-result:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
 .ws-tree-arrow {
   width: 12px;
   flex: none;
   color: var(--dim);
   text-align: center;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+}
+.ws-tree-arrow svg {
+  width: 12px;
+  height: 12px;
+  transition: transform 0.12s ease;
+}
+.ws-tree-arrow.expanded svg {
+  transform: rotate(90deg);
 }
 .ws-tree-icon {
-  width: 15px;
+  width: 16px;
+  height: 16px;
   flex: none;
   color: var(--dim);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.ws-tree-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.ws-tree-icon.folder {
+  color: var(--accent);
+}
+.ws-tree-icon.folder.expanded svg {
+  fill: var(--accent-soft);
 }
 .ws-tree-name,
 .ws-git-path {
@@ -1634,6 +1679,22 @@ body.ws-preview-resizing .ws-preview-resizer::after {
   width: 100%;
   overflow: auto;
 }
+.ws-history-more {
+  display: block;
+  position: sticky;
+  left: 0;
+  width: 100%;
+  padding: 10px;
+  border: 0;
+  background: var(--panel);
+  color: var(--dim);
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+.ws-history-more:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--accent);
+}
 .ws-filter-input {
   height: 27px;
   padding: 0 7px;
@@ -1688,6 +1749,29 @@ body.ws-preview-resizing .ws-preview-resizer::after {
 }
 .ws-commit-menu button.danger {
   color: var(--red);
+}
+.ws-menu-error {
+  max-width: 240px;
+  padding: 6px 9px;
+  color: var(--red);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.ws-copy-notice {
+  position: absolute;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--elevated);
+  color: var(--text);
+  box-shadow: var(--shadow-pop);
+  font-size: 12px;
+  white-space: nowrap;
+  pointer-events: none;
 }
 .ws-git-section-title {
   padding: 8px 12px 4px;
@@ -1831,8 +1915,8 @@ body.ws-preview-resizing .ws-preview-resizer::after {
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
-  color: var(--text);
-  background: transparent;
+  color: var(--syntax-fg);
+  background: var(--syntax-bg);
   font-family: var(--mono);
   font-size: 11px;
   line-height: 1.55;
@@ -2003,7 +2087,8 @@ body.ws-preview-resizing .ws-preview-resizer::after {
 .ws-markdown-preview code {
   padding: 1px 4px;
   border-radius: 4px;
-  background: var(--panel);
+  background: var(--syntax-bg);
+  color: var(--syntax-fg);
   font-family: var(--mono);
 }
 .ws-markdown-preview pre {
@@ -2035,6 +2120,16 @@ body.ws-preview-resizing .ws-preview-resizer::after {
   color: var(--accent);
   text-decoration: underline;
 }
+.ws-md-local-link {
+  cursor: pointer;
+}
+.ws-md-local-link:hover {
+  text-decoration-thickness: 2px;
+}
+.ws-md-local-link:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
 .ws-md-image-placeholder {
   color: var(--dim);
   font-style: italic;
@@ -2056,6 +2151,17 @@ body.ws-preview-resizing .ws-preview-resizer::after {
 .ws-markdown-toggle {
   display: inline-flex;
   gap: 3px;
+}
+.ws-markdown-navigation {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: auto;
+}
+.ws-markdown-nav-btn {
+  width: 28px;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 14px;
 }
 .ws-markdown-toggle .active {
   border-color: var(--accent);
@@ -2105,32 +2211,22 @@ body.ws-preview-resizing .ws-preview-resizer::after {
   position: absolute;
   left: 0;
   width: 24px;
-  color: var(--dim);
+  color: var(--syntax-line-number);
   text-align: right;
-  opacity: 0.55;
+  opacity: 0.8;
   user-select: none;
 }
-.ws-token.keyword {
-  color: #c792ea;
+.ws-syntax-token {
+  color: var(--syntax-dark, inherit);
+  font-style: var(--syntax-dark-style, normal);
+  font-weight: var(--syntax-dark-weight, 400);
+  text-decoration: var(--syntax-dark-decoration, none);
 }
-.ws-token.string {
-  color: #ecc48d;
-}
-.ws-token.number {
-  color: #f78c6c;
-}
-.ws-token.comment {
-  color: var(--gray);
-  font-style: italic;
-}
-body[data-theme="light"] .ws-token.keyword {
-  color: #8250df;
-}
-body[data-theme="light"] .ws-token.string {
-  color: #9a6700;
-}
-body[data-theme="light"] .ws-token.number {
-  color: #bc4c00;
+body[data-theme="light"] .ws-syntax-token {
+  color: var(--syntax-light, inherit);
+  font-style: var(--syntax-light-style, normal);
+  font-weight: var(--syntax-light-weight, 400);
+  text-decoration: var(--syntax-light-decoration, none);
 }
 .ws-diff-line {
   display: block;
