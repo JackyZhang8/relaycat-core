@@ -13,7 +13,6 @@ import {
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { WebglAddon } from "@xterm/addon-webgl";
 import { I18N, type Lang } from "./i18n";
 import {
   createRelayCompatibilityChecker,
@@ -86,7 +85,6 @@ interface Tab {
   logPath?: string;
   term: Terminal;
   fit: FitAddon;
-  webgl?: WebglAddon;
   pane: HTMLDivElement;
   tabEl: HTMLDivElement;
   pairUrl?: string;
@@ -739,27 +737,10 @@ async function createTab(tool: string, project: string, relay: string) {
 
   const pane = el("div", "term-pane") as HTMLDivElement;
   $("#terminals").appendChild(pane);
+  // Use xterm's default DOM renderer, as the workspace shells do. The WebGL
+  // glyph atlas can become corrupted during long sessions without emitting
+  // context loss; repainting alone then cannot repair the garbled characters.
   term.open(pane);
-
-  // The WebGL renderer keeps glyphs in a GPU texture atlas. When the GPU
-  // context is lost (driver reset, sleep/resume) the atlas becomes invalid and
-  // text renders as garbage even though the buffer is intact, so recreate the
-  // renderer instead of silently dropping it.
-  const loadWebgl = (): WebglAddon | undefined => {
-    try {
-      const addon = new WebglAddon();
-      addon.onContextLoss(() => {
-        addon.dispose();
-        tab.webgl = loadWebgl();
-        tab.term.refresh(0, tab.term.rows - 1);
-      });
-      term.loadAddon(addon);
-      return addon;
-    } catch {
-      return undefined; // fall back to the DOM renderer
-    }
-  };
-  const webgl = loadWebgl();
   fit.fit();
 
   const id = `s-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
@@ -774,7 +755,6 @@ async function createTab(tool: string, project: string, relay: string) {
     relayRevision: 0,
     term,
     fit,
-    webgl,
     pane,
     tabEl: el("div", "tab") as HTMLDivElement,
     sidePanelMode: null,
@@ -1401,7 +1381,6 @@ async function closeTab(id: string, force = false) {
   tabs.splice(idx, 1);
   if (tab.id && !tab.id.startsWith("failed-"))
     invoke("close_session", { id: tab.id }).catch(() => {});
-  tab.webgl?.dispose();
   tab.term.dispose();
   tab.pane.remove();
   tab.tabEl.remove();
@@ -1542,8 +1521,7 @@ function termToolButton(labelKey: string, svg: string): HTMLButtonElement {
   button.dataset.i18nTitle = labelKey;
   button.setAttribute("aria-label", t(labelKey));
   button.innerHTML = svg;
-  // Icon-only buttons in a 28px rail are hard to identify on first sight, so
-  // hovering expands a text label next to the icon.
+  // Expand a text label on hover to explain each workspace icon.
   const label = el("span", "term-tool-label");
   label.textContent = t(labelKey);
   button.appendChild(label);
@@ -2815,13 +2793,11 @@ function wireUi() {
       showSettingsGroup((b as HTMLElement).dataset.group!);
   });
 
-  // The glyph texture atlas can survive a GPU reset in a corrupted state
-  // without a context-loss event (text garbled, buffer/copy still correct).
-  // Rebuild it whenever the window becomes visible again.
+  // Repaint the existing buffer after returning from the tray/background.
+  // Keep the PTY grid intact, including any negotiated remote dimensions.
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
     for (const tab of tabs) {
-      tab.webgl?.clearTextureAtlas();
       tab.term.refresh(0, tab.term.rows - 1);
     }
   });

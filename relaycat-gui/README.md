@@ -12,7 +12,7 @@ GUI 不会把项目上传到云端执行。Claude Code、Codex、OpenCode、Gemi
 
 - 多项目、多标签 PTY 会话，每个标签对应独立的本地进程。
 - 终端分屏、标签切换、窗口 resize、快捷键和右键菜单。
-- xterm.js 终端渲染，并在 WebGL 上下文异常后自动恢复。
+- xterm.js 使用默认 DOM 终端渲染器，避免长时间运行时 WebGL 字形缓存损坏导致的乱码。
 - 支持 Claude Code、Codex、OpenCode、Gemini CLI、Shell 和自定义工具。
 - 扫码配对、连接状态显示、二维码重新打开和断线重连。
 - 每个已配对会话可同时使用 App 共享终端和 GUI 本地辅助终端。

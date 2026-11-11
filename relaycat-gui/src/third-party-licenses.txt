@@ -17,9 +17,8 @@ Frontend dependencies (npm)
   @tauri-apps/plugin-updater 2.10.1 — MIT OR Apache-2.0
   @xterm/addon-fit 0.10.0 — MIT
   @xterm/addon-web-links 0.11.0 — MIT
-  @xterm/addon-webgl 0.18.0 — MIT
   @xterm/xterm 5.5.0 — MIT
-  (9 packages)
+  (8 packages)
 
 
 Desktop backend dependencies (Rust crates)

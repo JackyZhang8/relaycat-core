@@ -415,8 +415,8 @@ button {
   display: flex;
 }
 .term-toolbtn {
-  width: 28px;
-  height: 28px;
+  width: 36px;
+  height: 36px;
   position: relative;
   display: inline-flex;
   align-items: center;
@@ -431,8 +431,8 @@ button {
     box-shadow 0.14s ease;
 }
 .term-toolbtn svg {
-  width: 17px;
-  height: 17px;
+  width: 22px;
+  height: 22px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.8;
