@@ -2,9 +2,8 @@ use relaycat_cli::{
     command::SessionKind,
     pairing::PairingMaterial,
     pairing_store::{
-        StoredPairingSession, cleanup_expired_pairing_qr_pngs, ensure_gitignore,
-        latest_pairing_qr_png_path, load_session, pairing_qr_png_path, save_session,
-        session_file_path, write_pairing_qr_pngs,
+        StoredPairingSession, ensure_gitignore, latest_pairing_qr_png_path, load_session,
+        pairing_qr_png_path, save_session, session_file_path, write_pairing_qr_pngs,
     },
 };
 
@@ -28,7 +27,6 @@ fn saves_and_loads_kind_scoped_pairing_session() {
 
     assert_eq!(loaded.material(), material);
     assert_eq!(loaded.cli_private_key, [3; 32]);
-    assert!(!loaded.is_expired_at(session.created_at_unix + 86_400 - 1));
     assert_eq!(
         path.file_name().and_then(|s| s.to_str()),
         Some("session_codex.json")
@@ -57,7 +55,7 @@ fn pairing_session_round_trips_relay_urls_containing_field_names_and_quotes() {
 }
 
 #[test]
-fn pairing_session_expires_after_twenty_four_hours() {
+fn pairing_session_remains_usable_after_many_days() {
     let material = PairingMaterial {
         relay_url: "ws://127.0.0.1:8787".to_string(),
         room_id: "abcdefghijklmnop".to_string(),
@@ -68,8 +66,31 @@ fn pairing_session_expires_after_twenty_four_hours() {
     let mut session = StoredPairingSession::new(material, [3; 32]);
     session.created_at_unix = 1_000;
 
-    assert!(!session.is_expired_at(1_000 + 86_400 - 1));
-    assert!(session.is_expired_at(1_000 + 86_400));
+    let temp = tempfile_dir("relaycat-old-pairing");
+    let path = session_file_path(&temp, &SessionKind::shell());
+    save_session(&path, &session).unwrap();
+    let (_, reused) = relaycat_cli::relay::load_or_generate_pairing_material(
+        &temp,
+        &session.relay_url,
+        &SessionKind::shell(),
+    )
+    .unwrap();
+    assert_eq!(
+        reused,
+        session.material(),
+        "old pairing credentials must be reusable"
+    );
+    let output = assert_cmd::Command::cargo_bin("relaycat")
+        .unwrap()
+        .args(["qr", "--kind", "shell", "--project"])
+        .arg(&temp)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&relaycat_cli::pairing::pairing_url(&session.material()))
+    );
 }
 
 #[test]
@@ -145,7 +166,7 @@ fn pairing_qr_png_path_is_kind_and_room_scoped() {
 }
 
 #[test]
-fn cleanup_expired_pairing_qr_pngs_keeps_only_valid_pngs() {
+fn writing_pairing_qr_preserves_older_session_images() {
     let temp = tempfile_dir("relaycat-pairing-qr-cleanup");
     let dir = temp.join(".relaycat/pairing");
     std::fs::create_dir_all(&dir).expect("create pairing dir");
@@ -160,9 +181,19 @@ fn cleanup_expired_pairing_qr_pngs_keeps_only_valid_pngs() {
     set_mtime_unix(&valid, 1_000 + 86_400);
     set_mtime_unix(&unrelated, 1_000);
 
-    cleanup_expired_pairing_qr_pngs(&temp, 1_000 + 86_400).expect("cleanup");
+    let material = PairingMaterial {
+        relay_url: "ws://127.0.0.1:8787".into(),
+        room_id: "new-room".into(),
+        cli_public_key: [1; 32],
+        pairing_token: vec![2; 16],
+        session_kind: SessionKind::codex(),
+    };
+    write_pairing_qr_pngs(&temp, &material).unwrap();
 
-    assert!(!expired.exists());
+    assert!(
+        expired.exists(),
+        "older running sessions still need their QR images"
+    );
     assert!(valid.exists());
     assert!(unrelated.exists());
 }

@@ -6,7 +6,7 @@ use relaycat_cli::{
     i18n::CliLanguage,
     pairing,
     pairing_store::{
-        StoredPairingSession, current_unix_timestamp, load_session, project_dir, session_file_path,
+        StoredPairingSession, load_session, project_dir, session_file_path,
         write_pairing_qr_pngs,
     },
     pty,
@@ -113,22 +113,6 @@ fn show_pairing_qr(args: &QrArgs, language: CliLanguage) -> Result<()> {
             kind.as_str()
         )
     })?;
-
-    let now_unix = current_unix_timestamp();
-    let expired = stored.is_expired_at(now_unix);
-    if expired {
-        // An expired pairing URL is a credential that the relay will reject,
-        // but it is still a credential: printing it again (and into terminal
-        // scrollback) only spreads it. Ask for a fresh session instead.
-        eprintln!(
-            "{}",
-            language.t(
-                "warning: this pairing session has expired; the URL and QR are not shown. Start a new `relaycat` session to generate a fresh one",
-                "警告：这个配对会话已过期，不再显示配对链接与二维码；重新启动一次 `relaycat` 会话即可生成新的",
-            )
-        );
-        return Ok(());
-    }
 
     let material = stored.material();
     println!("{}", pairing::pairing_url(&material));

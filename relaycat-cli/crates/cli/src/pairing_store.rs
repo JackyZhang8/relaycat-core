@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use crate::{command::SessionKind, pairing::PairingMaterial};
 
 pub const RELAYCAT_DIR: &str = ".relaycat";
-pub const PAIRING_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 pub const PAIRING_QR_DIR: &str = "pairing";
 
 #[derive(Clone, PartialEq, Eq)]
@@ -64,10 +63,6 @@ impl StoredPairingSession {
             cli_public_key: material.cli_public_key,
             pairing_token: material.pairing_token,
         }
-    }
-
-    pub fn is_expired_at(&self, now_unix: u64) -> bool {
-        now_unix.saturating_sub(self.created_at_unix) >= PAIRING_SESSION_TTL_SECS
     }
 
     pub fn key_pair(&self) -> KeyPair {
@@ -169,50 +164,14 @@ pub fn latest_pairing_qr_png_path(project_dir: &Path, kind: &SessionKind) -> Pat
     pairing_qr_dir(project_dir).join(format!("latest-{}.png", kind.as_str()))
 }
 
-pub fn cleanup_expired_pairing_qr_pngs(project_dir: &Path, now_unix: u64) -> Result<()> {
-    let dir = pairing_qr_dir(project_dir);
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(anyhow::Error::from(err))
-                .with_context(|| format!("failed to read pairing QR directory {}", dir.display()));
-        }
-    };
-
-    for entry in entries {
-        let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("png") {
-            continue;
-        }
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("failed to stat pairing QR PNG {}", path.display()))?;
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        let Ok(modified_unix) = modified.duration_since(UNIX_EPOCH) else {
-            continue;
-        };
-        if now_unix.saturating_sub(modified_unix.as_secs()) >= PAIRING_SESSION_TTL_SECS {
-            fs::remove_file(&path).with_context(|| {
-                format!("failed to remove expired pairing QR PNG {}", path.display())
-            })?;
-        }
-    }
-    Ok(())
-}
-
 pub fn write_pairing_qr_pngs(project_dir: &Path, material: &PairingMaterial) -> Result<PathBuf> {
-    cleanup_expired_pairing_qr_pngs(project_dir, current_unix_timestamp())?;
     let path = pairing_qr_png_path(project_dir, material);
     let latest = latest_pairing_qr_png_path(project_dir, &material.session_kind);
     let dir = pairing_qr_dir(project_dir);
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     // The QR encodes the pairing URL, i.e. the token: keep the directory and
     // the PNGs readable by the owner only. Without this a project directory
-    // that is shared, synced or backed up leaks a 24h pairing credential.
+    // that is shared, synced or backed up leaks a pairing credential.
     restrict_to_owner(&dir, 0o700)?;
 
     crate::pairing::write_pairing_qr_png(material, &path)?;

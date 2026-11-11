@@ -205,8 +205,8 @@ pub(crate) fn is_cancelled_by_user(err: &anyhow::Error) -> bool {
 /// Load the cached latest pairing material for `project_dir`/`session_kind`, or
 /// generate and persist a fresh one when no usable session exists.
 ///
-/// A cached session is reused only when it targets the same `relay_url` and has
-/// not expired. Relay runs should use [`generate_pairing_material_for_run`] so
+/// A cached session is reused when it targets the same `relay_url`, regardless
+/// of its age. Relay runs should use [`generate_pairing_material_for_run`] so
 /// concurrent sessions in the same project do not share a room; this helper is
 /// kept for callers that explicitly want the latest persisted session.
 pub fn load_or_generate_pairing_material(
@@ -216,17 +216,9 @@ pub fn load_or_generate_pairing_material(
 ) -> Result<(KeyPair, crate::pairing::PairingMaterial)> {
     let session_path = session_file_path(project_dir, session_kind);
     let stored = load_session(&session_path)?;
-    let now_unix = current_unix_timestamp();
     match stored {
-        Some(session) if session.relay_url == relay_url && !session.is_expired_at(now_unix) => {
-            Ok((session.key_pair(), session.material()))
-        }
         Some(session) if session.relay_url == relay_url => {
-            relaycat_log(
-                "INFO",
-                "cached secure pairing expired; generated a new pairing session",
-            );
-            generate_and_store_pairing_material(project_dir, &session_path, relay_url, session_kind)
+            Ok((session.key_pair(), session.material()))
         }
         Some(_) | None => {
             generate_and_store_pairing_material(project_dir, &session_path, relay_url, session_kind)
@@ -361,9 +353,6 @@ pub async fn prepare_secure_pairing(
             material.room_id.clone(),
             cli_keypair,
             material.pairing_token.clone(),
-        )
-        .with_admission_deadline(
-            created_at_unix.saturating_add(crate::pairing_store::PAIRING_SESSION_TTL_SECS),
         ),
     );
     let reconnect = Arc::new(RelayTransportReconnect::Secure {

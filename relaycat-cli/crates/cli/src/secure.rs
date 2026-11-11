@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
-use std::{collections::HashSet, sync::Mutex};
+use std::sync::Mutex;
 
 use relaycat_crypto::{
     Direction as CryptoDirection, KeyPair, PairingRole, SessionKeys, decrypt, encrypt,
@@ -44,8 +44,6 @@ pub struct CliSecureHandshake {
     /// kept so [`Self::rederive_session_keys`] can bind the current CLI salt to
     /// the app's still-current salt.
     app_peer: Mutex<Option<AppPeerMaterial>>,
-    admission_deadline_unix: Option<u64>,
-    admitted_devices: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl CliSecureHandshake {
@@ -60,14 +58,7 @@ impl CliSecureHandshake {
             pairing_token: pairing_token.into(),
             connection_salt: Mutex::new(generate_connection_salt()),
             app_peer: Mutex::new(None),
-            admission_deadline_unix: None,
-            admitted_devices: Mutex::new(HashSet::new()),
         }
-    }
-
-    pub fn with_admission_deadline(mut self, deadline_unix: u64) -> Self {
-        self.admission_deadline_unix = Some(deadline_unix);
-        self
     }
 
     /// Draws a fresh salt, stores it as the current salt, and returns it.
@@ -112,14 +103,6 @@ impl CliSecureHandshake {
     }
 
     pub fn accept_peer_joined(&self, frame: &OuterFrame) -> Result<Option<SessionKeys>> {
-        self.accept_peer_joined_at(frame, crate::pairing_store::current_unix_timestamp())
-    }
-
-    fn accept_peer_joined_at(
-        &self,
-        frame: &OuterFrame,
-        now_unix: u64,
-    ) -> Result<Option<SessionKeys>> {
         let OuterFrame::PeerJoined {
             role,
             device_pubkey,
@@ -159,17 +142,6 @@ impl CliSecureHandshake {
             bail!("peer public key is not contributory (low-order point)");
         }
 
-        let mut admitted_devices = self
-            .admitted_devices
-            .lock()
-            .map_err(|_| anyhow::anyhow!("admitted devices lock poisoned"))?;
-        if self
-            .admission_deadline_unix
-            .is_some_and(|deadline| now_unix >= deadline)
-            && !admitted_devices.contains(device_pubkey)
-        {
-            bail!("pairing expired; run relaycat again to show a new pairing QR code");
-        }
         let token_hash = pairing_token_hash(&self.pairing_token);
         let cli_salt = self.connection_salt()?;
         let keys = SessionKeys::derive_for_cli(
@@ -182,8 +154,6 @@ impl CliSecureHandshake {
             &cli_salt,
             app_salt,
         );
-        admitted_devices.insert(*device_pubkey);
-        drop(admitted_devices);
 
         if let Ok(mut guard) = self.app_peer.lock() {
             *guard = Some(AppPeerMaterial {
@@ -738,54 +708,18 @@ mod tests {
     }
 
     #[test]
-    fn expired_pairing_rejects_a_new_device() {
+    fn pairing_accepts_a_new_app_identity_after_an_existing_device() {
         let token = vec![9_u8; 16];
-        let app_keypair = KeyPair::generate();
-        let handshake = CliSecureHandshake::new("room", KeyPair::generate(), token.clone())
-            .with_admission_deadline(10);
-        let frame = app_peer_joined(&token, app_keypair.public(), [3_u8; 32]);
-
-        let error = handshake.accept_peer_joined_at(&frame, 10).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "pairing expired; run relaycat again to show a new pairing QR code"
-        );
-    }
-
-    #[test]
-    fn a_device_admitted_before_expiry_can_reconnect_afterward() {
-        let token = vec![9_u8; 16];
-        let app_keypair = KeyPair::generate();
-        let handshake = CliSecureHandshake::new("room", KeyPair::generate(), token.clone())
-            .with_admission_deadline(10);
-        let frame = app_peer_joined(&token, app_keypair.public(), [3_u8; 32]);
-
-        assert!(
-            handshake
-                .accept_peer_joined_at(&frame, 9)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            handshake
-                .accept_peer_joined_at(&frame, 10)
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn no_admission_deadline_keeps_accepting_new_devices() {
-        let token = vec![9_u8; 16];
-        let app_keypair = KeyPair::generate();
         let handshake = CliSecureHandshake::new("room", KeyPair::generate(), token.clone());
-        let frame = app_peer_joined(&token, app_keypair.public(), [3_u8; 32]);
+        let first_app = KeyPair::generate();
+        let first_frame = app_peer_joined(&token, first_app.public(), [3_u8; 32]);
+        let first_keys = handshake.accept_peer_joined(&first_frame).unwrap().unwrap();
 
-        assert!(
-            handshake
-                .accept_peer_joined_at(&frame, u64::MAX)
-                .unwrap()
-                .is_some()
-        );
+        // Restarting the app can replace its in-memory identity. The running
+        // desktop session must accept that freshly authenticated identity.
+        let restarted_app = KeyPair::generate();
+        let new_frame = app_peer_joined(&token, restarted_app.public(), [4_u8; 32]);
+        let new_keys = handshake.accept_peer_joined(&new_frame).unwrap().unwrap();
+        assert_ne!(first_keys, new_keys);
     }
 }

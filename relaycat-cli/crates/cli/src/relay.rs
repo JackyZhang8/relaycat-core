@@ -44,7 +44,7 @@ use crate::{
     i18n::CliLanguage,
     pairing::generate_pairing_material_for_public_key_and_kind,
     pairing_store::{
-        RELAYCAT_DIR, StoredPairingSession, current_unix_timestamp, ensure_gitignore, load_session,
+        RELAYCAT_DIR, StoredPairingSession, ensure_gitignore, load_session,
         project_dir, save_session, session_file_path, write_pairing_qr_pngs,
     },
     secure::{CliSecureHandshake, SecureSession, secure_join_frame},
@@ -391,6 +391,62 @@ fn workspace_terminal_transport_messages(
         }
     };
     Ok(messages.into_iter().map(PlainMsg::TerminalStreamV2).collect())
+}
+
+/// Workspace failures are scoped to this stream; callers must not propagate
+/// them out of the relay pump that also serves the main terminal.
+fn workspace_terminal_control_messages(
+    host: &mut Option<(String, WorkspaceTerminalHost)>,
+    service: &WorkspaceService,
+    stream: TerminalStreamV2,
+) -> Result<Vec<PlainMsg>> {
+    if host.is_none()
+        && let Some(descriptor) = service.shell_descriptors().into_iter().next()
+    {
+        let _ = workspace_terminal_transport_messages(
+            host,
+            ShellTransportEvent::Started(descriptor),
+        )?;
+    }
+    let Some((_, terminal)) = host.as_mut() else {
+        return Ok(Vec::new());
+    };
+    let result = terminal.handle_message(stream)?;
+    for action in result.actions {
+        match action {
+            WorkspaceTerminalAction::Write(bytes) => service.write_workspace_shell(bytes),
+            WorkspaceTerminalAction::Resize { cols, rows } => {
+                service.resize_workspace_shell(cols, rows)
+            }
+            WorkspaceTerminalAction::Close => {
+                service.close_workspace_shell()
+            }
+        }
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
+    Ok(result
+        .outbound
+        .into_iter()
+        .map(PlainMsg::TerminalStreamV2)
+        .collect())
+}
+
+fn handle_gui_workspace_command(
+    service: &WorkspaceService,
+    command: crate::gui_bridge::GuiWorkspaceTerminalCommand,
+) -> std::result::Result<(), relaycat_workspace::WorkspaceServiceError> {
+    use crate::gui_bridge::GuiWorkspaceTerminalCommand;
+    match command {
+        GuiWorkspaceTerminalCommand::Attach => {
+            service.ensure_workspace_shell(80, 24).map(|_| ())
+        }
+        GuiWorkspaceTerminalCommand::Detach => Ok(()),
+        GuiWorkspaceTerminalCommand::Input { bytes } => service.write_workspace_shell(bytes),
+        GuiWorkspaceTerminalCommand::Resize { cols, rows } => {
+            service.resize_workspace_shell(cols, rows)
+        }
+        GuiWorkspaceTerminalCommand::Close => service.close_workspace_shell(),
+    }
 }
 
 fn cli_metadata_for_target(target: &TargetCommand) -> Result<CliMetadata> {
@@ -1940,72 +1996,28 @@ where
                         if !terminal_streams_for_output.load(Ordering::Acquire) {
                             continue;
                         }
-                        if workspace_terminal_host.is_none()
-                            && let Some(descriptor) = workspace_service_for_terminal
-                                .shell_descriptors()
-                                .into_iter()
-                                .next()
-                        {
-                            let _ = workspace_terminal_transport_messages(
-                                &mut workspace_terminal_host,
-                                ShellTransportEvent::Started(descriptor),
-                            )?;
-                        }
-                        let Some((_, terminal)) = workspace_terminal_host.as_mut() else {
-                            continue;
-                        };
-                        let result = terminal.handle_message(stream)?;
-                        for action in result.actions {
-                            match action {
-                                WorkspaceTerminalAction::Write(bytes) => {
-                                    workspace_service_for_terminal
-                                        .write_workspace_shell(bytes)
-                                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                                }
-                                WorkspaceTerminalAction::Resize { cols, rows } => {
-                                    workspace_service_for_terminal
-                                        .resize_workspace_shell(cols, rows)
-                                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                                }
-                                WorkspaceTerminalAction::Close => {
-                                    workspace_service_for_terminal
-                                        .close_workspace_shell()
-                                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                                }
-                            }
-                        }
-                        result
-                            .outbound
-                            .into_iter()
-                            .map(PlainMsg::TerminalStreamV2)
-                            .collect()
+                        workspace_terminal_control_messages(
+                            &mut workspace_terminal_host,
+                            &workspace_service_for_terminal,
+                            stream,
+                        )
+                        .unwrap_or_else(|error| {
+                            relaycat_log(
+                                "WARN",
+                                format!("workspace terminal control failed: {error:#}"),
+                            );
+                            Vec::new()
+                        })
                     }
                     TerminalV2Control::GuiWorkspace(command) => {
-                        use crate::gui_bridge::{
-                            GuiWorkspaceTerminalCommand,
-                        };
-                        match command {
-                            GuiWorkspaceTerminalCommand::Attach => {
-                                let _ = workspace_service_for_terminal
-                                    .ensure_workspace_shell(80, 24)
-                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                            }
-                            GuiWorkspaceTerminalCommand::Detach => {}
-                            GuiWorkspaceTerminalCommand::Input { bytes } => {
-                                workspace_service_for_terminal
-                                    .write_workspace_shell(bytes)
-                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                            }
-                            GuiWorkspaceTerminalCommand::Resize { cols, rows } => {
-                                workspace_service_for_terminal
-                                    .resize_workspace_shell(cols, rows)
-                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                            }
-                            GuiWorkspaceTerminalCommand::Close => {
-                                workspace_service_for_terminal
-                                    .close_workspace_shell()
-                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                            }
+                        if let Err(error) = handle_gui_workspace_command(
+                            &workspace_service_for_terminal,
+                            command,
+                        ) {
+                            relaycat_log(
+                                "WARN",
+                                format!("GUI workspace terminal command failed: {error}"),
+                            );
                         }
                         Vec::new()
                     }
@@ -2155,7 +2167,14 @@ where
                         let messages = workspace_terminal_transport_messages(
                             &mut workspace_terminal_host,
                             event,
-                        )?;
+                        )
+                        .unwrap_or_else(|error| {
+                            relaycat_log(
+                                "WARN",
+                                format!("workspace terminal output failed: {error:#}"),
+                            );
+                            Vec::new()
+                        });
                         if terminal_streams_for_output.load(Ordering::Acquire) {
                             messages
                         } else {
@@ -2802,6 +2821,24 @@ where
                         .try_send(PtyEvent::Plain(Box::new(PlainMsg::Heartbeat)));
                 }
                 Some(RelayInputAction::Workspace(request)) => {
+                    // Cancellation must remain available when ordinary work
+                    // occupies every slot. execute() validates the project and
+                    // handles Cancel before dispatching any blocking work.
+                    if matches!(
+                        &request.operation,
+                        relaycat_protocol::WorkspaceRequest::Cancel { .. }
+                    ) {
+                        let response = workspace_service_for_input.execute(request);
+                        if !enqueue_reliable_plain_event(
+                            &heartbeat_output_tx_for_input,
+                            PlainMsg::WorkspaceResponse(response),
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     let permit = match workspace_request_slots.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {

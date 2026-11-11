@@ -568,8 +568,6 @@ struct PairedDeviceDto {
     paired: bool,
     /// Unix seconds the stored pairing was created (0 when not paired).
     created_at: u64,
-    /// The stored pairing is past its TTL and would require a re-scan anyway.
-    expired: bool,
     last_used_at: u64,
     use_count: u64,
 }
@@ -580,7 +578,6 @@ struct PairedDeviceDto {
 fn list_paired_devices() -> Result<Vec<PairedDeviceDto>, String> {
     let path = recent_store::recent_file_path().map_err(|e| e.to_string())?;
     let store = RecentStore::load(&path).map_err(|e| e.to_string())?;
-    let now = pairing_store::current_unix_timestamp();
     let mut out = Vec::new();
     for r in store.records() {
         let session_path = pairing_store::session_file_path(&r.project, &r.kind);
@@ -595,7 +592,6 @@ fn list_paired_devices() -> Result<Vec<PairedDeviceDto>, String> {
                 relay: r.relay.clone(),
                 paired: true,
                 created_at: s.created_at_unix,
-                expired: s.is_expired_at(now),
                 last_used_at: r.last_used_at,
                 use_count: r.use_count,
             });

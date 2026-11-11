@@ -1912,7 +1912,6 @@ type PairedDevice = {
   relay: string;
   paired: boolean;
   created_at: number;
-  expired: boolean;
   last_used_at: number;
   use_count: number;
 };
@@ -1931,21 +1930,7 @@ function fmtDate(unix: number): string {
 
 async function openDevices() {
   openOverlay("ov-devices");
-  await pruneExpiredPairings();
   await refreshDevices();
-}
-
-// Expired pairings can't be reused (a re-scan is required anyway), so silently
-// drop them when the dialog opens — there's no value in surfacing them.
-async function pruneExpiredPairings() {
-  const devices = await invoke<PairedDevice[]>("list_paired_devices").catch(
-    () => [] as PairedDevice[],
-  );
-  for (const d of devices.filter((d) => d.expired)) {
-    await invoke("revoke_pairing", { project: d.project, kind: d.kind }).catch(
-      () => {},
-    );
-  }
 }
 
 async function refreshDevices() {
@@ -1966,7 +1951,7 @@ async function refreshDevices() {
     const title = el("div", "dev-proj");
     title.textContent = `${d.kind} · ${d.project}`;
     const meta = el("div", "dev-meta");
-    const status = d.expired ? t("dev_expired") : t("dev_paired", fmtDate(d.created_at));
+    const status = t("dev_paired", fmtDate(d.created_at));
     meta.textContent = `${d.relay} · ${status} · ${t("dev_used", d.use_count)}`;
     info.append(title, meta);
     const btn = el("button", "btn danger sm") as HTMLButtonElement;

@@ -32,4 +32,4 @@
 
 - 从 [GitHub Releases](https://github.com/JackyZhang8/relaycat-core/releases) 或 [RelayCat 下载站](https://cdn.relaycat.cn/) 获取对应平台安装包，也可使用应用内更新功能。
 - GUI 版本为 `0.2.0`，复用的 CLI 核心版本为 `0.1.6`；两端使用独立版本号。
-- 若配对凭证已超过 24 小时，请重新创建会话并扫码配对。
+- 配对凭证不按时间过期，运行多天的会话仍可重连或重新扫码配对。
