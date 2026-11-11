@@ -1,10 +1,10 @@
 # RelayCat GUI
 
-RelayCat GUI 是 RelayCat 的开源桌面客户端，当前对外发布版本为 **0.2.0**。它使用 Tauri 2、Vite、TypeScript 和 xterm.js，将本地 AI Coding Agent、项目文件、Git 工作流和手机远程控制整合在一个桌面界面中。
+RelayCat GUI 是 RelayCat 的开源桌面客户端，当前对外发布版本为 **0.2.1**。它使用 Tauri 2、Vite、TypeScript 和 xterm.js，将本地 AI Coding Agent、项目文件、Git 工作流和手机远程控制整合在一个桌面界面中。
 
 GUI 不会把项目上传到云端执行。Claude Code、Codex、OpenCode、Gemini CLI、Shell 和自定义工具仍在本机 PTY 中运行；手机通过 RelayCat 的端到端加密会话查看和控制终端。
 
-本版变更见 [v0.2.0 Release 说明](../docs/releases/relaycat-gui-v0.2.0.md) 和 [更新日志](../CHANGELOG.md)。
+本版变更见 [v0.2.1 Release 说明](../docs/releases/relaycat-gui-v0.2.1.md) 和 [更新日志](../CHANGELOG.md)。
 
 ## 功能特性
 
@@ -14,14 +14,16 @@ GUI 不会把项目上传到云端执行。Claude Code、Codex、OpenCode、Gemi
 - 终端分屏、标签切换、窗口 resize、快捷键和右键菜单。
 - xterm.js 使用默认 DOM 终端渲染器，避免长时间运行时 WebGL 字形缓存损坏导致的乱码。
 - 支持 Claude Code、Codex、OpenCode、Gemini CLI、Shell 和自定义工具。
-- 扫码配对、连接状态显示、二维码重新打开和断线重连。
+- 扫码配对、连接状态显示、二维码重新打开和断线重连；配对凭证不按时间过期，适合持续多天的任务。
 - 每个已配对会话可同时使用 App 共享终端和 GUI 本地辅助终端。
 
 ### 工作区与 Git
 
-- 浏览项目目录，并分页加载大型目录。
-- 预览文本、代码和 Markdown；对二进制或过大文件给出明确提示。
-- 查看 Git 状态、文件 Diff、提交 Diff 和历史记录。
+- 浏览项目目录，并分页加载大型目录；同级文件与文件夹对齐，子目录缩进，展开与折叠文件夹使用不同图标。
+- 文件右键菜单支持复制路径并显示“已复制”提示；文件列表顶部可在系统文件管理器中打开项目目录。
+- 预览文本、代码和 Markdown；源码、Git Diff 与 Markdown 代码块统一使用 Shiki 高亮，随界面切换 GitHub Dark / Light 配色，未知语言与过大内容降级为纯文本。
+- Markdown 支持打开项目内其他 Markdown 文件，并通过预览工具栏的前进、后退按钮恢复浏览顺序与滚动位置。
+- 查看 Git 状态、文件 Diff、提交 Diff 和历史记录；历史列表向下滚动自动加载更多，失败时可重试。
 - 支持暂存、取消暂存、按 hunk 或选中行操作、提交和修订提交。
 - 支持创建、切换、重命名和删除分支，以及创建标签。
 - 支持 Fetch、Pull、Push 和 Commit & Push 等远程操作。
@@ -35,7 +37,7 @@ GUI 不会把项目上传到云端执行。Claude Code、Codex、OpenCode、Gemi
 - 系统托盘与开机自动启动。
 - 配对设备管理、会话状态与运行诊断。
 - 导出经过脱敏处理的诊断包，过滤主目录、配对材料、密钥和 IP 等敏感信息。
-- 中英文界面。
+- 中英文界面；工作区入口采用更大的图标与点击区域。
 
 ## 架构关系
 
@@ -110,7 +112,7 @@ npm test
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-正式版本使用独立 tag，格式为 `relaycat-gui-v<version>`。发布工作流目前保存在 `_github/workflows/release-gui.yml`，已暂停 GitHub Actions 自动执行。桌面安装包可在 [GitHub Releases](https://github.com/JackyZhang8/relaycat-core/releases) 或 [RelayCat 下载站](https://cdn.relaycat.cn/) 获取。
+正式版本使用独立 tag，格式为 `relaycat-gui-v<version>`。发布工作流保存在 `.github/workflows/release-gui.yml`，支持推送版本 tag 触发或通过 `workflow_dispatch` 手动触发。桌面安装包可在 [GitHub Releases](https://github.com/JackyZhang8/relaycat-core/releases) 或 [RelayCat 下载站](https://cdn.relaycat.cn/) 获取。
 
 ## 项目结构
 

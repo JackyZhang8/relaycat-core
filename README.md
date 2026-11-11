@@ -19,11 +19,11 @@ RelayCat Core 是本地 AI Coding Agent 的开源桌面控制层与加密中继�
 
 | 组件 | 版本 | Release 说明 |
 | --- | --- | --- |
-| CLI / TUI | **0.1.6** | [CLI v0.1.6](docs/releases/relaycat-cli-v0.1.6.md) |
-| 桌面 GUI | **0.2.0** | [GUI v0.2.0](docs/releases/relaycat-gui-v0.2.0.md) |
+| CLI / TUI | **0.1.7** | [CLI v0.1.7](docs/releases/relaycat-cli-v0.1.7.md) |
+| 桌面 GUI | **0.2.1** | [GUI v0.2.1](docs/releases/relaycat-gui-v0.2.1.md) |
 | Relay server | **0.1.3** | [Relay v0.1.3](docs/releases/relaycat-relay-v0.1.3.md) |
 
-CLI 本次重点加固签名更新、配对有效期与工作区访问；GUI 本次改进文件搜索、图片预览和 Git 工作流。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+CLI 本次取消 24 小时配对过期限制，并隔离工作区异常，改善运行多天后的 App 重连；GUI 本次修复终端乱码和 Git 历史加载，完善文件与 Markdown 导航，并统一使用 Shiki 代码高亮。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 产品预览
 
@@ -82,7 +82,7 @@ GUI 适合首次使用、同时管理多个项目，或希望通过可视化界�
 5. 启动 Relay 会话后，用手机 App 扫描弹出的二维码。
 6. 状态变为“已配对”后，即可在手机和电脑上共同操作该终端。
 
-GUI 0.2.0 提供多标签与分屏 PTY、工具检测、项目收藏、二维码展示、连接状态和最近会话入口；还内置项目文件浏览、开发文件预览、Git 状态与 Diff、暂存与提交、分支与历史、远程操作、共享终端、自动更新、托盘和诊断包。它复用 CLI 的会话、工作区与加密逻辑，不单独实现另一套协议。Windows 未安装 Git 时，GUI 和 App 都会收到明确的 Git 未安装提示。
+GUI 0.2.1 提供多标签与分屏 PTY、工具检测、项目收藏、二维码展示、连接状态和最近会话入口；还内置项目文件浏览、开发文件预览、Git 状态与 Diff、暂存与提交、分支与历史、远程操作、共享终端、自动更新、托盘和诊断包。它复用 CLI 的会话、工作区与加密逻辑，不单独实现另一套协议。Windows 未安装 Git 时，GUI 和 App 都会收到明确的 Git 未安装提示。
 
 ### 方式二：使用 CLI
 
@@ -361,12 +361,12 @@ relaycat-gui-v<version>
 relaycat-relay-v<version>
 ```
 
-发布工作流文件（目前位于 `_github/workflows`，已暂停自动执行）：
+发布工作流文件位于 `.github/workflows`，推送对应产品的版本 tag 或通过 `workflow_dispatch` 手动触发：
 
 ```text
-_github/workflows/release-cli.yml
-_github/workflows/release-gui.yml
-_github/workflows/release-relay.yml
+.github/workflows/release-cli.yml
+.github/workflows/release-gui.yml
+.github/workflows/release-relay.yml
 ```
 
 三个产品不要求同步升级版本：App 与 CLI 通过 Hello/HelloAck 协商取双方版本交集中的最高版本（相邻版本可互通），并校验 `terminal_state`、`snapshot_recovery` 两个 mandatory capabilities；版本无交集或缺少 mandatory capability 时会返回明确的 `ProtocolRejectV2`（提示升级较旧一侧），不会静默降级。未知的 optional capability 会在解码时被忽略，保证向前兼容。

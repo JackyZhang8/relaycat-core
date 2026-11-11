@@ -1,10 +1,10 @@
 # RelayCat CLI
 
-RelayCat CLI 是 RelayCat 的电脑端命令行入口，当前版本为 **0.1.6**，二进制名为 `relaycat`。它在本机启动 Claude Code、Codex、OpenCode、Gemini CLI、Shell 或自定义命令，管理 PTY 终端，并通过 Relay 将终端会话端到端加密地连接到 RelayCat App。
+RelayCat CLI 是 RelayCat 的电脑端命令行入口，当前版本为 **0.1.7**，二进制名为 `relaycat`。它在本机启动 Claude Code、Codex、OpenCode、Gemini CLI、Shell 或自定义命令，管理 PTY 终端，并通过 Relay 将终端会话端到端加密地连接到 RelayCat App。
 
 代码、凭据、项目目录和 Agent 进程始终留在本机；Relay 只转发握手信息和密文。
 
-本版变更见 [v0.1.6 Release 说明](../docs/releases/relaycat-cli-v0.1.6.md) 和 [更新日志](../CHANGELOG.md)。
+本版变更见 [v0.1.7 Release 说明](../docs/releases/relaycat-cli-v0.1.7.md) 和 [更新日志](../CHANGELOG.md)。
 
 ## 功能特性
 
@@ -13,7 +13,9 @@ RelayCat CLI 是 RelayCat 的电脑端命令行入口，当前版本为 **0.1.6*
 - 支持将任意本地命令注册为自定义工具。
 - 原生 PTY、终端窗口 resize、控制键和手机输入回传。
 - 扫码配对，以及基于 X25519、HKDF-SHA256 和 ChaCha20-Poly1305 的端到端加密。
+- 配对凭证不按时间过期，支持运行多天后重连或重新扫码配对。
 - 网络波动后自动重连，并通过 replay、快照和增量 patch 恢复终端状态。
+- 工作区共享 Shell 异常与主终端连接隔离；取消请求可在工作区并发请求满载时处理。
 - 大终端画面按行边界分片，避免单帧超过传输预算。
 - 通过 `HelloV2` / `HelloAckV2` 协商协议版本与能力；不兼容时返回明确的升级提示。
 - 与 GUI 共用会话、配置、工作区和加密实现，避免维护两套协议逻辑。
@@ -83,7 +85,7 @@ relaycat <command> --help
 cargo build --release -p relaycat-cli
 ```
 
-产物位于 `target/release/relaycat`。Windows 发布构建配置见 [CLI 发布工作流](../_github/workflows/release-cli.yml)，桌面快捷方式和安装脚本见 [packaging/README.md](packaging/README.md)。
+产物位于 `target/release/relaycat`。Windows 发布构建配置见 [CLI 发布工作流](../.github/workflows/release-cli.yml)，桌面快捷方式和安装脚本见 [packaging/README.md](packaging/README.md)。
 
 运行检查：
 
