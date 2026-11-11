@@ -268,7 +268,7 @@ pub(crate) fn format_byte_preview(bytes: &[u8]) -> String {
 pub(crate) fn local_timestamp() -> String {
     #[cfg(not(unix))]
     {
-        current_unix_timestamp().to_string()
+        crate::pairing_store::current_unix_timestamp().to_string()
     }
 
     #[cfg(unix)]
